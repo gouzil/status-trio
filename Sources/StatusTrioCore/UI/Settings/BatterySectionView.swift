@@ -6,6 +6,7 @@ struct BatterySectionView: View {
     @ObservedObject var statusStore: SystemStatusStore
     @Binding var previewIsDark: Bool
     var chargeToFullNow: ChargeToFullNowController? = nil
+    var sailingMode: SailingModeController? = nil
     /// When non-`nil` the pane shows only that leaf subtopic beneath the Battery
     /// category; `nil` keeps the original full-pane layout (used by tests and
     /// by any caller that does not drive the two-level sidebar).
@@ -36,6 +37,7 @@ struct BatterySectionView: View {
         }
         panelVisibilityGroup
         chargeManagementGroup
+        sailingModeGroup
         if helper.isAvailable {
             powerModesGroup
         } else {
@@ -180,6 +182,228 @@ struct BatterySectionView: View {
             .padding(.horizontal, SettingsMetrics.rowPaddingH)
             .padding(.bottom, 6)
         }
+    }
+
+    /// Sailing Mode: the interval charge-limit controller and its two bounds.
+    private var sailingModeGroup: some View {
+        SettingsGroup(
+            localization.string(.settingsBatterySailingGroup),
+            footnote: localization.string(.settingsBatterySailingFootnote)
+        ) {
+            VStack(alignment: .leading, spacing: 6) {
+                SettingsToggleRow(
+                    symbol: "sailboat",
+                    tint: .blue,
+                    title: localization.string(.settingsBatterySailingEnable),
+                    subtitle: localization.string(
+                        .settingsBatterySailingEnableDescription
+                    ),
+                    subtitleStatus: sailingStatus,
+                    isOn: Binding(
+                        get: { store.isSailingModeEnabled },
+                        set: { store.isSailingModeEnabled = $0 }
+                    )
+                )
+                .disabled(!sailingFeatureAvailable)
+
+                if !sailingFeatureAvailable {
+                    SettingsHintRow(
+                        text: localization.string(
+                            helper.isAvailable
+                                ? .settingsBatterySailingHelperRequired
+                                : .settingsBatterySailingHelperUnavailable
+                        )
+                    )
+                } else if !helper.isReady {
+                    SettingsHintRow(
+                        text: localization.string(.settingsBatterySailingHelperRequired)
+                    )
+                }
+
+                if sailingMode != nil, !helper.isReady {
+                    Button {
+                        helper.openLoginItemsSettings()
+                    } label: {
+                        HStack(spacing: 6) {
+                            Image(systemName: helper.requiresApproval
+                                ? "exclamationmark.triangle.fill"
+                                : "arrow.up.forward.app")
+                                .foregroundStyle(
+                                    helper.requiresApproval ? Color.orange : Color.accentColor
+                                )
+                            Text(localization.string(.settingsBatterySailingOpenLoginItems))
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            Spacer(minLength: 0)
+                        }
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel(
+                        localization.string(.settingsBatterySailingOpenLoginItems)
+                    )
+                    .padding(.horizontal, SettingsMetrics.rowPaddingH)
+                    .padding(.bottom, 6)
+                }
+
+                if store.isSailingModeEnabled, sailingFeatureAvailable {
+                    SettingsDivider()
+                    SettingsRow(
+                        "battery.75percent",
+                        tint: .blue,
+                        title: localization.string(.settingsBatterySailingChargeLimit),
+                        subtitle: localization.string(
+                            .settingsBatterySailingChargeLimitDescription
+                        )
+                    ) {
+                        HStack(spacing: 8) {
+                            Slider(
+                                value: Binding(
+                                    get: { store.sailingChargeLimit },
+                                    set: {
+                                        store.sailingChargeLimit = $0.rounded()
+                                    }
+                                ),
+                                in: SettingsStore.sailingChargeLimitRange,
+                                step: 5
+                            )
+                            .frame(width: 120)
+                            .controlSize(.small)
+                            .accessibilityLabel(
+                                localization.string(.settingsBatterySailingChargeLimit)
+                            )
+                            .accessibilityValue(
+                                "\(Int(store.sailingChargeLimit))%"
+                            )
+
+                            Text("\(Int(store.sailingChargeLimit))%")
+                                .font(.system(size: 12, design: .monospaced))
+                                .foregroundStyle(.secondary)
+                                .frame(width: 44, alignment: .trailing)
+                        }
+                    }
+                    SettingsDivider()
+                    SettingsRow(
+                        SymbolFallback.name("water.waves", "drop.fill"),
+                        tint: .blue,
+                        title: localization.string(.settingsBatterySailingLevel),
+                        subtitle: localization.string(
+                            .settingsBatterySailingLevelDescription
+                        )
+                    ) {
+                        HStack(spacing: 8) {
+                            Slider(
+                                value: Binding(
+                                    get: { store.sailingLevel },
+                                    set: {
+                                        store.sailingLevel = $0.rounded()
+                                    }
+                                ),
+                                in: SettingsStore.sailingLevelRange,
+                                step: 1
+                            )
+                            .frame(width: 120)
+                            .controlSize(.small)
+                            .accessibilityLabel(
+                                localization.string(.settingsBatterySailingLevel)
+                            )
+                            .accessibilityValue(
+                                "\(Int(store.sailingLevel))%"
+                            )
+
+                            Text("\(Int(store.sailingLevel))%")
+                                .font(.system(size: 12, design: .monospaced))
+                                .foregroundStyle(.secondary)
+                                .frame(width: 44, alignment: .trailing)
+                        }
+                    }
+                    SettingsDivider()
+                    HStack(spacing: 6) {
+                        Image(systemName: SymbolFallback.name("sailboat.fill", "sailboat"))
+                            .font(.system(size: 11))
+                            .foregroundStyle(.blue)
+                        Text(localization.format(
+                            .settingsBatterySailingWillSailTo,
+                            max(
+                                20,
+                                Int(store.sailingChargeLimit)
+                                    - Int(store.sailingLevel)
+                            )
+                        ))
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                        Spacer(minLength: 0)
+                    }
+                    .padding(.horizontal, SettingsMetrics.rowPaddingH)
+                    .padding(.vertical, 8)
+
+                    if let chargeToFullNow, chargeToFullNow.isSettingAvailable {
+                        SettingsDivider()
+                        SailingChargeToFullActionView(
+                            controller: chargeToFullNow,
+                            battery: statusStore.snapshot.battery,
+                            isSailingEnabled: store.isSailingModeEnabled
+                        )
+                        .padding(.horizontal, SettingsMetrics.rowPaddingH)
+                        .padding(.vertical, 6)
+                    }
+                }
+
+                if store.isSailingModeEnabled,
+                   helper.isReady,
+                   sailingMode?.phase == .failed,
+                   let error = sailingMode?.lastError,
+                   !error.isEmpty {
+                    HStack(alignment: .firstTextBaseline, spacing: 6) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundStyle(.red)
+                        Text(localization.format(
+                            .settingsBatterySailingStateFailed,
+                            error
+                        ))
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                        .fixedSize(horizontal: false, vertical: true)
+                    }
+                    .padding(.horizontal, SettingsMetrics.rowPaddingH)
+                    .padding(.bottom, 6)
+                }
+            }
+        }
+    }
+
+    private var sailingFeatureAvailable: Bool {
+        sailingMode != nil && helper.isAvailable
+    }
+
+    private var sailingStatus: Text? {
+        guard let phase = sailingMode?.phase else { return nil }
+        let value: String
+        switch phase {
+        case .disabled:
+            return nil
+        case .unavailable:
+            value = localization.string(.settingsBatterySailingUnavailable)
+        case .waitingForPower:
+            value = localization.string(.settingsBatterySailingStateWaitingForPower)
+        case let .chargingToUpper(upper):
+            value = localization.format(.settingsBatterySailingStateCharging, upper)
+        case let .sailingDown(lower):
+            value = localization.format(.settingsBatterySailingStateSailing, lower)
+        case let .holding(lower, _):
+            value = localization.format(.settingsBatterySailingWillSailTo, lower)
+        case .lowBatteryOverride:
+            value = localization.string(.settingsBatterySailingStateLowBattery)
+        case .pausedForChargeToFull:
+            value = localization.string(.settingsBatterySailingStatePaused)
+        case .restoring:
+            value = localization.string(.settingsBatterySailingStatePaused)
+        case .failed:
+            // The error row below the switch carries the actual message.
+            return nil
+        }
+        return Text(value)
+            .foregroundColor(.secondary)
     }
 
     /// The privileged power-mode control and the low-battery automation.

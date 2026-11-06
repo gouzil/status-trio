@@ -95,7 +95,11 @@ final class SystemPrivilegedHelperService: PrivilegedHelperServicing {
     }
 
     func verifyConnection() async throws {
-        _ = try await XPCPrivilegedHelperClient().readLowPowerMode()
+        // Verify the XPC surface itself, not a feature that can legitimately
+        // fail on a given macOS (for example the pmset Low Power read). A
+        // feature-specific failure must not mark the whole helper unavailable
+        // and tear down Sailing Mode's persistent session.
+        _ = try await XPCPrivilegedHelperClient().readProtocolVersion()
     }
 
     func openLoginItemsSettings() {
@@ -125,6 +129,16 @@ final class PrivilegedHelperManager: ObservableObject {
     /// state so a registration that an earlier session left waiting for approval
     /// is still shown as on.
     @Published private(set) var isEnabled: Bool
+
+    /// Whether Sailing Mode needs the same LaunchDaemon. This does not turn the
+    /// Low Power Mode control on; it only keeps registration, approval polling
+    /// and health checks alive while the Sailing Mode opt-in is active.
+    @Published private(set) var sailingModeDemand = false
+
+    /// The one registration/health predicate both features share.
+    private var wantsHelper: Bool {
+        isEnabled || sailingModeDemand
+    }
 
     /// How often the system state is re-read while a registration is pending.
     private let pollInterval: Duration
@@ -207,14 +221,14 @@ final class PrivilegedHelperManager: ObservableObject {
 
     /// True while the system is waiting for the user to approve the helper.
     var requiresApproval: Bool {
-        isEnabled && (status == .requiresApproval || registrationNeedsApproval)
+        wantsHelper && (status == .requiresApproval || registrationNeedsApproval)
     }
 
     /// Actual usability, independent of the native approval report. On some
     /// systems the report remains pending even after launchd permits XPC.
     /// A successful read is evidence of availability, not a rewritten approval.
     var isReady: Bool {
-        isEnabled && status != .notRegistered && isHelperResponsive
+        wantsHelper && status != .notRegistered && isHelperResponsive
     }
 
     /// False when this build or process cannot offer the helper at all.
@@ -251,6 +265,27 @@ final class PrivilegedHelperManager: ObservableObject {
         // retry window.
         checkHelperIfNeeded(userInitiated: enabled)
         startRegistrationRetryWindow()
+    }
+
+    /// Keeps the shared helper registered and probed while Sailing Mode is on.
+    ///
+    /// Low Power Mode and Sailing Mode are two consumers of one LaunchDaemon.
+    /// This demand switch must not alter `isEnabled`, which remains the Low
+    /// Power Mode UI's own state.
+    func setSailingModeDemand(_ active: Bool) {
+        guard isAvailable, sailingModeDemand != active else { return }
+        sailingModeDemand = active
+        if active {
+            registerIfNeeded()
+        }
+        publishSystemState()
+        updateStatusPolling()
+        checkHelperIfNeeded(userInitiated: active)
+        if active {
+            startRegistrationRetryWindow()
+        } else {
+            cancelRegistrationRetry()
+        }
     }
 
     /// Restores intent; pending registration gets the same delayed retries.
@@ -324,7 +359,7 @@ final class PrivilegedHelperManager: ObservableObject {
     /// A pending approval is an expected intermediate state, including when
     /// macOS reports EPERM from register(). Leave its registration intact.
     private func registerIfNeeded() {
-        guard isEnabled, isAvailable, status != .enabled, !isReady else { return }
+        guard wantsHelper, isAvailable, status != .enabled, !isReady else { return }
         do {
             try service.register()
         } catch {
@@ -362,7 +397,7 @@ final class PrivilegedHelperManager: ObservableObject {
     /// Retry only register(), at 2, 6, 14, 30 and 60 seconds by default.
     /// Polling stays read-only; a new user interaction may start another window.
     private func startRegistrationRetryWindow() {
-        guard isAvailable, isEnabled, status != .enabled, !isReady,
+        guard isAvailable, wantsHelper, status != .enabled, !isReady,
               registrationRetryTask == nil else { return }
         let retryGeneration = registrationRetryGeneration
         registrationRetryTask = Task { [weak self, pollInterval] in
@@ -372,7 +407,7 @@ final class PrivilegedHelperManager: ObservableObject {
                 guard !Task.isCancelled, let self,
                       self.registrationRetryGeneration == retryGeneration else { return }
                 self.refresh()
-                guard self.isEnabled, self.isAvailable else { break }
+                guard self.wantsHelper, self.isAvailable else { break }
                 if self.status == .enabled || self.isReady { break }
                 self.registerIfNeeded()
                 self.refresh()
@@ -382,7 +417,7 @@ final class PrivilegedHelperManager: ObservableObject {
             self.registrationRetryTask = nil
             // EPERM alone is not proof of pending consent. If the service
             // never registered, retire the provisional hint and expose why.
-            if self.isEnabled, self.status == .notRegistered,
+            if self.wantsHelper, self.status == .notRegistered,
                let error = self.provisionalRegistrationError {
                 self.registrationNeedsApproval = false
                 self.provisionalRegistrationError = nil
@@ -431,7 +466,7 @@ final class PrivilegedHelperManager: ObservableObject {
     /// would otherwise look like it randomly failed. Each new user action
     /// opens its own window; the scheduled probes in between never do.
     private func checkHelperIfNeeded(forceRead: Bool = false, userInitiated: Bool = false) {
-        guard isEnabled, isAvailable, status != .notRegistered,
+        guard wantsHelper, isAvailable, status != .notRegistered,
               verificationTask == nil else { return }
         switch status {
         case .enabled:
@@ -445,7 +480,7 @@ final class PrivilegedHelperManager: ObservableObject {
         let requestGeneration = generation
         if userInitiated { pendingProbeAttempts = 0 }
         verificationTask = Task { [weak self] in
-            guard let self, !Task.isCancelled, self.isEnabled,
+            guard let self, !Task.isCancelled, self.wantsHelper,
                   self.generation == requestGeneration else { return }
             defer {
                 if self.recoveringGeneration == requestGeneration {
@@ -457,7 +492,7 @@ final class PrivilegedHelperManager: ObservableObject {
                 try await self.service.verifyConnection()
             } catch {
                 guard !Task.isCancelled, self.generation == requestGeneration,
-                      self.isEnabled else { return }
+                      self.wantsHelper else { return }
                 let wasResponsive = self.isHelperResponsive
                 self.isHelperResponsive = false
                 // A pending helper that cannot be read is expected on a machine
@@ -501,7 +536,7 @@ final class PrivilegedHelperManager: ObservableObject {
                     self.recoveringGeneration = requestGeneration
                     try await self.service.unregisterForRecovery()
                     guard !Task.isCancelled, self.generation == requestGeneration,
-                          self.isEnabled else { return }
+                          self.wantsHelper else { return }
                     try self.service.register()
                     self.recoveringGeneration = nil
                     guard self.service.status == .enabled else {
@@ -520,7 +555,7 @@ final class PrivilegedHelperManager: ObservableObject {
                 }
             }
             guard !Task.isCancelled, self.generation == requestGeneration,
-                  self.isEnabled, self.service.status != .notRegistered else { return }
+                  self.wantsHelper, self.service.status != .notRegistered else { return }
             self.isHelperResponsive = true
             self.pendingProbeAttempts = 0
             // A completed round trip is proof the recovery budget can start
@@ -551,7 +586,7 @@ final class PrivilegedHelperManager: ObservableObject {
     /// the only way the settings pane catches up without the user having to
     /// touch the app's switch again. The poll is read-only on purpose.
     private func updateStatusPolling() {
-        guard isAvailable, isEnabled else {
+        guard isAvailable, wantsHelper else {
             pollTask?.cancel()
             pollTask = nil
             return

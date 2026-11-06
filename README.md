@@ -99,6 +99,7 @@ The following features are in the source on `main`, but are not included in the 
 
 - **Battery power flow and CPU energy impact** — the battery panel can show estimated charger input, power flowing into the battery, and system power. An optional list ranks up to five apps by CPU energy, falling back to CPU activity when energy counters are unavailable. This is not total app energy consumption or a copy of the macOS high-energy list. Enabling the list starts periodic background sampling; turning it off stops sampling. See [power flow and CPU energy impact](docs/battery-power-flow.md).
 - **Charge to Full Now, with cancellation** — a button for supported Apple silicon Macs on macOS 26.4 or later temporarily overrides the native charge limit. It uses a private PowerUI interface and is enabled by default only when the capability is available; you can turn it off in Battery settings. **The charge limit may remain at 100% after charging or unplugging; it is not automatically restored.** Use **Cancel Charge to Full** to restore the limit configured in Battery settings ("Restore Limit After Cancelling", 80–100%, defaulting to the system limit), or check and restore it in System Settings. Availability and behavior depend on macOS. See [behavior and verification](docs/charge-to-full-now-poc.md).
+- **Sailing Mode** — on supported Apple silicon Macs with macOS 26.4 or later, set a charge limit and a sailing level. A **Charge to Full Now** action in the sailing settings ignores the sailing range while plugged in; it pauses sailing and can be cancelled. Charging pauses inside the sailing range and resumes only when the battery reaches the lower limit; it never forces discharge, and below 20% charging is always allowed. It applies the native macOS Charge Limit through the privileged power helper and restores the user's setting when turned off or when the app quits. See [Sailing Mode](docs/sailing-mode.md).
 
 ## Bluetooth audio
 
@@ -198,7 +199,7 @@ The ad-hoc-signed bundle is intended for local personal use. Gatekeeper may reje
 Two boundaries macOS and this project draw deliberately. Both are explained in [Known limitations](docs/known-limitations.md).
 
 - **Switching networks happens in System Settings.** Choosing a network in the popover opens the Wi-Fi pane; Status Trio never reads or stores Wi-Fi passwords, because macOS offers no public API to connect with a saved password and every alternative ends with the app holding them.
-- **Charge-limit controls depend on the version.** Release 1.7.5 opens System Settings for charging overrides. The opt-in action on `main` uses a private interface and requires explicit cancellation to request restoration; see [New on main](#new-on-main-not-yet-released). Low Power Mode uses a separate [opt-in privileged helper](docs/privileged-helper.md).
+- **Charge-limit controls depend on the version.** Release 1.7.5 opens System Settings for charging overrides. The opt-in action on `main` uses a private interface and requires explicit cancellation to request restoration; see [New on main](#new-on-main-not-yet-released). Low Power Mode and Sailing Mode use a separate [opt-in privileged helper](docs/privileged-helper.md); Sailing Mode needs macOS 26.4 or later on Apple silicon and keeps modifying the system Charge Limit until it is turned off or Status Trio quits.
 
 ## Languages
 

@@ -118,6 +118,25 @@ does not add SMC writes or a background charge watcher. Low Power Mode uses a
 separate opt-in privileged helper, which does not control the charge limit;
 see [privileged helper](privileged-helper.md).
 
+## Sailing Mode is a system Charge Limit session, not a background daemon
+
+Sailing Mode on `main` requires macOS 26.4 or later on Apple silicon, an
+approved privileged helper, and a working system Charge Limit. It changes the
+macOS Charge Limit while it runs and restores the user's setting when turned
+off. The app keeps a persistent XPC connection while sailing; if the app quits
+or crashes, the helper restores the saved setting when the last connection
+closes and then idle-exits. A forced kill of both processes can leave the
+saved marker for the next helper connection to clean up; check System Settings
+if in doubt.
+
+The feature is intentionally not offered on Intel Macs or macOS releases
+without the native Charge Limit. It does not fall back to legacy `CH0B` SMC
+writes, because those keys are absent or entitlement-gated on current macOS
+and a partial fallback would be less trustworthy than disabling the control.
+macOS may temporarily override the limit for its periodic battery calibration
+charge; Sailing Mode does not fight that system behavior. See
+[Sailing Mode](sailing-mode.md).
+
 ## One Bluetooth battery source is undocumented
 
 Bluetooth battery levels come from `system_profiler -json SPBluetoothDataType`, a

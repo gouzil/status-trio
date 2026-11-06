@@ -58,12 +58,19 @@ extension PrivilegedHelperManager: HelperReadinessProviding {
     /// The same `isReady` rule the UI gates the switches with, re-published so
     /// the automation can re-evaluate when approval or responsiveness lands.
     var readinessPublisher: AnyPublisher<Bool, Never> {
-        Publishers.CombineLatest3($isEnabled, $status, $isHelperResponsive)
-            .map { enabled, status, isResponsive in
-                enabled && status != .notRegistered && isResponsive
-            }
-            .removeDuplicates()
-            .eraseToAnyPublisher()
+        Publishers.CombineLatest4(
+            $isEnabled,
+            $sailingModeDemand,
+            $status,
+            $isHelperResponsive
+        )
+        .map { enabled, sailingDemand, status, isResponsive in
+            (enabled || sailingDemand)
+                && status != .notRegistered
+                && isResponsive
+        }
+        .removeDuplicates()
+        .eraseToAnyPublisher()
     }
 }
 

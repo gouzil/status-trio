@@ -9,6 +9,8 @@ final class AppEnvironment {
     let iconPresentation: IconPresentationViewModel
     let statusBarController: StatusBarController
     let settingsWindowController: SettingsWindowController
+    let sailingMode: SailingModeController?
+    private let chargeToFullNow: ChargeToFullNowController?
     let onboardingWindowController: OnboardingWindowController
     let activationPolicy: AppActivationPolicy
     let appIconController: AppIconController
@@ -29,6 +31,7 @@ final class AppEnvironment {
     let backgroundUITesting: BackgroundUITestingConfiguration
 
     private var chargingEffectCancellables = Set<AnyCancellable>()
+    private var sailingModeCancellables = Set<AnyCancellable>()
     private var inputSourceLifecycleCancellables = Set<AnyCancellable>()
     private var previewResourceLifecycleCancellables = Set<AnyCancellable>()
     private var hasSubscribedToChargingEffectInputs = false
@@ -45,6 +48,8 @@ final class AppEnvironment {
         iconPresentation: IconPresentationViewModel,
         statusBarController: StatusBarController,
         settingsWindowController: SettingsWindowController,
+        sailingMode: SailingModeController? = nil,
+        chargeToFullNow: ChargeToFullNowController? = nil,
         onboardingWindowController: OnboardingWindowController,
         activationPolicy: AppActivationPolicy,
         appIconController: AppIconController,
@@ -67,6 +72,8 @@ final class AppEnvironment {
         self.iconPresentation = iconPresentation
         self.statusBarController = statusBarController
         self.settingsWindowController = settingsWindowController
+        self.sailingMode = sailingMode
+        self.chargeToFullNow = chargeToFullNow
         self.onboardingWindowController = onboardingWindowController
         self.activationPolicy = activationPolicy
         self.appIconController = appIconController
@@ -143,6 +150,9 @@ final class AppEnvironment {
             settings: settings,
             helper: PrivilegedHelperManager.shared
         )
+        PrivilegedHelperManager.shared.setSailingModeDemand(settings.isSailingModeEnabled)
+        sailingMode?.start()
+        bindSailingModeInputs()
         store.bindInputSettings(settings)
         store.bindLocalIPSettings(settings)
         store.bindApplicationEnergySettings(settings)
@@ -175,6 +185,10 @@ final class AppEnvironment {
         chargingEffectMotionMonitor.onChange = nil
         chargingEffectMotionMonitor.stop()
         chargingEffectCancellables.removeAll()
+        sailingModeCancellables.removeAll()
+        if let sailingMode {
+            Task { await sailingMode.stop() }
+        }
         bluetoothAudioIconOverrideSynchronizer.stop()
         bluetoothNearbyBatteryOptOutSynchronizer.stop()
         lowPowerModeControlSynchronizer.stop()
@@ -252,6 +266,45 @@ final class AppEnvironment {
             }
         }
         .store(in: &inputSourceLifecycleCancellables)
+    }
+
+    /// Sailing Mode reacts to the battery stream and to Charge to Full Now,
+    /// which owns the same system charge-limit state. Combining both here
+    /// keeps the controller free of view and app-lifecycle knowledge.
+    private func bindSailingModeInputs() {
+        guard sailingModeCancellables.isEmpty,
+              let sailingMode,
+              let chargeToFullNow else { return }
+        settings.$isSailingModeEnabled
+            .removeDuplicates()
+            .sink { enabled in
+                PrivilegedHelperManager.shared.setSailingModeDemand(enabled)
+            }
+            .store(in: &sailingModeCancellables)
+
+        Publishers.CombineLatest(
+            store.$snapshot
+                .map(\.battery)
+                .removeDuplicates(),
+            chargeToFullNow.$presentation
+                .map { Self.isChargeToFullActive($0) }
+                .removeDuplicates()
+        )
+        .sink { battery, chargeToFullActive in
+            sailingMode.update(
+                battery: battery,
+                chargeToFullActive: chargeToFullActive
+            )
+        }
+        .store(in: &sailingModeCancellables)
+    }
+
+    private static func isChargeToFullActive(
+        _ presentation: ChargeToFullNowPresentation
+    ) -> Bool {
+        presentation.isApplying
+            || presentation.isChargingToFull
+            || presentation.isCancelling
     }
 
     private func subscribeToChargingEffectInputs() {
@@ -475,6 +528,10 @@ final class AppEnvironment {
                 Int(settings.chargeToFullRestoreLimit.rounded())
             }
         )
+        let sailingMode = SailingModeController(
+            settings: settings,
+            client: XPCPrivilegedHelperClient()
+        )
         let dockChargingAnimationPresenter: any DockChargingAnimationPresenting =
             DockChargingAnimationRendererMode.usesApplicationIconFrames()
                 ? DockApplicationIconChargingPresenter()
@@ -523,6 +580,7 @@ final class AppEnvironment {
             inputSourceController: inputSourceController,
             globalShortcutController: globalShortcutController,
             chargeToFullNow: chargeToFullNow,
+            sailingMode: sailingMode,
             backgroundUITesting: backgroundUITesting
         )
         settingsWindowController = resolvedSettingsWindowController
@@ -586,6 +644,8 @@ final class AppEnvironment {
             iconPresentation: iconPresentation,
             statusBarController: controller,
             settingsWindowController: resolvedSettingsWindowController,
+            sailingMode: sailingMode,
+            chargeToFullNow: chargeToFullNow,
             onboardingWindowController: onboardingWindowController,
             activationPolicy: activationPolicy,
             appIconController: appIconController,

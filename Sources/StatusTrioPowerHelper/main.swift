@@ -9,7 +9,12 @@ import PowerHelperProtocol
 // daemon owns its own lifetime: the monitor ends the process once the app's
 // connections are gone instead of leaving a root daemon behind.
 let idleExit = IdleExitMonitor()
-let delegate = ListenerDelegate(service: PowerModeService(), idleExit: idleExit)
+let service = PowerModeService()
+let delegate = ListenerDelegate(
+    service: service,
+    idleExit: idleExit,
+    onAllConnectionsClosed: { service.restoreSailingLimitOnClientDisconnect() }
+)
 let listener = NSXPCListener(machServiceName: PowerHelperConstants.machServiceName)
 listener.delegate = delegate
 // Authoritative client gate: Foundation evaluates this against the peer's audit

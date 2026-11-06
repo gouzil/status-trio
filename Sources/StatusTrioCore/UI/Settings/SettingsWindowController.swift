@@ -12,6 +12,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private let inputSourceController: InputSourceController
     private let globalShortcutController: GlobalShortcutController?
     private let chargeToFullNow: ChargeToFullNowController?
+    private let sailingMode: SailingModeController?
     private let activationPolicy: AppActivationPolicy
     private let showIconGuide: () -> Void
     private let backgroundUITesting: BackgroundUITestingConfiguration
@@ -42,6 +43,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         inputSourceController: InputSourceController? = nil,
         globalShortcutController: GlobalShortcutController? = nil,
         chargeToFullNow: ChargeToFullNowController? = nil,
+        sailingMode: SailingModeController? = nil,
         backgroundUITesting: BackgroundUITestingConfiguration = .disabled,
         presentWindow: @escaping @MainActor (NSWindow, SettingsWindowPresentation) -> Void = {
             window, mode in mode.present(window)
@@ -54,6 +56,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         self.inputSourceController = inputSourceController ?? InputSourceController()
         self.globalShortcutController = globalShortcutController
         self.chargeToFullNow = chargeToFullNow
+        self.sailingMode = sailingMode
         self.activationPolicy = activationPolicy
         self.showIconGuide = showIconGuide
         self.backgroundUITesting = backgroundUITesting
@@ -226,6 +229,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
                 inputSourceController: inputSourceController,
                 globalShortcutController: globalShortcutController,
                 chargeToFullNow: chargeToFullNow,
+                sailingMode: sailingMode,
                 onShowIconGuide: showIconGuide,
                 consumePendingSection: { [weak self] in self?.takePendingSection() },
                 consumePendingSubtopic: { [weak self] in self?.takePendingSubtopic() }

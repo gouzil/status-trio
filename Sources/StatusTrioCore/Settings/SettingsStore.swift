@@ -32,6 +32,16 @@ final class SettingsStore: ObservableObject {
     static let chargeToFullRestoreLimitRange: ClosedRange<Double> = 80...95
     static let defaultChargeToFullRestoreLimit: Double = 95
     static let chargeToFullRestoreLimitDefaultsKey = "chargeToFullRestoreLimit"
+    /// Sailing Mode keeps the battery between this charge limit and a lower
+    /// level. The lower level is `sailingChargeLimit - sailingLevel`, floored
+    /// at 20%.
+    static let sailingChargeLimitRange: ClosedRange<Double> = 20...95
+    static let defaultSailingChargeLimit: Double = 80
+    static let sailingChargeLimitDefaultsKey = "sailingChargeLimit"
+    static let sailingLevelRange: ClosedRange<Double> = 1...15
+    static let defaultSailingLevel: Double = 5
+    static let sailingLevelDefaultsKey = "sailingLevel"
+    static let isSailingModeEnabledDefaultsKey = "isSailingModeEnabled"
     static let batterySymbolScaleRange: ClosedRange<Double> = 0.9...1.1
     static let defaultBatterySymbolScale: Double = 1
     static let showsBatteryPercentageDefaultsKey = "showsBatteryPercentage"
@@ -552,6 +562,42 @@ final class SettingsStore: ObservableObject {
                 clamped,
                 forKey: Self.chargeToFullRestoreLimitDefaultsKey
             )
+        }
+    }
+
+    /// Whether Sailing Mode is active. Off by default: enabling it changes the
+    /// system Charge Limit and needs the privileged helper.
+    @Published var isSailingModeEnabled: Bool {
+        didSet {
+            defaults.set(
+                isSailingModeEnabled,
+                forKey: Self.isSailingModeEnabledDefaultsKey
+            )
+        }
+    }
+
+    /// The upper charge limit Sailing Mode charges to.
+    @Published var sailingChargeLimit: Double {
+        didSet {
+            let clamped = Self.clampedSailingChargeLimit(sailingChargeLimit)
+            guard clamped == sailingChargeLimit else {
+                sailingChargeLimit = clamped
+                return
+            }
+            defaults.set(clamped, forKey: Self.sailingChargeLimitDefaultsKey)
+        }
+    }
+
+    /// How far below `sailingChargeLimit` the battery sails before charging
+    /// resumes. Recommended 5–10%; the lower bound is always at least 20%.
+    @Published var sailingLevel: Double {
+        didSet {
+            let clamped = Self.clampedSailingLevel(sailingLevel)
+            guard clamped == sailingLevel else {
+                sailingLevel = clamped
+                return
+            }
+            defaults.set(clamped, forKey: Self.sailingLevelDefaultsKey)
         }
     }
 
@@ -1871,6 +1917,19 @@ final class SettingsStore: ObservableObject {
         // Initialization does not call didSet; keep the initial restore target
         // even when macOS removes its charge-limit policy during an override.
         defaults.set(resolvedRestoreLimit, forKey: Self.chargeToFullRestoreLimitDefaultsKey)
+        self.isSailingModeEnabled = defaults.bool(
+            forKey: Self.isSailingModeEnabledDefaultsKey
+        )
+        self.sailingChargeLimit = Self.clampedSailingChargeLimit(
+            (defaults.object(
+                forKey: Self.sailingChargeLimitDefaultsKey
+            ) as? NSNumber)?.doubleValue ?? Self.defaultSailingChargeLimit
+        )
+        self.sailingLevel = Self.clampedSailingLevel(
+            (defaults.object(
+                forKey: Self.sailingLevelDefaultsKey
+            ) as? NSNumber)?.doubleValue ?? Self.defaultSailingLevel
+        )
         self.showsWiFiIconForEthernet = defaults.object(
             forKey: Self.showsWiFiIconForEthernetDefaultsKey
         ) as? Bool ?? false
@@ -2193,6 +2252,23 @@ final class SettingsStore: ObservableObject {
         return min(
             batteryFullThresholdRange.upperBound,
             max(batteryFullThresholdRange.lowerBound, value)
+        ).rounded()
+    }
+
+    static func clampedSailingChargeLimit(_ value: Double) -> Double {
+        guard value.isFinite else { return defaultSailingChargeLimit }
+        let clamped = min(
+            sailingChargeLimitRange.upperBound,
+            max(sailingChargeLimitRange.lowerBound, value)
+        )
+        return (clamped / 5).rounded() * 5
+    }
+
+    static func clampedSailingLevel(_ value: Double) -> Double {
+        guard value.isFinite else { return defaultSailingLevel }
+        return min(
+            sailingLevelRange.upperBound,
+            max(sailingLevelRange.lowerBound, value)
         ).rounded()
     }
 

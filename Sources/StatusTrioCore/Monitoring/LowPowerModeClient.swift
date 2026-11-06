@@ -52,6 +52,22 @@ final class XPCPrivilegedHelperClient: LowPowerModeClienting, @unchecked Sendabl
         }
     }
 
+    /// Verifies the XPC surface without depending on a Low Power Mode read.
+    /// `PrivilegedHelperManager` uses this as its health probe: the Sailing
+    /// Mode helper must remain usable when `pmset`'s Low Power reading is
+    /// unavailable on a particular macOS release.
+    func readProtocolVersion() async throws -> Int {
+        try await withProxy { proxy, finish in
+            proxy.readProtocolVersion { version, error in
+                if let error {
+                    finish(.failure(LowPowerModeClientError.rejected(error)))
+                } else {
+                    finish(.success(version))
+                }
+            }
+        }
+    }
+
     private static func result(enabled: Bool, error: String?) -> Result<Bool, any Error> {
         if let error {
             return .failure(LowPowerModeClientError.rejected(error))
@@ -59,9 +75,9 @@ final class XPCPrivilegedHelperClient: LowPowerModeClienting, @unchecked Sendabl
         return .success(enabled)
     }
 
-    private func withProxy(
-        _ body: @escaping (any PowerHelperXPCProtocol, @escaping (Result<Bool, any Error>) -> Void) -> Void
-    ) async throws -> Bool {
+    private func withProxy<Value: Sendable>(
+        _ body: @escaping (any PowerHelperXPCProtocol, @escaping (Result<Value, any Error>) -> Void) -> Void
+    ) async throws -> Value {
         try await withCheckedThrowingContinuation { continuation in
             queue.async {
                 let connection = NSXPCConnection(

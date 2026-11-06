@@ -1,8 +1,9 @@
 # Privileged power helper
 
-Status Trio ships one privileged helper. It exists for a single job: turning
-macOS Low Power Mode on or off. That is the only operation it exposes, and the
-only reason it needs root.
+Status Trio ships one privileged helper. It serves two app features: turning
+macOS Low Power Mode on or off, and applying the macOS Charge Limit used by
+Sailing Mode. Both operations need root; the helper exposes only fixed,
+feature-level commands and never an arbitrary SMC key writer.
 
 ## Why a helper at all
 
@@ -161,6 +162,39 @@ Because the requirement is Apple-anchored, an Ad-hoc-signed build can never
 satisfy it. That is intentional: relaxing the requirement to make Ad-hoc work
 would let any unsigned binary drive the daemon. Local end-to-end testing
 therefore needs a Developer ID identity (see below), not an Ad-hoc build.
+
+## Sailing Mode (protocol version 3)
+
+Sailing Mode needs the system's Manual Charge Limit, whose preference domain is
+root-owned: `com.apple.smartcharging.topoffprotection` under `/var/root`.
+The helper writes `MCLFeatureState` / `mclLimitValue`, posts
+`com.apple.smartcharging.defaultschanged`, and uses the private
+`PowerUISmartChargeClient` only to call `disableMCL:` when restoring the user's
+original setting. It does not write SMC keys; on macOS 27 the old
+`CH0B`/`CH0C`/`CHTE` keys no longer exist for third-party root processes.
+
+The protocol is version 3. `readSailingChargeLimitCapability` probes the
+PowerUI class and `pmset -g battlimit`; `readSailingChargeLimit` reports `-1`
+when Sailing Mode has not applied a limit; `applySailingChargeLimit` and
+`restoreSailingChargeLimit` are the only writes. The first apply saves the
+user's original switch and target to
+`/Library/Application Support/StatusTrio/saved-native-limit` (0755 directory,
+0644 file, atomic write). The restore path consumes that marker only after
+`disableMCL:` and the preference rewrite both succeed.
+
+The app keeps one persistent XPC connection open for the whole Sailing Mode
+session. When the last accepted connection closes — including App crash or
+quit — `ListenerDelegate` calls `restoreSailingLimitOnClientDisconnect()`
+before the daemon idles out. This is the safety net that prevents a user's
+Charge Limit from being left at 70% or 80% indefinitely.
+
+Live verification of the root preference write, `notify_post`, `disableMCL:`
+and the signed v3 XPC round trip is **NOT RUN** in CI; it needs a Developer ID
+build signed by the configured team (`HCB7JKMQ2F` by default, or a matching
+development team for a local test build) and an approved helper. An ad-hoc
+local build has no team identifier and will always show the helper as
+unavailable; the Login Items pane cannot authorize it. Unit tests use a fake
+transport.
 
 ## Build variants
 

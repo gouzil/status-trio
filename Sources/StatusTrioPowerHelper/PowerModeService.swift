@@ -254,11 +254,20 @@ private final class PmsetCompletion: @unchecked Sendable {
 }
 
 /// The object the daemon exports over XPC.
-final class PowerModeService: NSObject, PowerHelperXPCProtocol {
+///
+/// `@unchecked Sendable`: every stored property is immutable and sendable
+/// (`runner` and `sailing` are both `Sendable`), and the exported methods hand
+/// all work to `Task` instead of mutating the service.
+final class PowerModeService: NSObject, PowerHelperXPCProtocol, @unchecked Sendable {
     private let runner: any PmsetRunning
+    private let sailing: NativeChargeLimitController
 
-    init(runner: any PmsetRunning = SystemPmsetRunner()) {
+    init(
+        runner: any PmsetRunning = SystemPmsetRunner(),
+        sailing: NativeChargeLimitController = NativeChargeLimitController()
+    ) {
         self.runner = runner
+        self.sailing = sailing
     }
 
     func readLowPowerMode(withReply reply: @escaping (Bool, String?) -> Void) {
@@ -339,6 +348,73 @@ final class PowerModeService: NSObject, PowerHelperXPCProtocol {
                 return
             }
             reply.send(observed, nil)
+        }
+    }
+
+    // MARK: - Sailing Mode charge limit (protocol version 3)
+
+    func readSailingChargeLimitCapability(withReply reply: @escaping (Bool, String?) -> Void) {
+        let reply = PowerHelperReply(reply)
+        let sailing = self.sailing
+        Task {
+            reply.send(sailing.capability(), nil)
+        }
+    }
+
+    func readSailingChargeLimit(withReply reply: @escaping (Int, String?) -> Void) {
+        let reply = PowerHelperReply(reply)
+        let sailing = self.sailing
+        Task {
+            // `-1` is the protocol's "not applied" sentinel; an unavailable
+            // read is reported the same way so the app treats it as inactive.
+            reply.send(sailing.readAppliedLimit(), nil)
+        }
+    }
+
+    func applySailingChargeLimit(
+        _ percent: Int,
+        withReply reply: @escaping (Bool, String?) -> Void
+    ) {
+        let reply = PowerHelperReply(reply)
+        let sailing = self.sailing
+        Task {
+            do {
+                try sailing.apply(percent: percent)
+            } catch {
+                reply.send(false, error.localizedDescription)
+                return
+            }
+            reply.send(true, nil)
+        }
+    }
+
+    func restoreSailingChargeLimit(withReply reply: @escaping (Bool, String?) -> Void) {
+        let reply = PowerHelperReply(reply)
+        let sailing = self.sailing
+        Task {
+            do {
+                try sailing.restore()
+            } catch {
+                reply.send(false, error.localizedDescription)
+                return
+            }
+            reply.send(true, nil)
+        }
+    }
+
+    /// Called by the listener when the last XPC client disconnects, before the
+    /// daemon idles out. Quitting or crashing the app must not leave the Mac at
+    /// a Sailing Mode charge limit the user did not choose.
+    ///
+    /// Best effort and detached from the connection queue: there is no reply to
+    /// send, and the result is only logged.
+    func restoreSailingLimitOnClientDisconnect() {
+        let sailing = self.sailing
+        Task {
+            guard !sailing.restoreIfNeeded() else { return }
+            NSLog(
+                "StatusTrioPowerHelper could not restore the Sailing Mode charge limit after the last client disconnected"
+            )
         }
     }
 }
