@@ -826,3 +826,9 @@
 "settings.battery.sailing.footnote" = "セーリングモードは実行中に macOS の充電上限を変更し、オフにすると元の設定に戻します。ファームウェアが目標値に追従するには Mac が起きている必要があります。";
 "settings.battery.sailing.helperUnavailable" = "このビルドでは電源ヘルパーを利用できません。Developer ID 署名済みのビルドをインストールしてください。";
 "settings.battery.sailing.openLoginItems" = "ログイン項目設定を開く";
+
+"settings.battery.magSafeLED.group" = "MagSafe LED";
+"settings.battery.magSafeLED.control" = "充電上限を表示";
+"settings.battery.magSafeLED.description" = "MagSafe LED で充電状態を表示します。上限到達時またはセーリングモード停止中は緑、充電中はオレンジです。";
+"settings.battery.magSafeLED.unavailable" = "この Mac は MagSafe LED 制御に対応していません。";
+"settings.battery.magSafeLED.error" = "MagSafe LED の書き込みに失敗しました: %@";

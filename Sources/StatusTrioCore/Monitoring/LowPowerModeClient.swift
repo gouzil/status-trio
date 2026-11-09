@@ -68,6 +68,56 @@ final class XPCPrivilegedHelperClient: LowPowerModeClienting, @unchecked Sendabl
         }
     }
 
+    // MARK: - MagSafe LED (protocol version 4)
+
+    func readMagSafeLEDCapability() async throws -> Bool {
+        try await withProxy { proxy, finish in
+            proxy.readMagSafeLEDCapability { supported, error in
+                if let error {
+                    finish(.failure(LowPowerModeClientError.rejected(error)))
+                } else {
+                    finish(.success(supported))
+                }
+            }
+        }
+    }
+
+    func readMagSafeLEDState() async throws -> Int {
+        try await withProxy { proxy, finish in
+            proxy.readMagSafeLEDState { value, error in
+                if let error {
+                    finish(.failure(LowPowerModeClientError.rejected(error)))
+                } else {
+                    finish(.success(value))
+                }
+            }
+        }
+    }
+
+    func setMagSafeLED(_ color: MagSafeLEDColor) async throws -> Bool {
+        try await withProxy { proxy, finish in
+            proxy.setMagSafeLED(color.rawValue) { succeeded, error in
+                if let error {
+                    finish(.failure(LowPowerModeClientError.rejected(error)))
+                } else {
+                    finish(.success(succeeded))
+                }
+            }
+        }
+    }
+
+    func restoreMagSafeLED() async throws -> Bool {
+        try await withProxy { proxy, finish in
+            proxy.restoreMagSafeLED { succeeded, error in
+                if let error {
+                    finish(.failure(LowPowerModeClientError.rejected(error)))
+                } else {
+                    finish(.success(succeeded))
+                }
+            }
+        }
+    }
+
     private static func result(enabled: Bool, error: String?) -> Result<Bool, any Error> {
         if let error {
             return .failure(LowPowerModeClientError.rejected(error))

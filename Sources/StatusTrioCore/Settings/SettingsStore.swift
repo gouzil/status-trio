@@ -42,6 +42,7 @@ final class SettingsStore: ObservableObject {
     static let defaultSailingLevel: Double = 5
     static let sailingLevelDefaultsKey = "sailingLevel"
     static let isSailingModeEnabledDefaultsKey = "isSailingModeEnabled"
+    static let isMagSafeLEDControlEnabledDefaultsKey = "isMagSafeLEDControlEnabled"
     static let batterySymbolScaleRange: ClosedRange<Double> = 0.9...1.1
     static let defaultBatterySymbolScale: Double = 1
     static let showsBatteryPercentageDefaultsKey = "showsBatteryPercentage"
@@ -572,6 +573,17 @@ final class SettingsStore: ObservableObject {
             defaults.set(
                 isSailingModeEnabled,
                 forKey: Self.isSailingModeEnabledDefaultsKey
+            )
+        }
+    }
+
+    /// Whether Status Trio mirrors the charge/limit state to the MagSafe LED.
+    /// Off by default; enabling it uses the fixed `ACLC` helper operation.
+    @Published var isMagSafeLEDControlEnabled: Bool {
+        didSet {
+            defaults.set(
+                isMagSafeLEDControlEnabled,
+                forKey: Self.isMagSafeLEDControlEnabledDefaultsKey
             )
         }
     }
@@ -1921,6 +1933,9 @@ final class SettingsStore: ObservableObject {
         defaults.set(resolvedRestoreLimit, forKey: Self.chargeToFullRestoreLimitDefaultsKey)
         self.isSailingModeEnabled = defaults.bool(
             forKey: Self.isSailingModeEnabledDefaultsKey
+        )
+        self.isMagSafeLEDControlEnabled = defaults.bool(
+            forKey: Self.isMagSafeLEDControlEnabledDefaultsKey
         )
         self.sailingChargeLimit = Self.clampedSailingChargeLimit(
             (defaults.object(

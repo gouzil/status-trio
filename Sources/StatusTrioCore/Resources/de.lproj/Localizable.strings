@@ -826,3 +826,9 @@
 "settings.battery.sailing.footnote" = "Der Segelmodus ändert während des Betriebs die macOS-Ladegrenze und stellt beim Ausschalten deine ursprüngliche Einstellung wieder her. Der Mac muss wach bleiben, damit die Firmware das Ziel befolgt.";
 "settings.battery.sailing.helperUnavailable" = "Der Energie-Helfer ist in diesem Build nicht verfügbar. Installiere einen mit Developer ID signierten Build.";
 "settings.battery.sailing.openLoginItems" = "Anmeldeobjekte öffnen";
+
+"settings.battery.magSafeLED.group" = "MagSafe-LED";
+"settings.battery.magSafeLED.control" = "Ladelimit anzeigen";
+"settings.battery.magSafeLED.description" = "Die MagSafe-LED zeigt den Ladezustand: Grün bei erreichtem Limit oder pausiertem Segelmodus, Bernstein während des Ladens.";
+"settings.battery.magSafeLED.unavailable" = "Dieser Mac unterstützt die MagSafe-LED-Steuerung nicht.";
+"settings.battery.magSafeLED.error" = "Schreiben der MagSafe-LED fehlgeschlagen: %@";

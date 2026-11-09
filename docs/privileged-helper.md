@@ -189,12 +189,28 @@ before the daemon idles out. This is the safety net that prevents a user's
 Charge Limit from being left at 70% or 80% indefinitely.
 
 Live verification of the root preference write, `notify_post`, `disableMCL:`
-and the signed v3 XPC round trip is **NOT RUN** in CI; it needs a Developer ID
+and the signed XPC round trip is **NOT RUN** in CI; it needs a Developer ID
 build signed by the configured team (`HCB7JKMQ2F` by default, or a matching
 development team for a local test build) and an approved helper. An ad-hoc
 local build has no team identifier and will always show the helper as
 unavailable; the Login Items pane cannot authorize it. Unit tests use a fake
 transport.
+
+## MagSafe LED (protocol version 4)
+
+The optional MagSafe LED mirror uses the fixed SMC key `ACLC`. Unlike the
+Charge Limit path, this is a hardware LED write: `6` hands control back to
+macOS, `1` turns the LED off, `2` is green and `4` is amber. The helper exposes
+only those fixed values; it never enumerates SMC keys or accepts arbitrary key
+and byte pairs.
+
+The capability probe checks the `ACLC` key metadata (`ui8`, size 1). The app's
+policy maps Sailing Mode's `holding` state to green and `chargingToUpper` /
+low-battery / Charge to Full Now states to amber; unplugged and disabled states
+return the LED to system control. On app shutdown the app writes `ACLC = 0`.
+The fixed-value SMC ABI is derived from the public MagSleep implementation and
+the AlDente behavior documented on its MagSafe LED page; live hardware
+verification is **NOT RUN** in CI.
 
 ## Build variants
 

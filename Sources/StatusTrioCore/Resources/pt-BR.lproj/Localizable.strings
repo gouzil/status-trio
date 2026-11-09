@@ -826,3 +826,9 @@
 "settings.battery.sailing.footnote" = "O modo navegação altera o limite de carga do macOS enquanto está ativo e restaura seu ajuste original ao desativar. O Mac precisa permanecer acordado para o firmware seguir o alvo.";
 "settings.battery.sailing.helperUnavailable" = "O assistente de energia não está disponível nesta compilação. Instale uma compilação assinada com Developer ID.";
 "settings.battery.sailing.openLoginItems" = "Abrir itens de início";
+
+"settings.battery.magSafeLED.group" = "LED MagSafe";
+"settings.battery.magSafeLED.control" = "Indicar limite de carga";
+"settings.battery.magSafeLED.description" = "Use o LED MagSafe para mostrar o estado de carga: verde quando o limite for atingido ou o Sailing Mode estiver pausado; âmbar durante o carregamento.";
+"settings.battery.magSafeLED.unavailable" = "Este Mac não oferece suporte ao controle do LED MagSafe.";
+"settings.battery.magSafeLED.error" = "Falha ao gravar o LED MagSafe: %@";

@@ -51,7 +51,8 @@ let package = Package(
             dependencies: ["PowerHelperProtocol"],
             path: "Sources/StatusTrioPowerHelper",
             linkerSettings: [
-                .linkedFramework("Security")
+                .linkedFramework("Security"),
+                .linkedFramework("IOKit")
             ]
         ),
         .target(

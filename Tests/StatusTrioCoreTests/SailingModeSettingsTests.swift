@@ -17,6 +17,16 @@ final class SailingModeSettingsTests: XCTestCase {
         XCTAssertEqual(SettingsStore.sailingLevelRange, 1...15)
     }
 
+    func testMagSafeLEDControlDefaultsOffAndPersists() {
+        let suite = makeSuite()
+        let first = SettingsStore(defaults: suite.defaults)
+        XCTAssertFalse(first.isMagSafeLEDControlEnabled)
+
+        first.isMagSafeLEDControlEnabled = true
+        let second = SettingsStore(defaults: suite.defaults)
+        XCTAssertTrue(second.isMagSafeLEDControlEnabled)
+    }
+
     func testSailingValuesPersistAcrossRelaunch() {
         let suite = makeSuite()
         let first = SettingsStore(defaults: suite.defaults)

@@ -10,6 +10,7 @@ final class AppEnvironment {
     let statusBarController: StatusBarController
     let settingsWindowController: SettingsWindowController
     let sailingMode: SailingModeController?
+    let magSafeLED: MagSafeLEDController?
     private let chargeToFullNow: ChargeToFullNowController?
     let onboardingWindowController: OnboardingWindowController
     let activationPolicy: AppActivationPolicy
@@ -49,6 +50,7 @@ final class AppEnvironment {
         statusBarController: StatusBarController,
         settingsWindowController: SettingsWindowController,
         sailingMode: SailingModeController? = nil,
+        magSafeLED: MagSafeLEDController? = nil,
         chargeToFullNow: ChargeToFullNowController? = nil,
         onboardingWindowController: OnboardingWindowController,
         activationPolicy: AppActivationPolicy,
@@ -73,6 +75,7 @@ final class AppEnvironment {
         self.statusBarController = statusBarController
         self.settingsWindowController = settingsWindowController
         self.sailingMode = sailingMode
+        self.magSafeLED = magSafeLED
         self.chargeToFullNow = chargeToFullNow
         self.onboardingWindowController = onboardingWindowController
         self.activationPolicy = activationPolicy
@@ -152,6 +155,12 @@ final class AppEnvironment {
         )
         PrivilegedHelperManager.shared.setSailingModeDemand(settings.isSailingModeEnabled)
         sailingMode?.start()
+        if let sailingMode, let magSafeLED {
+            magSafeLED.start(
+                battery: store.$snapshot.map(\.battery).eraseToAnyPublisher(),
+                phase: sailingMode.$phase.eraseToAnyPublisher()
+            )
+        }
         bindSailingModeInputs()
         store.bindInputSettings(settings)
         store.bindLocalIPSettings(settings)
@@ -188,6 +197,9 @@ final class AppEnvironment {
         sailingModeCancellables.removeAll()
         if let sailingMode {
             Task { await sailingMode.stop() }
+        }
+        if let magSafeLED {
+            Task { await magSafeLED.stop() }
         }
         bluetoothAudioIconOverrideSynchronizer.stop()
         bluetoothNearbyBatteryOptOutSynchronizer.stop()
@@ -535,6 +547,10 @@ final class AppEnvironment {
             settings: settings,
             client: XPCPrivilegedHelperClient()
         )
+        let magSafeLED = MagSafeLEDController(
+            settings: settings,
+            client: XPCPrivilegedHelperClient()
+        )
         let dockChargingAnimationPresenter: any DockChargingAnimationPresenting =
             DockChargingAnimationRendererMode.usesApplicationIconFrames()
                 ? DockApplicationIconChargingPresenter()
@@ -584,6 +600,7 @@ final class AppEnvironment {
             globalShortcutController: globalShortcutController,
             chargeToFullNow: chargeToFullNow,
             sailingMode: sailingMode,
+            magSafeLED: magSafeLED,
             backgroundUITesting: backgroundUITesting
         )
         settingsWindowController = resolvedSettingsWindowController
@@ -648,6 +665,7 @@ final class AppEnvironment {
             statusBarController: controller,
             settingsWindowController: resolvedSettingsWindowController,
             sailingMode: sailingMode,
+            magSafeLED: magSafeLED,
             chargeToFullNow: chargeToFullNow,
             onboardingWindowController: onboardingWindowController,
             activationPolicy: activationPolicy,

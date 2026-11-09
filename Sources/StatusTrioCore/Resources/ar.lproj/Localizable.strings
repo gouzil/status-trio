@@ -826,3 +826,9 @@
 "settings.battery.sailing.footnote" = "يغيّر وضع الإبحار حد شحن macOS أثناء تشغيله ويعيد إعدادك الأصلي عند إيقاف تشغيله. يجب أن يبقى Mac مستيقظًا ليتبع البرنامج الثابت الهدف.";
 "settings.battery.sailing.helperUnavailable" = "مساعد الطاقة غير متاح في هذا الإصدار. ثبّت إصدارًا موقّعًا بـ Developer ID.";
 "settings.battery.sailing.openLoginItems" = "فتح إعدادات عناصر تسجيل الدخول";
+
+"settings.battery.magSafeLED.group" = "مؤشر MagSafe LED";
+"settings.battery.magSafeLED.control" = "إظهار حد الشحن";
+"settings.battery.magSafeLED.description" = "استخدم مؤشر MagSafe LED لعرض حالة الشحن: أخضر عند الوصول إلى الحد أو إيقاف وضع الإبحار مؤقتاً؛ برتقالي أثناء الشحن.";
+"settings.battery.magSafeLED.unavailable" = "هذا الـ Mac لا يدعم التحكم في مؤشر MagSafe LED.";
+"settings.battery.magSafeLED.error" = "فشل كتابة مؤشر MagSafe LED: %@";

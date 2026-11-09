@@ -826,3 +826,9 @@
 "settings.battery.sailing.footnote" = "航海模式執行時會修改 macOS 充電上限，關閉時會恢復原設定。";
 "settings.battery.sailing.helperUnavailable" = "目前版本無法使用電源 Helper；請安裝 Developer ID 簽名的正式版本後再使用航海模式。";
 "settings.battery.sailing.openLoginItems" = "開啟登入項設定";
+
+"settings.battery.magSafeLED.group" = "MagSafe 指示燈";
+"settings.battery.magSafeLED.control" = "指示充電上限";
+"settings.battery.magSafeLED.description" = "用 MagSafe 指示燈顯示充電狀態：綠色表示已達到充電上限或航海模式暫停，橙色表示正在充電。";
+"settings.battery.magSafeLED.unavailable" = "此 Mac 不支援 MagSafe 指示燈控制。";
+"settings.battery.magSafeLED.error" = "MagSafe 指示燈寫入失敗：%@";

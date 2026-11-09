@@ -56,14 +56,16 @@ Helper 未就绪时，航海模式分组下方会出现「打开登录项设置�
 - 原生 Manual Charge Limit 由 `powerd`/PowerUIAgent 持久化并跨睡眠执行；它能在当前电量低于目标时充电。Status Trio 通过把目标设为当前电量来暂停充电，因此不会主动放电。Helper 只写这一个固定的偏好域，**不暴露任意 SMC 键写入**。
 - macOS 会在使用 Charge Limit 时周期性做一次校准充电（到 100%）；这是系统行为，航海模式无法阻止，UI 不把它误报为失败。
 
-## Helper 协议 v3 与安全
+## Helper 协议 v4 与安全
 
-`PowerHelperProtocolVersion.current = 3`。新增四个方法：
+`PowerHelperProtocolVersion.current = 4`。Sailing Mode 在 v3 新增四个方法：
 
 - `readSailingChargeLimitCapability(withReply:)`
 - `readSailingChargeLimit(withReply:)`（`-1` 表示没有由航海模式应用的限制）
 - `applySailingChargeLimit(_:withReply:)`
 - `restoreSailingChargeLimit(withReply:)`
+
+MagSafe LED 在 v4 新增 `readMagSafeLEDCapability` / `readMagSafeLEDState` / `setMagSafeLED` / `restoreMagSafeLED`，固定写 `ACLC=6/1/2/4`。
 
 Helper 只在第一次 `apply` 时把用户原有的 `MCLFeatureState` / `mclLimitValue` 写入 `/Library/Application Support/StatusTrio/saved-native-limit`，之后恢复时先调用 PowerUI 的 `disableMCL:` 清掉已注册的 limit，再写回原设置并 post reload。恢复成功后删除 marker。
 
@@ -126,6 +128,10 @@ SMC key-info 探测：`CH0B`/`CH0C`/`CH0I`/`CHTE`/`CHWA`/`BCLM` 不存在；`CHI
 - [Ampere: How it works（macOS 27 native charge limit 路径）](https://amperebattery.app/tech.html)
 - [batt issue #152: macOS 27 SMC charge-control keys gated](https://github.com/charlie0129/batt/issues/152)
 
+
+## MagSafe 指示灯
+
+航海模式联动可选的 MagSafe LED 指示：开启后，`holding`（航行区间内暂停）显示绿色，`chargingToUpper` / 低电量 / 立即充满显示橙色；未插电或关闭时把 `system`（0）写回，让 macOS 接管。该功能与 AlDente 的 MagSafe LED 语义一致，使用固定 `ACLC` SMC 键，不提供任意 SMC 写入。
 
 ## 直接充满（Charge to Full Now）
 

@@ -824,3 +824,9 @@
 "settings.battery.sailing.footnote" = "Sailing Mode changes the macOS Charge Limit while it runs and restores your original setting when turned off.";
 "settings.battery.sailing.helperUnavailable" = "The power helper is unavailable in this build. Install a Developer ID signed build to use Sailing Mode.";
 "settings.battery.sailing.openLoginItems" = "Open Login Items Settings";
+
+"settings.battery.magSafeLED.group" = "MagSafe LED";
+"settings.battery.magSafeLED.control" = "Indicate Charge Limit";
+"settings.battery.magSafeLED.description" = "Use the MagSafe LED to show charge state: green when the limit is reached or Sailing Mode is paused; amber while charging.";
+"settings.battery.magSafeLED.unavailable" = "This Mac does not support MagSafe LED control.";
+"settings.battery.magSafeLED.error" = "MagSafe LED write failed: %@";

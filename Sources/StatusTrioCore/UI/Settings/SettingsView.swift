@@ -17,6 +17,7 @@ struct SettingsView: View {
     var globalShortcutController: GlobalShortcutController? = nil
     var chargeToFullNow: ChargeToFullNowController? = nil
     var sailingMode: SailingModeController? = nil
+    var magSafeLED: MagSafeLEDController? = nil
     let onShowIconGuide: () -> Void
     /// Returns the tab the window controller wants to reveal, if any. The
     /// controller stores the request because the first presentation can post
@@ -390,6 +391,7 @@ struct SettingsView: View {
                 previewIsDark: $previewIsDark,
                 chargeToFullNow: chargeToFullNow,
                 sailingMode: sailingMode,
+                magSafeLED: magSafeLED,
                 subtopic: subtopicIfSelectionMatches(.battery)
             )
         case .network:

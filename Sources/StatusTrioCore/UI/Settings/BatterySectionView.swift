@@ -7,6 +7,7 @@ struct BatterySectionView: View {
     @Binding var previewIsDark: Bool
     var chargeToFullNow: ChargeToFullNowController? = nil
     var sailingMode: SailingModeController? = nil
+    var magSafeLED: MagSafeLEDController? = nil
     /// When non-`nil` the pane shows only that leaf subtopic beneath the Battery
     /// category; `nil` keeps the original full-pane layout (used by tests and
     /// by any caller that does not drive the two-level sidebar).
@@ -38,6 +39,9 @@ struct BatterySectionView: View {
         }
         panelVisibilityGroup
         chargeManagementGroup
+        if let magSafeLED {
+            MagSafeLEDSettingsGroup(controller: magSafeLED, settings: store)
+        }
         sailingModeGroup
         if helper.isAvailable {
             powerModesGroup

@@ -826,3 +826,9 @@
 "settings.battery.sailing.footnote" = "Режим «Парус» изменяет предел заряда macOS во время работы и восстанавливает исходную настройку при выключении. Mac должен оставаться в состоянии бодрствования, чтобы прошивка следовала цели.";
 "settings.battery.sailing.helperUnavailable" = "Помощник питания недоступен в этой сборке. Установите сборку с подписью Developer ID.";
 "settings.battery.sailing.openLoginItems" = "Открыть элементы входа";
+
+"settings.battery.magSafeLED.group" = "LED MagSafe";
+"settings.battery.magSafeLED.control" = "Показывать лимит заряда";
+"settings.battery.magSafeLED.description" = "Используйте LED MagSafe для отображения состояния заряда: зелёный при достижении лимита или паузе Sailing Mode, оранжевый во время зарядки.";
+"settings.battery.magSafeLED.unavailable" = "Этот Mac не поддерживает управление LED MagSafe.";
+"settings.battery.magSafeLED.error" = "Не удалось записать LED MagSafe: %@";

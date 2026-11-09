@@ -261,13 +261,16 @@ private final class PmsetCompletion: @unchecked Sendable {
 final class PowerModeService: NSObject, PowerHelperXPCProtocol, @unchecked Sendable {
     private let runner: any PmsetRunning
     private let sailing: NativeChargeLimitController
+    private let magSafeLED: MagSafeLEDService
 
     init(
         runner: any PmsetRunning = SystemPmsetRunner(),
-        sailing: NativeChargeLimitController = NativeChargeLimitController()
+        sailing: NativeChargeLimitController = NativeChargeLimitController(),
+        magSafeLED: MagSafeLEDService = MagSafeLEDService()
     ) {
         self.runner = runner
         self.sailing = sailing
+        self.magSafeLED = magSafeLED
     }
 
     func readLowPowerMode(withReply reply: @escaping (Bool, String?) -> Void) {
@@ -394,6 +397,49 @@ final class PowerModeService: NSObject, PowerHelperXPCProtocol, @unchecked Senda
         Task {
             do {
                 try sailing.restore()
+            } catch {
+                reply.send(false, error.localizedDescription)
+                return
+            }
+            reply.send(true, nil)
+        }
+    }
+
+    // MARK: - MagSafe LED (protocol version 4)
+
+    func readMagSafeLEDCapability(withReply reply: @escaping (Bool, String?) -> Void) {
+        let service = magSafeLED
+        PowerHelperReply(reply).send(service.isAvailable, nil)
+    }
+
+    func readMagSafeLEDState(withReply reply: @escaping (Int, String?) -> Void) {
+        let service = magSafeLED
+        PowerHelperReply(reply).send(service.read() ?? -1, nil)
+    }
+
+    func setMagSafeLED(_ value: Int, withReply reply: @escaping (Bool, String?) -> Void) {
+        let reply = PowerHelperReply(reply)
+        let service = magSafeLED
+        Task {
+            do {
+                guard let color = MagSafeLEDColor(rawValue: value) else {
+                    throw MagSafeLEDServiceError.invalidColor
+                }
+                try service.apply(color)
+            } catch {
+                reply.send(false, error.localizedDescription)
+                return
+            }
+            reply.send(true, nil)
+        }
+    }
+
+    func restoreMagSafeLED(withReply reply: @escaping (Bool, String?) -> Void) {
+        let reply = PowerHelperReply(reply)
+        let service = magSafeLED
+        Task {
+            do {
+                try service.restore()
             } catch {
                 reply.send(false, error.localizedDescription)
                 return

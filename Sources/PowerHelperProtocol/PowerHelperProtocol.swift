@@ -53,8 +53,13 @@ public enum PowerHelperProtocolVersion {
     /// through the privileged helper; they never expose arbitrary SMC writes.
     public static let sailingMode = 3
 
+    /// Adds the fixed-key MagSafe LED status and control methods. The daemon
+    /// only writes the ACPI/SMC `ACLC` key with system/off/green/amber values;
+    /// it does not expose arbitrary SMC writes.
+    public static let magSafeLED = 4
+
     /// What the daemon in this build implements.
-    public static let current = sailingMode
+    public static let current = magSafeLED
 }
 
 /// The XPC surface the privileged helper exposes.
@@ -131,4 +136,27 @@ public enum PowerHelperProtocolVersion {
     /// Added in protocol version 3. Idempotent: when no saved setting exists,
     /// the call succeeds without writing anything.
     func restoreSailingChargeLimit(withReply reply: @escaping (Bool, String?) -> Void)
+
+    /// Whether this Mac exposes the fixed `ACLC` MagSafe LED key.
+    ///
+    /// Added in protocol version 4. The daemon checks the SMC key metadata;
+    /// it does not enumerate or write arbitrary SMC keys.
+    func readMagSafeLEDCapability(withReply reply: @escaping (Bool, String?) -> Void)
+
+    /// The current `ACLC` byte, or `-1` when the key cannot be read.
+    ///
+    /// Added in protocol version 4. Values follow the fixed set
+    /// `6 = system`, `1 = off`, `2 = green`, `4 = amber`.
+    func readMagSafeLEDState(withReply reply: @escaping (Int, String?) -> Void)
+
+    /// Sets the fixed `ACLC` LED state. Only `3` (green) and `4` (amber) are
+    /// accepted by the daemon; `restoreMagSafeLED` hands control back to macOS.
+    ///
+    /// Added in protocol version 4.
+    func setMagSafeLED(_ value: Int, withReply reply: @escaping (Bool, String?) -> Void)
+
+    /// Writes `ACLC = 6`, returning LED control to macOS.
+    ///
+    /// Added in protocol version 4. Idempotent.
+    func restoreMagSafeLED(withReply reply: @escaping (Bool, String?) -> Void)
 }

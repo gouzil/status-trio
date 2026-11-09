@@ -1333,7 +1333,7 @@ func setAdapterGateCut(_ cut: Bool, withReply reply: @escaping (Bool, String?) -
 
 本文 §15–16 在“只有 PowerUI 客户端 API”这一前提下提出了 `CHIE` 适配器门控的备选方案。实际实现前又核对到 Ampere 的公开实现路径：PowerUIAgent 的 root 偏好域 `com.apple.smartcharging.topoffprotection` 支持任意 `1...100` 目标；Helper 以 root 写 `MCLFeatureState=1` 与 `mclLimitValue=percent` 并 post `com.apple.smartcharging.defaultschanged`，系统固件会在目标低于当前电量时自行放电到目标。该路径不需要 `CHIE`，因此没有 PD 重协商、clamshell 睡眠和适配器残留风险。
 
-最终 Status Trio 采用：**Helper v3 + macOS 原生 Manual Charge Limit 偏好路径**（不写 SMC、不写 CHIE）。控制器的目标不是 `upper` / `lower` 二选一，而是：区间内把目标设为**当前电量**以暂停充电；电量到达下限时把目标设为 `upper` 恢复充电；充电到 `upper` 后目标保持 `upper`，不主动放电。实现与验证见：
+最终 Status Trio 采用：**Helper v4（v3 航海 + v4 MagSafe LED）+ macOS 原生 Manual Charge Limit 偏好路径**（不写 CHIE；MagSafe LED 只写固定 `ACLC`）。控制器的目标不是 `upper` / `lower` 二选一，而是：区间内把目标设为**当前电量**以暂停充电；电量到达下限时把目标设为 `upper` 恢复充电；充电到 `upper` 后目标保持 `upper`，不主动放电。实现与验证见：
 
 - `docs/sailing-mode.md`
 - `Sources/StatusTrioCore/Battery/SailingModeController.swift`

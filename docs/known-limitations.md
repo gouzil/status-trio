@@ -137,6 +137,20 @@ macOS may temporarily override the limit for its periodic battery calibration
 charge; Sailing Mode does not fight that system behavior. See
 [Sailing Mode](sailing-mode.md).
 
+## MagSafe LED control is model- and firmware-specific
+
+The optional MagSafe LED mirror writes the fixed SMC key `ACLC` with the
+AlDente MagSafe 3 values (`6` system, `1` off, `2` green, `4` amber). The SMC
+key is undocumented and not present on every Mac; older Intel/MagSafe 2
+machines use different values and are not covered by the current helper. A
+macOS or firmware update can change or reject the key, so a write failure is
+reported in Battery settings and never silently retried with another value.
+
+This feature is hardware control, not just a status icon. It is off by default;
+enabling it changes the physical MagSafe LED. Live verification on this Mac is
+still **NOT RUN** beyond the read-only key-presence probe, and the app cannot
+prove that the LED changed color without a human looking at the connector.
+
 ## One Bluetooth battery source is undocumented
 
 Bluetooth battery levels come from `system_profiler -json SPBluetoothDataType`, a
