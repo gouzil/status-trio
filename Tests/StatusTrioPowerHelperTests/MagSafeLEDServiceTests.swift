@@ -5,11 +5,11 @@ final class MagSafeLEDServiceTests: XCTestCase {
     func testCapabilityAndReadPassThroughTransport() {
         let transport = FakeMagSafeLEDTransport()
         transport.available = true
-        transport.value = 2
+        transport.value = 6
         let service = MagSafeLEDService(transport: transport)
 
         XCTAssertTrue(service.isAvailable)
-        XCTAssertEqual(service.read(), 2)
+        XCTAssertEqual(service.read(), 6)
     }
 
     func testApplyUsesOnlyFixedMagSafeValues() throws {
@@ -18,10 +18,10 @@ final class MagSafeLEDServiceTests: XCTestCase {
 
         try service.apply(.green)
         try service.apply(.amber)
-        XCTAssertEqual(transport.writes, [2, 4])
+        XCTAssertEqual(transport.writes, [6, 4])
 
         XCTAssertThrowsError(try service.apply(.system))
-        XCTAssertEqual(transport.writes, [2, 4])
+        XCTAssertEqual(transport.writes, [6, 4])
     }
 
     func testRestoreHandsControlBackToTheSystem() throws {
@@ -30,7 +30,7 @@ final class MagSafeLEDServiceTests: XCTestCase {
 
         try service.restore()
 
-        XCTAssertEqual(transport.writes, [6])
+        XCTAssertEqual(transport.writes, [0])
     }
 
     func testUnavailableTransportNeverWrites() {

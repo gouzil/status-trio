@@ -146,7 +146,7 @@ public enum PowerHelperProtocolVersion {
     /// The current `ACLC` byte, or `-1` when the key cannot be read.
     ///
     /// Added in protocol version 4. Values follow the fixed set
-    /// `6 = system`, `1 = off`, `2 = green`, `4 = amber`.
+    /// `0 = system`, `1 = off`, `6 = green`, `4 = amber`.
     func readMagSafeLEDState(withReply reply: @escaping (Int, String?) -> Void)
 
     /// Sets the fixed `ACLC` LED state. Only `3` (green) and `4` (amber) are
@@ -155,7 +155,7 @@ public enum PowerHelperProtocolVersion {
     /// Added in protocol version 4.
     func setMagSafeLED(_ value: Int, withReply reply: @escaping (Bool, String?) -> Void)
 
-    /// Writes `ACLC = 6`, returning LED control to macOS.
+    /// Writes `ACLC = 0`, returning LED control to macOS.
     ///
     /// Added in protocol version 4. Idempotent.
     func restoreMagSafeLED(withReply reply: @escaping (Bool, String?) -> Void)

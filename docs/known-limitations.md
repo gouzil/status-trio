@@ -140,7 +140,7 @@ charge; Sailing Mode does not fight that system behavior. See
 ## MagSafe LED control is model- and firmware-specific
 
 The optional MagSafe LED mirror writes the fixed SMC key `ACLC` with the
-AlDente MagSafe 3 values (`6` system, `1` off, `2` green, `4` amber). The SMC
+AlDente MagSafe 3 values (`0` system, `1` off, `6` green, `4` amber); the blinking orange value is reserved and not used. The SMC
 key is undocumented and not present on every Mac; older Intel/MagSafe 2
 machines use different values and are not covered by the current helper. A
 macOS or firmware update can change or reject the key, so a write failure is

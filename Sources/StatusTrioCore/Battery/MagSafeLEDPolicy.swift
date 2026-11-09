@@ -2,9 +2,9 @@ import Foundation
 
 /// The fixed colors available through the privileged `ACLC` key.
 enum MagSafeLEDColor: Int, CaseIterable, Sendable {
-    case system = 6
+    case system = 0
     case off = 1
-    case green = 2
+    case green = 6
     case amber = 4
 }
 
