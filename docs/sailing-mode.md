@@ -65,7 +65,7 @@ Helper 未就绪时，航海模式分组下方会出现「打开登录项设置�
 - `applySailingChargeLimit(_:withReply:)`
 - `restoreSailingChargeLimit(withReply:)`
 
-MagSafe LED 在 v4 新增 `readMagSafeLEDCapability` / `readMagSafeLEDState` / `setMagSafeLED` / `restoreMagSafeLED`，固定写 `ACLC=0/1/6/4`。
+MagSafe LED 在 v4 新增 `readMagSafeLEDCapability` / `readMagSafeLEDState` / `setMagSafeLED` / `restoreMagSafeLED`，固定写 `ACLC=0/1/3/4`。
 
 Helper 只在第一次 `apply` 时把用户原有的 `MCLFeatureState` / `mclLimitValue` 写入 `/Library/Application Support/StatusTrio/saved-native-limit`，之后恢复时先调用 PowerUI 的 `disableMCL:` 清掉已注册的 limit，再写回原设置并 post reload。恢复成功后删除 marker。
 

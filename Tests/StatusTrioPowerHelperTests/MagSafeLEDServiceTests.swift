@@ -18,10 +18,10 @@ final class MagSafeLEDServiceTests: XCTestCase {
 
         try service.apply(.green)
         try service.apply(.amber)
-        XCTAssertEqual(transport.writes, [6, 4])
+        XCTAssertEqual(transport.writes, [3, 4])
 
         XCTAssertThrowsError(try service.apply(.system))
-        XCTAssertEqual(transport.writes, [6, 4])
+        XCTAssertEqual(transport.writes, [3, 4])
     }
 
     func testRestoreHandsControlBackToTheSystem() throws {

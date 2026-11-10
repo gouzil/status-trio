@@ -4,7 +4,7 @@ import Foundation
 enum MagSafeLEDColor: Int, CaseIterable, Sendable {
     case system = 0
     case off = 1
-    case green = 6
+    case green = 3
     case amber = 4
 }
 

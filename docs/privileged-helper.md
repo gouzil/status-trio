@@ -200,7 +200,7 @@ transport.
 
 The optional MagSafe LED mirror uses the fixed SMC key `ACLC`. Unlike the
 Charge Limit path, this is a hardware LED write: `0` hands control back to
-macOS, `1` turns the LED off, `6` is green and `4` is amber. The helper exposes
+macOS, `1` turns the LED off, `3` is green and `4` is amber. The helper exposes
 only those fixed values; it never enumerates SMC keys or accepts arbitrary key
 and byte pairs.
 

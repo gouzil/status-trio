@@ -3,14 +3,14 @@ import IOKit
 
 /// The fixed MagSafe LED colors exposed by the helper.
 ///
-/// The values observed on AlDente's MagSafe 3 path on this hardware: `6` is
-/// green, `4` is steady amber, `2` is blinking amber and `1` is off. `0` is
-/// the system-control value used when the override is released. No arbitrary
-/// SMC key or byte is exposed.
+/// The open-source MagSafe LED mapping for Apple Silicon: `0` hands control
+/// back to macOS, `1` turns the LED off, `3` is green and `4` is steady amber.
+/// `6` is a slow-blink mode and is not used for the normal green state. No
+/// arbitrary SMC key or byte is exposed.
 enum MagSafeLEDColor: Int, CaseIterable, Sendable {
     case system = 0
     case off = 1
-    case green = 6
+    case green = 3
     case amber = 4
 }
 
