@@ -18,6 +18,7 @@ final class MagSafeLEDController: ObservableObject {
     private var lastBattery: BatteryStatus?
     private var lastPhase: SailingModePhase?
     private var lastApplied: MagSafeLEDColor?
+    private var powerTransitionTask: Task<Void, Never>?
     private var isStopped = false
 
     init(settings: SettingsStore, client: any MagSafeLEDClienting) {
@@ -53,9 +54,23 @@ final class MagSafeLEDController: ObservableObject {
             phase.removeDuplicates()
         )
         .sink { [weak self] _, battery, phase in
-            self?.lastBattery = battery
-            self?.lastPhase = phase
-            self?.evaluate()
+            guard let self else { return }
+            let previousConnection = self.lastBattery?.isConnectedToPower
+            self.lastBattery = battery
+            self.lastPhase = phase
+
+            // macOS resets the MagSafe LED state when the cable is removed or
+            // reattached. Drop our cached value so the new power state gets a
+            // fresh write, and give the firmware one delayed re-apply after
+            // reconnect to cover its own LED initialization.
+            if let previousConnection,
+               previousConnection != battery.isConnectedToPower {
+                self.lastApplied = nil
+                if battery.isConnectedToPower {
+                    self.scheduleReapplyAfterPowerTransition()
+                }
+            }
+            self.evaluate()
         }
         .store(in: &cancellables)
     }
@@ -68,6 +83,8 @@ final class MagSafeLEDController: ObservableObject {
         probeTask = nil
         applyTask?.cancel()
         applyTask = nil
+        powerTransitionTask?.cancel()
+        powerTransitionTask = nil
 
         guard lastApplied != nil else { return }
         _ = try? await client.restoreMagSafeColor()
@@ -87,6 +104,18 @@ final class MagSafeLEDController: ObservableObject {
         // there is nothing of ours to clear in that case.
         guard settings.isMagSafeLEDControlEnabled || lastApplied != nil else { return }
         apply(desired)
+    }
+
+    private func scheduleReapplyAfterPowerTransition() {
+        powerTransitionTask?.cancel()
+        powerTransitionTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(700))
+            guard let self, !Task.isCancelled, !isStopped else { return }
+            // Force a fresh write even when the desired color is unchanged:
+            // the charger may have reset ACLC back to its own value.
+            lastApplied = nil
+            evaluate()
+        }
     }
 
     private func apply(_ desired: MagSafeLEDColor) {

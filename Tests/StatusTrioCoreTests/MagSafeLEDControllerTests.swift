@@ -36,6 +36,48 @@ final class MagSafeLEDControllerTests: XCTestCase {
         await controller.stop()
     }
 
+    func testReconnectForcesAFreshGreenWrite() async {
+        let suite = "MagSafeLEDControllerTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let settings = SettingsStore(defaults: defaults)
+        settings.isMagSafeLEDControlEnabled = true
+        settings.isSailingModeEnabled = true
+
+        let client = FakeMagSafeLEDClient()
+        let controller = MagSafeLEDController(settings: settings, client: client)
+        let connected = BatteryStatus(
+            rawPercentage: 77,
+            isPresent: true,
+            isCharging: false,
+            isLowPowerMode: false,
+            isConnectedToPower: true
+        )
+        let disconnected = BatteryStatus(
+            rawPercentage: 77,
+            isPresent: true,
+            isCharging: false,
+            isLowPowerMode: false,
+            isConnectedToPower: false
+        )
+        let battery = CurrentValueSubject<BatteryStatus, Never>(connected)
+        let phase = CurrentValueSubject<SailingModePhase, Never>(.holding(70, 80))
+
+        controller.start(
+            battery: battery.eraseToAnyPublisher(),
+            phase: phase.eraseToAnyPublisher()
+        )
+        await waitUntil { client.colors == [.green] }
+
+        battery.send(disconnected)
+        await waitUntil { client.colors.contains(.system) }
+
+        battery.send(connected)
+        await waitUntil { client.colors.last == .green }
+        XCTAssertTrue(client.colors.contains(.system))
+        await controller.stop()
+    }
+
     private func waitUntil(
         timeout: Duration = .seconds(2),
         _ condition: @escaping @MainActor () -> Bool
