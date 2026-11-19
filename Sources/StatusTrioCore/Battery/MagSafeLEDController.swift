@@ -1,3 +1,4 @@
+import AppKit
 import Combine
 import Foundation
 
@@ -19,6 +20,8 @@ final class MagSafeLEDController: ObservableObject {
     private var lastPhase: SailingModePhase?
     private var lastApplied: MagSafeLEDColor?
     private var powerTransitionTask: Task<Void, Never>?
+    private var wakeObservers: [NSObjectProtocol] = []
+    private var activity: NSObjectProtocol?
     private var isStopped = false
 
     init(settings: SettingsStore, client: any MagSafeLEDClienting) {
@@ -48,13 +51,32 @@ final class MagSafeLEDController: ObservableObject {
             }
         }
 
+        let workspaceCenter = NSWorkspace.shared.notificationCenter
+        wakeObservers = [
+            workspaceCenter.addObserver(
+                forName: NSWorkspace.didWakeNotification,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in
+                Task { @MainActor in self?.forceReapplyAfterWake() }
+            },
+            workspaceCenter.addObserver(
+                forName: NSWorkspace.screensDidWakeNotification,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in
+                Task { @MainActor in self?.forceReapplyAfterWake() }
+            },
+        ]
+
         Publishers.CombineLatest3(
             settings.$isMagSafeLEDControlEnabled.removeDuplicates(),
             battery.removeDuplicates(),
             phase.removeDuplicates()
         )
-        .sink { [weak self] _, battery, phase in
+        .sink { [weak self] enabled, battery, phase in
             guard let self else { return }
+            self.updateActivity(enabled: enabled)
             let previousConnection = self.lastBattery?.isConnectedToPower
             self.lastBattery = battery
             self.lastPhase = phase
@@ -85,6 +107,11 @@ final class MagSafeLEDController: ObservableObject {
         applyTask = nil
         powerTransitionTask?.cancel()
         powerTransitionTask = nil
+        for observer in wakeObservers {
+            NSWorkspace.shared.notificationCenter.removeObserver(observer)
+        }
+        wakeObservers.removeAll()
+        endActivity()
 
         guard lastApplied != nil else { return }
         _ = try? await client.restoreMagSafeColor()
@@ -104,6 +131,33 @@ final class MagSafeLEDController: ObservableObject {
         // there is nothing of ours to clear in that case.
         guard settings.isMagSafeLEDControlEnabled || lastApplied != nil else { return }
         apply(desired)
+    }
+
+    private func updateActivity(enabled: Bool) {
+        if enabled, activity == nil {
+            // Keep the LED policy responsive while the display is asleep or the
+            // lid is closed but the Mac itself remains awake. This does not
+            // prevent system sleep; a sleeping Mac cannot be driven by a
+            // user-space app.
+            activity = ProcessInfo.processInfo.beginActivity(
+                options: [.userInitiated],
+                reason: "Maintain MagSafe LED state while the display is asleep"
+            )
+        } else if !enabled {
+            endActivity()
+        }
+    }
+
+    private func endActivity() {
+        guard let activity else { return }
+        ProcessInfo.processInfo.endActivity(activity)
+        self.activity = nil
+    }
+
+    private func forceReapplyAfterWake() {
+        guard !isStopped, settings.isMagSafeLEDControlEnabled else { return }
+        lastApplied = nil
+        evaluate()
     }
 
     private func scheduleReapplyAfterPowerTransition() {
