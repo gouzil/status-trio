@@ -165,7 +165,7 @@ struct AudioInputControlsView: View {
                 PanelLevelSlider(
                     value: sliderValue,
                     isEnabled: state.canAdjust,
-                    tint: state.muteState == .muted ? Color.secondary : Color.accentColor,
+                    tint: state.muteState == .muted ? Color.secondary : Color.primary,
                     accessibilityLabel: state.sliderLabel,
                     accessibilityValue: sliderAccessibilityValue,
                     accessibilityHint: state.canAdjust
@@ -205,7 +205,7 @@ struct AudioInputControlsView: View {
                 .accessibilityHidden(true)
 
             Button(action: onOpenSoundSettings) {
-                PanelActionGlyph(systemName: "gearshape")
+                PanelActionGlyph(systemName: "gearshape", size: PanelSummaryActionMetrics.actionSlot)
                     .foregroundStyle(.secondary)
                     .contentShape(Rectangle())
                     .opacity(state.isBusy ? 0 : 1)
@@ -233,7 +233,7 @@ struct AudioInputControlsView: View {
             Image(systemName: "mic.fill")
                 .overlay(alignment: .topTrailing) {
                     Image(systemName: "minus.circle.fill")
-                        .font(.system(size: 9, weight: .bold))
+                        .font(.system(size: 9, weight: .regular))
                 }
         } else {
             Image(systemName: state.muteSymbol)

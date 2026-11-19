@@ -43,7 +43,7 @@ struct AppIconSectionView: View {
         statusIconGroup
         MiddleIconSettingsGroup(store: store, statusStore: statusStore)
         dockGroup
-        AppIconRingView(store: store)
+        AppIconRingView(store: store, hasBattery: statusStore.snapshot.battery.isPresent)
         AppIconBottomIndicatorView(
             store: store,
             statusStore: statusStore,
@@ -63,7 +63,11 @@ struct AppIconSectionView: View {
             statusIconGroup
             dockGroup
         case .appIconRing:
-            AppIconRingView(store: store)
+            AppIconRingView(
+                store: store,
+                hasBattery: statusStore.snapshot.battery.isPresent,
+                showsRingContentTitle: false
+            )
         case .appIconMiddleIcon:
             MiddleIconSettingsGroup(store: store, statusStore: statusStore,
                                     showsGroupTitle: false)
@@ -144,7 +148,7 @@ struct AppIconSectionView: View {
                     Slider(
                         value: Binding(
                             get: { store.iconSize },
-                            set: { store.iconSize = $0.rounded() }
+                            set: { store.setIconSizeFromSlider($0.rounded()) }
                         ),
                         in: SettingsStore.iconSizeRange
                     )

@@ -48,15 +48,17 @@ public enum PowerHelperProtocolVersion {
     /// Adds `readProtocolVersion` plus the High Power Mode capability probe,
     /// read and write (issue #235).
     public static let highPowerMode = 2
+    /// readDisableSleep / setDisableSleep (issue #295).
+    public static let disableSleep = 3
     /// Adds the Sailing Mode manual charge-limit capability probe, read, apply
     /// and restore. These methods drive macOS's own charge-limit preferences
     /// through the privileged helper; they never expose arbitrary SMC writes.
-    public static let sailingMode = 3
+    public static let sailingMode = 4
 
     /// Adds the fixed-key MagSafe LED status and control methods. The daemon
     /// only writes the ACPI/SMC `ACLC` key with system/off/green/amber values;
     /// it does not expose arbitrary SMC writes.
-    public static let magSafeLED = 4
+    public static let magSafeLED = 5
 
     /// What the daemon in this build implements.
     public static let current = magSafeLED
@@ -107,23 +109,36 @@ public enum PowerHelperProtocolVersion {
     /// Added in protocol version 2.
     func setHighPowerMode(_ enabled: Bool, withReply reply: @escaping (Bool, String?) -> Void)
 
+    /// Reads whether the lid-close sleep is disabled (`pmset -g` `SleepDisabled`).
+    ///
+    /// Added in protocol version 3. `enabled` is the observed value;
+    /// `errorDescription` is non-nil only when the state could not be read, in
+    /// which case `enabled` is meaningless.
+    func readDisableSleep(withReply reply: @escaping (Bool, String?) -> Void)
+
+    /// Sets `pmset -a disablesleep` and replies with the state the daemon
+    /// observed afterwards, so the caller never has to guess whether the write
+    /// took.
+    ///
+    /// Added in protocol version 3.
+    func setDisableSleep(_ enabled: Bool, withReply reply: @escaping (Bool, String?) -> Void)
     /// Whether this Mac can enforce a manual charge limit through PowerUI.
     ///
-    /// Added in protocol version 3. The daemon checks for the private
+    /// Added in protocol version 4. The daemon checks for the private
     /// `PowerUISmartChargeClient` class and the `pmset -g battlimit` tool; both
     /// belong to macOS's own Charge Limit feature (macOS 26.4 or later).
     func readSailingChargeLimitCapability(withReply reply: @escaping (Bool, String?) -> Void)
 
     /// The charge limit currently applied for Sailing Mode.
     ///
-    /// Added in protocol version 3. `percent` is `1...100`, or `-1` when
+    /// Added in protocol version 4. `percent` is `1...100`, or `-1` when
     /// Sailing Mode has not applied a limit in this session. This reads the
     /// same preference the system's Charge Limit UI uses.
     func readSailingChargeLimit(withReply reply: @escaping (Int, String?) -> Void)
 
     /// Applies `percent` as the system's manual charge limit for Sailing Mode.
     ///
-    /// Added in protocol version 3. The daemon captures the user's original
+    /// Added in protocol version 4. The daemon captures the user's original
     /// Charge Limit setting the first time this is called; the value is
     /// restored by `restoreSailingChargeLimit`. `percent` must be `1...100`.
     func applySailingChargeLimit(
@@ -133,30 +148,30 @@ public enum PowerHelperProtocolVersion {
 
     /// Restores the Charge Limit setting that was active before Sailing Mode.
     ///
-    /// Added in protocol version 3. Idempotent: when no saved setting exists,
+    /// Added in protocol version 4. Idempotent: when no saved setting exists,
     /// the call succeeds without writing anything.
     func restoreSailingChargeLimit(withReply reply: @escaping (Bool, String?) -> Void)
 
     /// Whether this Mac exposes the fixed `ACLC` MagSafe LED key.
     ///
-    /// Added in protocol version 4. The daemon checks the SMC key metadata;
+    /// Added in protocol version 5. The daemon checks the SMC key metadata;
     /// it does not enumerate or write arbitrary SMC keys.
     func readMagSafeLEDCapability(withReply reply: @escaping (Bool, String?) -> Void)
 
     /// The current `ACLC` byte, or `-1` when the key cannot be read.
     ///
-    /// Added in protocol version 4. Values follow the fixed set
+    /// Added in protocol version 5. Values follow the fixed set
     /// `0 = system`, `1 = off`, `3 = green`, `4 = amber`.
     func readMagSafeLEDState(withReply reply: @escaping (Int, String?) -> Void)
 
     /// Sets the fixed `ACLC` LED state. Only `3` (green) and `4` (amber) are
     /// accepted by the daemon; `restoreMagSafeLED` hands control back to macOS.
     ///
-    /// Added in protocol version 4.
+    /// Added in protocol version 5.
     func setMagSafeLED(_ value: Int, withReply reply: @escaping (Bool, String?) -> Void)
 
     /// Writes `ACLC = 0`, returning LED control to macOS.
     ///
-    /// Added in protocol version 4. Idempotent.
+    /// Added in protocol version 5. Idempotent.
     func restoreMagSafeLED(withReply reply: @escaping (Bool, String?) -> Void)
 }

@@ -38,13 +38,10 @@ enum ChargeToFullNowPresentation: Equatable, Sendable {
     /// An intermediate charge limit that differs from the configured target
     /// was read while cancelling. The user confirms before it is replaced.
     case cancelLimitChangedConfirmation(current: Int, target: Int)
-    /// The configured limit is back. The action stays hidden while the battery
-    /// finishes charging toward a sub-100 limit.
-    case limitRestored(limit: Int)
 
     var showsButton: Bool {
         switch self {
-        case .hidden, .unavailable, .limitRestored:
+        case .hidden, .unavailable:
             false
         case .available,
              .applying,
@@ -57,13 +54,6 @@ enum ChargeToFullNowPresentation: Equatable, Sendable {
              .cancelLimitChangedConfirmation:
             true
         }
-    }
-
-    var isRestoredLimit: Bool {
-        if case .limitRestored = self {
-            return true
-        }
-        return false
     }
 
     var isApplying: Bool {
@@ -100,22 +90,24 @@ final class ChargeToFullNowController: ObservableObject {
     private let now: () -> Date
     private var currentDemand: ChargeToFullNowDemand?
     private var session: ChargeToFullNowSession?
-    private var restoredLimit: RestoredLimitState?
     private var sessionNeedsConfirmation = false
     private var isApplying = false
     private var isCancelling = false
     private var hasObservedTemporaryOverride = false
     private var pendingLimitChange: PendingLimitChange?
+    /// Set after an Optimized-Battery-Charging override is accepted. macOS can
+    /// take up to a minute to actually start charging, so keep the action hidden
+    /// until charging begins instead of letting the user fire duplicates.
+    private var optimizedChargingStartedAt: Date?
+    private static let optimizedChargingGrace: TimeInterval = 150
+    /// After a request is accepted, powerd can take up to ~10s to reflect the
+    /// temporary override. Keep the session (and its cancel row) for this long
+    /// before treating a missing override as an ended/never-engaged session.
+    private static let sessionEngageGrace: TimeInterval = 20
 
     private struct PendingLimitChange {
         let currentLimit: Int
         let targetLimit: Int
-    }
-
-    private struct RestoredLimitState {
-        let limit: Int
-        let restoredAt: Date
-        var hasObservedCharging: Bool
     }
 
     init(
@@ -136,22 +128,35 @@ final class ChargeToFullNowController: ObservableObject {
     func update(_ demand: ChargeToFullNowDemand) {
         currentDemand = demand
         guard !isApplying, !isCancelling else { return }
-        guard demand.showsSurface, capability.isAvailable else {
+        guard demand.showsSurface else {
+            publish(.hidden)
+            return
+        }
+        // An unsupported machine still gets a details-page explanation instead
+        // of an empty, silent action area (#280).
+        guard capability.isAvailable else {
+            publish(.unavailable)
+            return
+        }
+        // On battery there is no charging to report. The user may unplug in the
+        // middle of a charge-to-full session; keep the stored session so the row
+        // can come back when power returns, but hide every charging state now.
+        guard demand.battery.isConnectedToPower else {
             publish(.hidden)
             return
         }
 
         let state = backend.readState()
-        if var restored = restoredLimit {
+        if let startedAt = optimizedChargingStartedAt {
             if demand.battery.isCharging {
-                restored.hasObservedCharging = true
-                restoredLimit = restored
-            }
-            if shouldHoldRestoredLimit(restored, demand: demand, state: state) {
-                publish(.limitRestored(limit: restored.limit))
+                optimizedChargingStartedAt = nil
+            } else if now().timeIntervalSince(startedAt) < Self.optimizedChargingGrace {
+                // A request was accepted but charging has not begun yet.
+                publish(.hidden)
                 return
+            } else {
+                optimizedChargingStartedAt = nil
             }
-            restoredLimit = nil
         }
 
         // A confirmation is an explicit user step. Keep it across live battery
@@ -183,11 +188,26 @@ final class ChargeToFullNowController: ObservableObject {
             clearSession()
         }
 
-        if session != nil {
+        if let activeSession = session {
             hasObservedTemporaryOverride =
                 hasObservedTemporaryOverride || state.indicatesTemporaryOverride
-            publish(.chargingToFull)
-            return
+            let withinEngageGrace =
+                now().timeIntervalSince(activeSession.acceptedAt)
+                    < Self.sessionEngageGrace
+            // Keep the cancel row while the system still reports the temporary
+            // override, while the battery is charging, or during the short
+            // window right after a just-accepted request.
+            if state.indicatesTemporaryOverride
+                || demand.battery.isCharging
+                || (withinEngageGrace && !hasObservedTemporaryOverride) {
+                publish(.chargingToFull)
+                return
+            }
+            // The override is gone, nothing is charging, and there is no active
+            // charge limit to cancel back to (e.g. the limit was 100% / none, or
+            // the request never actually engaged). End the stale session so the
+            // panel cannot get stuck on "Charging to 100%".
+            clearSession()
         }
 
         // macOS can start the same temporary override from its own battery
@@ -204,7 +224,31 @@ final class ChargeToFullNowController: ObservableObject {
             publish(.hidden)
             return
         }
-        publish(state.hasActiveChargeLimit ? .available : .hidden)
+        publish(Self.offersChargeToFull(demand: demand, state: state) ? .available : .hidden)
+    }
+
+    /// Whether the live state means the user can start charging to full right
+    /// now.
+    ///
+    /// A native sub-100% charge limit is *not* required: macOS shows its own
+    /// "Charge to Full Now" action whenever the Mac is plugged in, not full and
+    /// can be forced to charge. With an active charge limit the existing flow
+    /// stays unchanged (it also shows while charging toward the limit); without
+    /// one, offer the action only while charging is paused and the system
+    /// reports the pause is overridable (for example Optimized Battery Charging
+    /// at ~80% with the charge limit at 100%).
+    private static func offersChargeToFull(
+        demand: ChargeToFullNowDemand,
+        state: ChargeToFullNowDeviceState
+    ) -> Bool {
+        guard demand.canStartChargeToFull else { return false }
+        // An overridable pause (Optimized Battery Charging and similar) is its
+        // own case: it resumes charging without changing any user charge limit.
+        if !demand.battery.isCharging, state.chargingOverrideAllowed == true {
+            return true
+        }
+        if state.hasActiveChargeLimit { return true }
+        return false
     }
 
     /// Read-only diagnostics for the Settings pane. Ignores whether the
@@ -249,16 +293,11 @@ final class ChargeToFullNowController: ObservableObject {
         // An operation already in flight is not a hidden reason; a transient
         // missing limit during the write must not be misreported.
         if isApplying || isCancelling { return [] }
+        // A request that was accepted but has not started charging yet must not
+        // flash a "not overridable" notice before the system catches up.
+        if optimizedChargingStartedAt != nil { return [] }
 
         let state = backend.readState()
-
-        // The restore wait is explained while the system finishes charging
-        // toward the restored limit, using the same live-state rule as the
-        // controller itself rather than the cached presentation.
-        if let restored = restoredLimit,
-           shouldHoldRestoredLimit(restored, demand: demand, state: state) {
-            return [.restoredLimit(restored.limit)]
-        }
 
         if state.errorMessage != nil {
             return [.stateReadFailed]
@@ -269,12 +308,21 @@ final class ChargeToFullNowController: ObservableObject {
         if session != nil { return [] }
         if state.indicatesTemporaryOverride { return [] }
 
-        if state.hasActiveChargeLimit { return [] }
+        // The action is visible, so there is nothing to explain: this includes
+        // a paused charge without a native sub-100% limit.
+        if Self.offersChargeToFull(demand: demand, state: state) { return [] }
 
         if Self.isUnrecognizedChargeLimit(state) {
             return [.unrecognizedChargeLimitState]
         }
-        return [.noActiveChargeLimit]
+        // Paused but the system does not report the pause as overridable.
+        if !battery.isCharging {
+            return [.unrecognizedChargeLimitState]
+        }
+        // Charging normally with no native limit: nothing is hidden that the
+        // user needs to act on. The action returns once charging pauses and the
+        // system reports the pause as overridable (Optimized Battery Charging).
+        return []
     }
 
     private static func hiddenReason(
@@ -309,9 +357,6 @@ final class ChargeToFullNowController: ObservableObject {
     func clearDemand() {
         currentDemand = nil
         pendingLimitChange = nil
-        // Closing the panel ends the restored-limit notice; reopening shows
-        // the live state instead of a stale "restored" row.
-        restoredLimit = nil
         if !isApplying, !isCancelling {
             publish(.hidden)
         }
@@ -324,7 +369,7 @@ final class ChargeToFullNowController: ObservableObject {
             requestCancelChargeToFullNow()
         case .available, .failed:
             requestChargeToFullNow()
-        case .hidden, .applying, .cancelling, .unavailable, .limitRestored:
+        case .hidden, .applying, .cancelling, .unavailable:
             break
         }
     }
@@ -350,12 +395,13 @@ final class ChargeToFullNowController: ObservableObject {
         )
 
         switch presentation {
-        case .available, .failed, .chargingToFull:
+        case .available, .failed:
             performPrimaryAction()
             return true
-        case .hidden, .applying, .cancelling, .unavailable, .limitRestored,
+        case .hidden, .applying, .cancelling, .unavailable, .chargingToFull,
              .cancelConfirmationRequired, .cancelPending, .cancelFailed,
              .cancelLimitChangedConfirmation:
+            // Cancel removed: the quick action never cancels a running charge.
             return false
         }
     }
@@ -375,11 +421,17 @@ final class ChargeToFullNowController: ObservableObject {
             publish(.unavailable)
             return
         }
-        guard state.hasActiveChargeLimit else {
+        guard Self.offersChargeToFull(demand: requestedDemand, state: state) else {
             publish(.hidden)
             return
         }
 
+        // Cancelling restores a charge limit, so only a genuine limit – not an
+        // overridable pause such as Optimized Battery Charging – creates the
+        // cancellable session. A 100% user limit paused by optimized charging
+        // must never be turned into a sub-100% limit by "Cancel".
+        let usesNativeLimit = state.hasActiveChargeLimit
+            && state.chargingOverrideAllowed != true
         let originalLimit = state.reportedChargeLimit
         isApplying = true
         publish(.applying)
@@ -388,14 +440,22 @@ final class ChargeToFullNowController: ObservableObject {
             let result = await backend.chargeToFullNow()
             isApplying = false
             if result.succeeded {
-                let accepted = ChargeToFullNowSession(
-                    originalLimit: originalLimit,
-                    acceptedAt: now()
-                )
-                session = accepted
-                sessionNeedsConfirmation = false
-                hasObservedTemporaryOverride = false
-                sessionStore.save(accepted)
+                if usesNativeLimit {
+                    let accepted = ChargeToFullNowSession(
+                        originalLimit: originalLimit,
+                        acceptedAt: now()
+                    )
+                    session = accepted
+                    sessionNeedsConfirmation = false
+                    hasObservedTemporaryOverride = false
+                    sessionStore.save(accepted)
+                } else {
+                    // No native limit to cancel back to: the system override
+                    // simply resumes charging. Suppress the action until the
+                    // battery reports charging so a duplicate request cannot
+                    // fire during the system's startup delay.
+                    optimizedChargingStartedAt = now()
+                }
             }
 
             guard let currentDemand,
@@ -403,7 +463,11 @@ final class ChargeToFullNowController: ObservableObject {
                 publish(.hidden)
                 return
             }
-            publish(result.succeeded ? .chargingToFull : .failed)
+            if usesNativeLimit {
+                publish(result.succeeded ? .chargingToFull : .failed)
+            } else {
+                publish(result.succeeded ? .hidden : .failed)
+            }
         }
     }
 
@@ -491,11 +555,6 @@ final class ChargeToFullNowController: ObservableObject {
             if verified {
                 clearSession()
                 pendingLimitChange = nil
-                restoredLimit = RestoredLimitState(
-                    limit: limit,
-                    restoredAt: now(),
-                    hasObservedCharging: false
-                )
             }
 
             guard let currentDemand,
@@ -505,7 +564,17 @@ final class ChargeToFullNowController: ObservableObject {
             }
 
             if verified {
-                publish(.limitRestored(limit: limit))
+                // The restore-limit feature is off: after a successful restore
+                // the action simply follows the live state again instead of
+                // entering a "limit restored" holding state that hid the button.
+                publish(
+                    Self.offersChargeToFull(
+                        demand: currentDemand,
+                        state: verification
+                    )
+                    ? .available
+                    : .hidden
+                )
                 return
             }
 
@@ -548,29 +617,6 @@ final class ChargeToFullNowController: ObservableObject {
             && state.reportedChargeLimit == limit
     }
 
-    /// The restored limit stays visible while the system keeps charging toward
-    /// it. The action comes back once the battery reaches the limit or the
-    /// system stops charging before it.
-    private func shouldHoldRestoredLimit(
-        _ restored: RestoredLimitState,
-        demand: ChargeToFullNowDemand,
-        state: ChargeToFullNowDeviceState
-    ) -> Bool {
-        guard state.errorMessage == nil,
-              state.mclEnabledRawValue != 3,
-              state.reportedChargeLimit == restored.limit,
-              demand.canStartChargeToFull,
-              demand.battery.percentage < restored.limit else {
-            return false
-        }
-        if restored.hasObservedCharging {
-            return demand.battery.isCharging
-        }
-        // The system needs a moment to resume charging after the restore. Give
-        // it a bounded grace period instead of keeping an inert row forever.
-        return now().timeIntervalSince(restored.restoredAt) < 30
-    }
-
     private func clampedRestoreLimit() -> Int {
         let requested = restoreLimit()
         let clamped = min(
@@ -602,6 +648,10 @@ final class ChargeToFullNowController: ObservableObject {
     }
 
     private func publish(_ next: ChargeToFullNowPresentation) {
+        // A write can finish after an unplug tick updated the demand. Its
+        // completion must not resurrect a charging label on battery power.
+        let next = next == .chargingToFull
+            && currentDemand?.battery.isConnectedToPower == false ? .hidden : next
         guard presentation != next else { return }
         presentation = next
     }

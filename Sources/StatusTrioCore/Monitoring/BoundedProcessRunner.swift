@@ -52,6 +52,8 @@ final class BoundedProcessInvocation: @unchecked Sendable {
     private let stderrQueue = DispatchQueue(label: "StatusTrio.BoundedProcess.IO.stderr")
     private let executableURL: URL
     private let arguments: [String]
+    /// Extra environment entries layered over the inherited process environment.
+    private let environment: [String: String]?
     private let outputLimit: Int
     private let onProcessStarted: (@Sendable (Int32) -> Void)?
 
@@ -77,11 +79,13 @@ final class BoundedProcessInvocation: @unchecked Sendable {
     init(
         executableURL: URL,
         arguments: [String],
+        environment: [String: String]? = nil,
         outputLimit: Int = BoundedProcessInvocation.defaultOutputLimit,
         onProcessStarted: (@Sendable (Int32) -> Void)? = nil
     ) {
         self.executableURL = executableURL
         self.arguments = arguments
+        self.environment = environment
         self.outputLimit = outputLimit
         self.onProcessStarted = onProcessStarted
     }
@@ -93,12 +97,14 @@ final class BoundedProcessInvocation: @unchecked Sendable {
         executableURL: URL,
         arguments: [String],
         timeout: Duration,
+        environment: [String: String]? = nil,
         outputLimit: Int = BoundedProcessInvocation.defaultOutputLimit,
         onProcessStarted: (@Sendable (Int32) -> Void)? = nil
     ) async -> BoundedProcessOutcome {
         let invocation = BoundedProcessInvocation(
             executableURL: executableURL,
             arguments: arguments,
+            environment: environment,
             outputLimit: outputLimit,
             onProcessStarted: onProcessStarted
         )
@@ -118,11 +124,13 @@ final class BoundedProcessInvocation: @unchecked Sendable {
         executableURL: URL,
         arguments: [String],
         timeout: Duration,
+        environment: [String: String]? = nil,
         outputLimit: Int = BoundedProcessInvocation.defaultOutputLimit
     ) -> BoundedProcessOutcome {
         let invocation = BoundedProcessInvocation(
             executableURL: executableURL,
             arguments: arguments,
+            environment: environment,
             outputLimit: outputLimit
         )
         let box = SyncOutcomeBox()
@@ -172,6 +180,9 @@ final class BoundedProcessInvocation: @unchecked Sendable {
             let stderrPipe = Pipe()
             child.executableURL = self.executableURL
             child.arguments = self.arguments
+            if let environment = self.environment {
+                child.environment = ProcessInfo.processInfo.environment.merging(environment) { _, override in override }
+            }
             child.standardOutput = stdoutPipe
             child.standardError = stderrPipe
             self.process = child
@@ -203,11 +214,23 @@ final class BoundedProcessInvocation: @unchecked Sendable {
                     // still in each pipe before letting the invocation finish,
                     // on that stream's queue: draining them in sequence would
                     // reintroduce the deadlock the queues exist to prevent.
+                    //
+                    // Read `onFinish` here, on the state-machine queue. The
+                    // stream queues must never touch it: `finish` nils it from
+                    // this queue, and a read racing that write was undefined
+                    // behaviour in a path that also runs on the blocked path.
+                    let hasPendingWork = invocation.onFinish != nil
                     invocation.stdoutQueue.async { [invocation] in
-                        invocation.drainPipesAfterProcessExit(.stdout)
+                        invocation.drainPipesAfterProcessExit(
+                            .stdout,
+                            hasPendingWork: hasPendingWork
+                        )
                     }
                     invocation.stderrQueue.async { [invocation] in
-                        invocation.drainPipesAfterProcessExit(.stderr)
+                        invocation.drainPipesAfterProcessExit(
+                            .stderr,
+                            hasPendingWork: hasPendingWork
+                        )
                     }
                     invocation.completeIfReady()
                 }
@@ -281,7 +304,7 @@ final class BoundedProcessInvocation: @unchecked Sendable {
 
     /// Reads one stream to EOF after the child is gone. Called once per stream,
     /// each on that stream's own queue.
-    private func drainPipesAfterProcessExit(_ stream: Stream) {
+    private func drainPipesAfterProcessExit(_ stream: Stream, hasPendingWork: Bool) {
         // The pipe stays alive because this block holds `self` strongly (and
         // `self` holds the pipe); read its handle once and drain it locally
         // rather than reaching through a mutable property twice.
@@ -310,8 +333,6 @@ final class BoundedProcessInvocation: @unchecked Sendable {
             }
         }
     }
-
-    private var hasPendingWork: Bool { onFinish != nil }
 
     private func markIOStreamEnded(_ stream: Stream) {
         switch stream {

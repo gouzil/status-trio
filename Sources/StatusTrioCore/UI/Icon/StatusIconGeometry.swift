@@ -4,6 +4,23 @@ import Foundation
 enum StatusIconGeometry {
     static let canvas = CGRect(x: 0, y: 0, width: 120, height: 120)
 
+    /// The one content rect both menu-bar surfaces use for a status button.
+    ///
+    /// The system draws `NSStatusBarButton.image` centred in `bounds`
+    /// (`NSButtonCell.imageRect(forBounds:)` reports a zero mid-X offset), so
+    /// both the template view and the coloured layer must use exactly this rect
+    /// and follow `bounds` whenever AppKit resizes the button. No extra pixel
+    /// rounding: matching the system's own centred rect is what keeps the two
+    /// surfaces on one grid.
+    static func contentFrame(in bounds: CGRect, contentSize: CGSize) -> CGRect {
+        CGRect(
+            x: bounds.midX - contentSize.width / 2,
+            y: bounds.midY - contentSize.height / 2,
+            width: contentSize.width,
+            height: contentSize.height
+        )
+    }
+
     /// The x coordinate every element of the icon is centred on.
     ///
     /// This is deliberately **not** `canvas.midX`. The artwork is drawn on a
@@ -37,13 +54,17 @@ enum StatusIconGeometry {
     /// carry the same visual weight in the gap.
     static let batteryPlugHeightScale: CGFloat = 1.2
 
-    /// The bolt scales away from its tip, so any other glyph in the top gap
-    /// shares the scaled bolt's center to stay optically aligned with it.
+    /// The top-gap accessory shares the artwork centre axis. Only its vertical
+    /// position follows the bolt's scaling; horizontally it is pinned to
+    /// `artworkCenterX`, so neither the plug nor a fallback glyph inherits the
+    /// bolt's asymmetric bounding box — which sits ~0.05 units left of centre and
+    /// would otherwise drift further left as the glyph is scaled up (Issue #30
+    /// top accessory: "插头看着偏左").
     static func batteryTopIndicatorCenter(boltScale: CGFloat) -> CGPoint {
         let bolt = batteryChargingBolt().boundingBoxOfPath
         let pivot = batteryChargingBoltPivot
         return CGPoint(
-            x: pivot.x + (bolt.midX - pivot.x) * boltScale,
+            x: artworkCenterX,
             y: pivot.y + (bolt.midY - pivot.y) * boltScale
         )
     }
@@ -595,14 +616,69 @@ enum StatusIconGeometry {
         return path
     }
 
+    static let airPodsMinimumGapWidth: CGFloat = 16
+    static let airPodsMaximumGapWidth: CGFloat = 24
+    static let airPodsGapWidth: CGFloat = 18
+
+    static func airPodsTrack(
+        position: RingSegmentPosition,
+        gapWidth: CGFloat = airPodsGapWidth,
+        topGapWidth: CGFloat? = nil
+    ) -> CGPath {
+        airPodsArc(position: position, progress: 1, gapWidth: gapWidth, topGapWidth: topGapWidth)
+    }
+
+    static func airPodsArc(
+        position: RingSegmentPosition,
+        progress: Double,
+        gapWidth: CGFloat = airPodsGapWidth,
+        topGapWidth: CGFloat? = nil
+    ) -> CGPath {
+        guard progress.isFinite else { return CGMutablePath() }
+        let fraction = min(1, max(0, progress))
+        guard fraction > 0 else { return CGMutablePath() }
+
+        let safeGap: CGFloat
+        if let topGapWidth {
+            let maximumArcLength = batteryRadius * batterySweep
+            safeGap = topGapWidth.isFinite
+                ? min(maximumArcLength, max(0, topGapWidth))
+                : 0
+        } else {
+            safeGap = gapWidth.isFinite
+                ? min(airPodsMaximumGapWidth, max(airPodsMinimumGapWidth, gapWidth))
+                : 10
+        }
+        let gapAngle = safeGap / batteryRadius
+        let halfSweep = (batterySweep - gapAngle) / 2
+        let start: CGFloat
+        let end: CGFloat
+        switch position {
+        case .left:
+            start = batteryStart
+            end = batteryStart + halfSweep * CGFloat(fraction)
+        case .right:
+            start = batteryStart + batterySweep
+            end = start - halfSweep * CGFloat(fraction)
+        }
+        return arc(
+            center: batteryCenter,
+            radius: batteryRadius,
+            start: start,
+            end: end,
+            clockwise: position == .right
+        )
+    }
+
     private static func arc(
         center: CGPoint,
         radius: CGFloat,
         start: CGFloat,
-        end: CGFloat
+        end: CGFloat,
+        clockwise: Bool = false
     ) -> CGPath {
         let path = CGMutablePath()
-        path.addArc(center: center, radius: radius, startAngle: start, endAngle: end, clockwise: false)
+        path.addArc(center: center, radius: radius, startAngle: start, endAngle: end, clockwise: clockwise)
         return path
     }
 }

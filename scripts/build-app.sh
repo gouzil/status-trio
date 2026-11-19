@@ -14,6 +14,8 @@ SU_FEED_URL="${SU_FEED_URL:-}"
 DEVELOPMENT_CODENAME="${DEVELOPMENT_CODENAME:-}"
 UNIVERSAL_BUILD="${UNIVERSAL_BUILD:-0}"
 TELEMETRY_PRODUCTION="${TELEMETRY_PRODUCTION:-0}"
+DISABLE_PRODUCTION_UPDATES="${DISABLE_PRODUCTION_UPDATES:-0}"
+APP_OUTPUT_PATH="${APP_OUTPUT_PATH:-$ROOT/dist/StatusTrio.app}"
 PRIVILEGED_HELPER="${PRIVILEGED_HELPER:-1}"
 
 case "$OPEN_APP" in
@@ -65,6 +67,14 @@ case "$UNIVERSAL_BUILD" in
         ;;
 esac
 
+case "$DISABLE_PRODUCTION_UPDATES" in
+    0|1) ;;
+    *)
+        echo "Error: DISABLE_PRODUCTION_UPDATES must be 0 or 1." >&2
+        exit 2
+        ;;
+esac
+
 # 0 excludes the privileged power helper and its LaunchDaemon property list from
 # the bundle, which is what an App-Store-style build needs: a root LaunchDaemon
 # cannot ship there. The app reads STIncludesPrivilegedHelper at runtime and
@@ -102,7 +112,7 @@ build_phase swift-release-build
 swift "${SWIFT_BUILD_ARGS[@]}"
 BIN_PATH="$(swift "${SWIFT_BUILD_ARGS[@]}" --show-bin-path)"
 build_phase bundle-assembly
-APP_DIR="$ROOT/dist/StatusTrio.app"
+APP_DIR="$APP_OUTPUT_PATH"
 CONTENTS="$APP_DIR/Contents"
 
 rm -rf "$APP_DIR"
@@ -228,6 +238,9 @@ fi
 
 if [[ -n "$SU_FEED_URL" ]]; then
     /usr/libexec/PlistBuddy -c "Set :SUFeedURL $SU_FEED_URL" "$CONTENTS/Info.plist"
+fi
+if [[ "$DISABLE_PRODUCTION_UPDATES" == "1" ]]; then
+    bash "$ROOT/scripts/configure-local-dev-plist.sh" "$CONTENTS/Info.plist"
 fi
 INFO_PLIST_COUNT="$(find "$ROOT/Sources/StatusTrioCore/Resources" -name 'InfoPlist.strings' -type f | wc -l | tr -d ' ')"
 if [[ "$INFO_PLIST_COUNT" -ne 12 ]]; then
@@ -355,6 +368,14 @@ chmod +x "$CONTENTS/MacOS/StatusTrio"
 # alone requires a newer macOS is caught here rather than by a user.
 bash "$ROOT/scripts/verify-platform-version.sh" "$CONTENTS/MacOS/StatusTrio" "$DECLARED_MINOS"
 
+# The unprivileged audio helper owns its process-local compatibility shim.
+mkdir -p "$CONTENTS/Helpers"
+cp "$BIN_PATH/StatusTrioAirPodsHelper" "$CONTENTS/Helpers/StatusTrioAirPodsHelper"
+cp "$BIN_PATH/libAirPodsAudioContext.dylib" "$CONTENTS/Helpers/libAirPodsAudioContext.dylib"
+cp "$ROOT/Sources/AirPodsAudioContext/LICENSE" "$CONTENTS/Resources/AirPodsAudioContext-LICENSE"
+bash "$ROOT/scripts/verify-platform-version.sh" "$CONTENTS/Helpers/StatusTrioAirPodsHelper" "$DECLARED_MINOS"
+bash "$ROOT/scripts/verify-platform-version.sh" "$CONTENTS/Helpers/libAirPodsAudioContext.dylib" "$DECLARED_MINOS"
+
 SIGNING_IDENTITY="${CODE_SIGN_IDENTITY:--}"
 SIGNING_ARGS=(--force --deep --sign "$SIGNING_IDENTITY")
 if [[ "$SIGNING_IDENTITY" != "-" ]]; then
@@ -381,7 +402,9 @@ codesign "${SIGNING_ARGS[@]}" "$CONTENTS/Helpers/StatusTrioMobileBatteryHelper"
 if [[ "$PRIVILEGED_HELPER" == "1" ]]; then
     codesign "${SIGNING_ARGS[@]}" "$CONTENTS/Helpers/StatusTrioPowerHelper"
 fi
-codesign "${SIGNING_ARGS[@]}" "$APP_DIR"
+codesign "${SIGNING_ARGS[@]}" "$CONTENTS/Helpers/libAirPodsAudioContext.dylib"
+codesign "${SIGNING_ARGS[@]}" --entitlements "$ROOT/Support/AirPodsHelper.entitlements" "$CONTENTS/Helpers/StatusTrioAirPodsHelper"
+codesign "${SIGNING_ARGS[@]}" --preserve-metadata=entitlements "$APP_DIR"
 codesign --verify --deep --strict --verbose=2 "$APP_DIR"
 build_phase signed-bundle-contracts
 bash "$ROOT/scripts/verify-mobile-battery-bundle.sh" "$APP_DIR"

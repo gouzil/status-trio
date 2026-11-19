@@ -68,7 +68,7 @@ final class XPCPrivilegedHelperClient: LowPowerModeClienting, @unchecked Sendabl
         }
     }
 
-    // MARK: - MagSafe LED (protocol version 4)
+    // MARK: - MagSafe LED (protocol version 5)
 
     func readMagSafeLEDCapability() async throws -> Bool {
         try await withProxy { proxy, finish in

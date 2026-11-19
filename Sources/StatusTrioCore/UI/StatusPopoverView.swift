@@ -2,6 +2,13 @@ import AppKit
 import SwiftUI
 
 struct StatusPopoverView: View {
+    /// Which window hosts this view. The primary window keeps the summary while
+    /// a detail is shown beside it; the detail window renders only the page.
+    enum Host {
+        case primary
+        case detail
+    }
+
     @ObservedObject var panel: StatusPanelViewModel
     /// Observed so the Low Power Mode control appears the moment the helper is
     /// approved — reading `.isReady` off the shared manager without observing
@@ -33,6 +40,7 @@ struct StatusPopoverView: View {
     var dismissPanel: () -> Void = {}
     /// Reject measurements from a retained tree after its hosting controller is replaced.
     var contentMeasurementID: UUID? = nil
+    var host: Host = .primary
 
     var body: some View {
         // One scroll surface for every route (#237). The area measures the page
@@ -51,12 +59,18 @@ struct StatusPopoverView: View {
                 // detail pages and Bluetooth lists keep their own scroll views
                 // for other hosts, but disable them here.
                 .environment(\.statusPanelManagesScrolling, true)
+                .environment(\.airPodsConversationCache, panel.store.airPodsConversationCache)
+                .environment(\.statusPanelVisibility, layoutMetrics.visibilityPublisher)
         } footer: {
-            if panel.route == .summary {
+            if host == .primary, panel.isSummaryVisible {
                 pinnedFooter
             }
         }
+        .environment(\.panelCardSurfaceStyle, PanelCardSurfaceStyle.resolve(panel.effectivePanelBackgroundStyle))
+        .environment(\.statusPanelDetailHost, host == .detail)
         .frame(width: 330)
+        .environment(\.statusPanelBoldTextEnabled, panel.statusPanelBoldTextEnabled)
+        .environment(\.statusPanelMediumTextEnabled, panel.statusPanelMediumTextEnabled)
     }
 
     /// The current route, inset for the panel's fixed width.
@@ -65,7 +79,26 @@ struct StatusPopoverView: View {
     /// reproduces the old in-page `VStack` spacing before the footer's rule.
     private var routeContent: some View {
         Group {
-            switch panel.route {
+            switch host {
+            case .detail:
+                if panel.route != .summary { pageContent }
+            case .primary:
+                if panel.isShowingDetailPage && panel.detailPresentation == .alongside {
+                    summary
+                } else {
+                    pageContent
+                }
+            }
+        }
+        .padding(.top, host == .detail ? 8 : 14)
+        .padding(.horizontal, 14)
+        .padding(.bottom, routeBottomPadding)
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    @ViewBuilder
+    private var pageContent: some View {
+        switch panel.route {
             case .summary:
                 summary
             case .battery:
@@ -95,6 +128,10 @@ struct StatusPopoverView: View {
                     onOpenWiFiSettings: openWiFiSettings,
                     onOpenLocationSettings: openLocationSettings,
                     onSetPower: { panel.actions.setWiFiPower($0) },
+                    wifiPowerRequiresConfirmation: WiFiPowerTogglePolicy.requiresConfirmation(
+                        for: panel.store.popupSnapshot.wifi.state,
+                        confirmsPowerOff: panel.settings.confirmsWiFiPowerOff
+                    ),
                     onRefresh: { panel.actions.refreshWiFi() },
                     onOpenSharingSettings: openSharingSettings,
                     onCopyValue: { copyValue($0) },
@@ -118,19 +155,23 @@ struct StatusPopoverView: View {
                     onSelect: { panel.actions.selectInputSource($0) },
                     onOpenKeyboardSettings: openKeyboardSettings
                 )
-            }
+            case let .hardwareDetail(kind):
+                HardwareDetailView(kind: kind,
+                                   hardware: panel.hardwareMonitor,
+                                   onBack: { panel.showSummaryPage() },
+                                   metricColors: panel.hardwareMonitorMetricColors,
+                                   topApps: panel.showsHardwareTopApps ? panel.topApps : nil,
+                                   downloadCapMbps: panel.settings.hardwareDownloadCapMbps,
+                                   uploadCapMbps: panel.settings.hardwareUploadCapMbps,
+                                   networkChartFixedScale: panel.settings.hardwareNetworkChartFixedScale)
         }
-        .padding(.top, 14)
-        .padding(.horizontal, 14)
-        .padding(.bottom, routeBottomPadding)
-        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     /// The gap between the route content and the pinned footer. The summary
     /// keeps 12pt so the footer's rule sits where the old in-page spacing put
     /// it; an empty summary lets the footer own the whole inset.
     private var routeBottomPadding: CGFloat {
-        guard panel.route == .summary else { return 14 }
+        guard host == .primary, panel.isSummaryVisible else { return 14 }
         return displayedSections.isEmpty ? 0 : 12
     }
 
@@ -167,7 +208,11 @@ struct StatusPopoverView: View {
     /// dropped when every display is hidden, so no empty section or dangling
     /// separator is left behind (#241).
     private var displayedSections: [PopupSection] {
-        panel.displayedSummarySections
+        panel.displayedSummarySections.filter { section in
+            guard section == .quickActions else { return true }
+            // Drop the whole keep-awake section when both pills are turned off.
+            return panel.settings.showsKeepScreenButton || panel.settings.showsLidSleepButton
+        }
     }
 
     /// The footer only renders on the summary route, so its rule follows the
@@ -212,6 +257,12 @@ struct StatusPopoverView: View {
                     panel.actions.requestChargeToFullNow()
                 }
             )
+        case .quickActions:
+            QuickActionsCardView(
+                control: panel.store.sleepControl,
+                showsDisplay: panel.settings.showsKeepScreenButton,
+                showsLid: panel.settings.showsLidSleepButton
+            )
         case .network:
             WiFiPowerSummaryView(panel: panel,
                 state: panel.network,
@@ -223,7 +274,9 @@ struct StatusPopoverView: View {
                 onOpenLocationSettings: openLocationSettings
             )
         case .vpn:
-            VPNStatusView(state: panel.vpn)
+            VPNStatusView(state: panel.vpn) { enabled in
+                panel.actions.setVPNPower(enabled)
+            }
         case .bluetooth:
             BluetoothStatusView(
                 controller: panel.store.bluetoothDevices,
@@ -234,10 +287,12 @@ struct StatusPopoverView: View {
                 nearbyBLESelections: panel.settings.nearbyBLESelections,
                 trustedAppleDeviceMetadata: panel.settings.trustedAppleDeviceMetadata,
                 currentTrustedAppleCandidates: panel.store.trustedAppleDeviceCandidates,
+                appleDeviceLastSuccessfulIDs: panel.store.appleDeviceLastSuccessfulIDs,
                 trustedDiscoveryGeneration: panel.store.trustedAppleDeviceDiscoveryGeneration,
                 listOptions: panel.settings.bluetoothDeviceListOptions,
                 showsRadioPowerControl: panel.settings.showsBluetoothPowerControl,
                 showsBluetoothInStatusPanel: panel.settings.enabledPopupSections.contains(.bluetooth),
+                bluetoothIconColor: panel.settings.bluetoothIconColor,
                 listeningModePresentations: panel.settings.showsBluetoothListeningMode
                     ? panel.store.bluetoothListeningModes.huaweiBluetoothRowPresentations
                     : [:],
@@ -277,6 +332,19 @@ struct StatusPopoverView: View {
                 onOpen: { panel.showInputSourcePage() },
                 onOpenKeyboardSettings: openKeyboardSettings
             )
+        case .hardwareMonitor:
+            // Fixed compact summary: the existing four rings plus one aligned
+            // four-column data row. Card metric order/colour settings still feed
+            // the ring colours; the summary no longer depends on card metrics.
+            HardwareMonitorSummaryView(model: panel.hardwareMonitor,
+                                       metricColors: panel.hardwareMonitorMetricColors,
+                                       showsRings: panel.showsHardwareRings,
+                                       showsSummaryRow: panel.showsHardwareSummaryRow,
+                                       onOpenHardwareDetail: { panel.showHardwareDetail($0) },
+                                       ringSlots: HardwareRingSlot.allCases.filter {
+                                           panel.enabledHardwareRingSlots.contains($0)
+                                       },
+                                       summaryMetrics: panel.enabledHardwareSummaryMetrics)
         }
     }
 
@@ -318,7 +386,8 @@ private struct WiFiPowerSummaryView: View {
             wifiPowerIsOn: WiFiPowerControlVisibility.isRadioOn(state: store.popupSnapshot.wifi.state),
             wifiPowerCanSet: !store.wifiPowerIsChanging,
             wifiPowerRequiresConfirmation: WiFiPowerTogglePolicy.requiresConfirmation(
-                for: store.popupSnapshot.wifi.state
+                for: store.popupSnapshot.wifi.state,
+                confirmsPowerOff: panel.settings.confirmsWiFiPowerOff
             ),
             wifiPowerFailed: store.wifiPowerFailed,
             onSetWiFiPower: { store.setWiFiPower($0) },

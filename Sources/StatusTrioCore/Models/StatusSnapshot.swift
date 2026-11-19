@@ -6,8 +6,13 @@ struct BatteryStatus: Equatable, Sendable {
     let isCharging: Bool
     let isCharged: Bool
     let timeToFullChargeMinutes: Int?
+    let timeToEmptyMinutes: Int?
     let isLowPowerMode: Bool
     let isConnectedToPower: Bool
+    /// The percentage macOS stops charging at when a charge limit is in
+    /// effect. Nil when the battery may reach 100%. The system estimate targets
+    /// this limit instead of 100%.
+    let chargeLimitPercent: Int?
 
     init(
         rawPercentage: Int?,
@@ -15,16 +20,20 @@ struct BatteryStatus: Equatable, Sendable {
         isCharging: Bool,
         isCharged: Bool = false,
         timeToFullChargeMinutes: Int? = nil,
+        timeToEmptyMinutes: Int? = nil,
         isLowPowerMode: Bool,
-        isConnectedToPower: Bool
+        isConnectedToPower: Bool,
+        chargeLimitPercent: Int? = nil
     ) {
         self.rawPercentage = rawPercentage
         self.isPresent = isPresent
         self.isCharging = isCharging
         self.isCharged = isCharged
         self.timeToFullChargeMinutes = timeToFullChargeMinutes
+        self.timeToEmptyMinutes = timeToEmptyMinutes
         self.isLowPowerMode = isLowPowerMode
         self.isConnectedToPower = isConnectedToPower
+        self.chargeLimitPercent = chargeLimitPercent
     }
 
     var percentage: Int {
@@ -40,6 +49,28 @@ struct BatteryStatus: Equatable, Sendable {
         isLowPowerMode: false,
         isConnectedToPower: false
     )
+
+    /// A battery-less reading, used by the developer-only no-battery preview so
+    /// the settings pane can show how the UI looks on a Mac with no battery.
+    static let absent = BatteryStatus(
+        rawPercentage: nil,
+        isPresent: false,
+        isCharging: false,
+        isLowPowerMode: false,
+        isConnectedToPower: false
+    )
+
+    /// A battery-less reading that keeps the current Low Power Mode, used by the
+    /// no-battery preview so the ring can still show the Low Power Mode colour.
+    static func absent(lowPowerMode: Bool) -> BatteryStatus {
+        BatteryStatus(
+            rawPercentage: nil,
+            isPresent: false,
+            isCharging: false,
+            isLowPowerMode: lowPowerMode,
+            isConnectedToPower: false
+        )
+    }
 }
 
 enum WiFiState: Equatable, Sendable {

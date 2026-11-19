@@ -28,15 +28,52 @@ struct SettingsView: View {
     var consumePendingSubtopic: () -> SettingsSubtopic? = { nil }
 
     @StateObject private var navigation = SettingsNavigationModel()
-    @State private var previewIsDark: Bool = true
+    /// Kept above the category switch so leaving General does not discard undo or preview.
+    @StateObject private var transferSession: SettingsTransferSession
+
+    init(
+        store: SettingsStore,
+        statusStore: SystemStatusStore,
+        localization: Localization,
+        inputSourceController: InputSourceController? = nil,
+        globalShortcutController: GlobalShortcutController? = nil,
+        chargeToFullNow: ChargeToFullNowController? = nil,
+        sailingMode: SailingModeController? = nil,
+        magSafeLED: MagSafeLEDController? = nil,
+        onShowIconGuide: @escaping () -> Void,
+        consumePendingSection: @escaping () -> Section? = { nil },
+        consumePendingSubtopic: @escaping () -> SettingsSubtopic? = { nil }
+    ) {
+        self.store = store
+        self.statusStore = statusStore
+        self.localization = localization
+        self.inputSourceController = inputSourceController
+        self.globalShortcutController = globalShortcutController
+        self.chargeToFullNow = chargeToFullNow
+        self.sailingMode = sailingMode
+        self.magSafeLED = magSafeLED
+        self.onShowIconGuide = onShowIconGuide
+        self.consumePendingSection = consumePendingSection
+        self.consumePendingSubtopic = consumePendingSubtopic
+        _transferSession = StateObject(wrappedValue: SettingsTransferSession(store: store, localization: localization))
+    }
+    /// The live system appearance, so the menu bar preview starts in the same
+    /// light/dark mode as the real menu bar instead of always opening dark.
+    @Environment(\.colorScheme) private var systemColorScheme
+    /// `nil` means "follow the live system appearance". It only becomes a value
+    /// after the user taps the preview card's dark/light toggle, so that manual
+    /// choice overrides the system for the rest of the window's lifetime.
+    @State private var previewOverrideIsDark: Bool?
 
     enum Section: String, CaseIterable, Identifiable {
         case appIcon
         case battery
+        case keepAwake
         case network
         case bluetooth
         case audio
         case brightness
+        case monitor
         case popover
         case general
         case about
@@ -52,10 +89,12 @@ struct SettingsView: View {
             switch self {
             case .appIcon: return .symbol("macwindow.on.rectangle")
             case .battery: return .symbol(SymbolFallback.name("battery.100percent", "battery.100"))
+            case .keepAwake: return .symbol("moon.zzz.fill")
             case .network: return .symbol("wifi")
             case .bluetooth: return .bluetoothRune
             case .audio:   return .symbol("speaker.wave.3.fill")
             case .brightness: return .symbol(SymbolFallback.name("sun.max.fill", "sun.max"))
+            case .monitor: return .symbol(SymbolFallback.name("gauge.with.dots.needle.bottom.50percent", "gauge"))
             case .popover: return .symbol("list.bullet.rectangle")
             case .general: return .symbol("gearshape.fill")
             case .about:   return .symbol("info.circle.fill")
@@ -68,10 +107,12 @@ struct SettingsView: View {
             switch self {
             case .appIcon: return .indigo
             case .battery: return .green
+            case .keepAwake: return .indigo
             case .network: return .blue
             case .bluetooth: return .blue
             case .audio:   return .cyan
             case .brightness: return .orange
+            case .monitor: return .teal
             case .popover: return .purple
             case .general: return .gray
             case .about:   return .orange
@@ -83,10 +124,12 @@ struct SettingsView: View {
             switch self {
             case .appIcon: return localization.string(.settingsTabAppIcon)
             case .battery: return localization.string(.settingsTabBattery)
+            case .keepAwake: return localization.string(.settingsPopupOrderQuickActions)
             case .network: return localization.string(.settingsTabNetwork)
             case .bluetooth: return localization.string(.settingsTabBluetooth)
             case .audio:   return localization.string(.settingsTabAudio)
             case .brightness: return localization.string(.settingsTabBrightness)
+            case .monitor: return localization.string(.settingsTabMonitor)
             case .popover: return localization.string(.settingsTabPanel)
             case .general: return localization.string(.settingsPageGeneral)
             case .about:   return localization.string(.settingsTabAbout)
@@ -144,7 +187,7 @@ struct SettingsView: View {
 
     /// Functional status categories shown in the scrollable top group.
     private static let scrollableSections: [Section] = [
-        .appIcon, .battery, .network, .bluetooth, .audio, .brightness, .popover,
+        .appIcon, .battery, .network, .bluetooth, .audio, .brightness, .keepAwake, .monitor, .popover,
     ]
 
     /// App-wide panes pinned below the divider so they stay reachable when the
@@ -370,6 +413,31 @@ struct SettingsView: View {
         .id(subtopic)
     }
 
+    // MARK: - Menu bar preview appearance
+
+    /// `true` when the preview should draw the dark menu bar backdrop. It follows
+    /// the live system appearance until the user taps the card's toggle, so the
+    /// preview opens in the same light/dark mode as the real menu bar (#290).
+    private var previewIsDark: Bool {
+        Self.previewIsDark(override: previewOverrideIsDark, systemColorScheme: systemColorScheme)
+    }
+
+    /// Resolves the preview backdrop: a manual override wins, otherwise the live
+    /// system appearance decides. Kept as a static so it can be tested without a
+    /// live window.
+    static func previewIsDark(override: Bool?, systemColorScheme: ColorScheme) -> Bool {
+        override ?? (systemColorScheme == .dark)
+    }
+
+    /// Binding for the section panes: a manual toggle is remembered for this
+    /// window, while an untouched preview keeps tracking the system appearance.
+    private var previewIsDarkBinding: Binding<Bool> {
+        Binding(
+            get: { previewIsDark },
+            set: { previewOverrideIsDark = $0 }
+        )
+    }
+
     // MARK: - Detail
 
     @ViewBuilder
@@ -380,7 +448,7 @@ struct SettingsView: View {
                 store: store,
                 statusStore: statusStore,
                 inputSourceController: inputSourceController,
-                previewIsDark: $previewIsDark,
+                previewIsDark: previewIsDarkBinding,
                 onShowIconGuide: onShowIconGuide,
                 subtopic: subtopicIfSelectionMatches(.appIcon)
             )
@@ -388,18 +456,20 @@ struct SettingsView: View {
             BatterySectionView(
                 store: store,
                 statusStore: statusStore,
-                previewIsDark: $previewIsDark,
+                previewIsDark: previewIsDarkBinding,
                 chargeToFullNow: chargeToFullNow,
                 sailingMode: sailingMode,
                 magSafeLED: magSafeLED,
                 subtopic: subtopicIfSelectionMatches(.battery)
             )
+        case .keepAwake:
+            KeepAwakeSectionView(store: store)
         case .network:
             NetworkSectionView(
                 store: store,
                 statusStore: statusStore,
                 inputSourceController: inputSourceController,
-                previewIsDark: $previewIsDark
+                previewIsDark: previewIsDarkBinding
             )
         case .bluetooth:
             BluetoothSectionView(
@@ -407,18 +477,20 @@ struct SettingsView: View {
                 statusStore: statusStore,
                 bluetoothDevices: statusStore.bluetoothDevices,
                 appleDeviceDiscovery: statusStore.appleDeviceDiscovery,
-                previewIsDark: $previewIsDark,
+                previewIsDark: previewIsDarkBinding,
                 subtopic: subtopicIfSelectionMatches(.bluetooth)
             )
         case .audio:
             AudioSectionView(
                 store: store,
                 statusStore: statusStore,
-                previewIsDark: $previewIsDark,
+                previewIsDark: previewIsDarkBinding,
                 subtopic: subtopicIfSelectionMatches(.audio)
             )
         case .brightness:
             BrightnessSectionView(store: store, statusStore: statusStore)
+        case .monitor:
+            HardwareMonitorSectionView(store: store)
         case .popover:
             PopoverSectionView(store: store, statusStore: statusStore)
         case .general:
@@ -427,7 +499,8 @@ struct SettingsView: View {
                 localization: localization,
                 globalShortcutController: globalShortcutController,
                 statusStore: statusStore,
-                chargeToFullNow: chargeToFullNow
+                chargeToFullNow: chargeToFullNow,
+                transferSession: transferSession
             )
         case .about:
             AboutSectionView()
@@ -444,6 +517,16 @@ struct SettingsView: View {
     }
 
     static let sidebarWidth: CGFloat = 196
+    /// Default content size the first time the window opens. Once the user has
+    /// resized or moved it, the window restores its saved frame instead (#304).
     static let width: CGFloat = 720
     static let height: CGFloat = 530
+    /// Smallest content size the user can drag the window down to. The fixed
+    /// 196pt sidebar plus the detail column's widest control (a 180pt pop-up)
+    /// and one line of label copy still fit; narrow rows wrap instead of
+    /// truncating, and pages scroll vertically, so height only needs to stay
+    /// usable rather than exactly fit every page. Keep these below the default
+    /// size so "zoom" and free resizing still have range (#304).
+    static let minimumWidth: CGFloat = 640
+    static let minimumHeight: CGFloat = 460
 }

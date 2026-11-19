@@ -38,6 +38,7 @@ struct AudioSectionView: View {
         deviceOrderGroup
         inputDeviceOrderGroup
         externalVolumeGroup
+        airPodsInlineControlsGroup
     }
 
     /// Quick show/hide of the audio modules (output volume and input) in the
@@ -83,33 +84,10 @@ struct AudioSectionView: View {
             SettingsToggleRow(
                 symbol: "arrow.up.arrow.down.circle.fill",
                 tint: .cyan,
-                title: localization.string(.settingsPopupVolumeScroll),
-                subtitle: localization.string(.settingsPopupVolumeScrollDescription),
-                isOn: $store.popupScrollAdjustsVolume
+                title: localization.string(.settingsPopupPanelScroll),
+                subtitle: localization.string(.settingsPopupPanelScrollDescription),
+                isOn: $store.popupPanelScrollAdjustsVolume
             )
-
-            if store.popupScrollAdjustsVolume {
-                SettingsDivider()
-
-                SettingsMenuRow(
-                    symbol: "aspectratio",
-                    tint: .teal,
-                    title: localization.string(.settingsPopupVolumeScrollScope),
-                    subtitle: localization.string(.settingsPopupVolumeScrollScopeDescription),
-                    selection: $store.popupVolumeScrollScope,
-                    options: PopupVolumeScrollScope.allCases,
-                    label: scrollScopeLabel
-                )
-            }
-        }
-    }
-
-    private func scrollScopeLabel(_ scope: PopupVolumeScrollScope) -> String {
-        switch scope {
-        case .panel:
-            localization.string(.settingsPopupVolumeScrollScopePanel)
-        case .volumeControl:
-            localization.string(.settingsPopupVolumeScrollScopeVolumeControl)
         }
     }
 
@@ -499,6 +477,32 @@ struct AudioSectionView: View {
 
     private func orderListHeight(for count: Int) -> CGFloat {
         min(max(CGFloat(count) * 32 + 12, 48), 180)
+    }
+
+    private var airPodsInlineControlsGroup: some View {
+        SettingsGroup(localization.string(.settingsAudioAirPodsInlineControlsTitle)) {
+            AirPodsListeningModeSettingsRows(store: store)
+
+            SettingsDivider()
+
+            SettingsToggleRow(
+                symbol: "airpodspro",
+                tint: .blue,
+                title: localization.string(.settingsAudioSpatialAudioControlsTitle),
+                subtitle: localization.string(.settingsAudioSpatialAudioControlsDescription),
+                isOn: $store.showsSpatialAudioControls
+            )
+
+            SettingsDivider()
+
+            SettingsToggleRow(
+                symbol: "person.wave.2.fill",
+                tint: .blue,
+                title: localization.string(.settingsAudioConversationAwarenessControlsTitle),
+                subtitle: localization.string(.settingsAudioConversationAwarenessControlsDescription),
+                isOn: $store.showsConversationAwarenessControls
+            )
+        }
     }
 }
 

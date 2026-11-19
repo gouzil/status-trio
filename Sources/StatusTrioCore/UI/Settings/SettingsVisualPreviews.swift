@@ -66,6 +66,9 @@ private func menuBarPreviewStatus(from statusStore: SystemStatusStore) -> MenuBa
 
 struct VolumeIndicatorPreview: View {
     let style: VolumeDisplayStyle
+    /// The selected bottom data source, so the style preview shows the same
+    /// quantity the settings page will actually draw.
+    var source: BottomIndicatorSource = .volume
     let isDarkBackground: Bool
     @ObservedObject var store: SettingsStore
     @ObservedObject var statusStore: SystemStatusStore
@@ -81,7 +84,8 @@ struct VolumeIndicatorPreview: View {
                     ringStrokeScale: store.ringStrokeStyle.scale
                 ),
                 bluetooth: .standard
-            )
+            ),
+            bottomIndicatorSource: source
         )
     }
 
@@ -264,16 +268,18 @@ struct RingStrokeStylePreview: View {
             status: menuBarPreviewStatus(from: statusStore),
             configuration: IconPresentationConfiguration(
                 battery: BatteryIconOptions(
-                    showsPercentage: store.showsBatteryPercentage,
-                    showsChargingIndicator: store.showsChargingIndicator,
                     splitGapProgress: store.batterySplitGapProgress,
                     usesStatusColors: store.usesBatteryStatusColors,
                     criticalThreshold: Int(store.batteryCriticalThreshold.rounded()),
-                    connectedIndicator: store.batteryConnectedIndicator,
                     fullThreshold: Int(store.batteryFullThreshold.rounded()),
                     textScale: store.batterySymbolScale * BatteryIconOptions.defaultTextScale,
                     ringStrokeScale: style.scale,
-                    batteryStatusColors: store.batteryStatusColors
+                    batteryStatusColors: store.batteryStatusColors,
+                    onBatteryMarker: store.batteryOnBatteryMarker,
+                    chargingMarker: store.batteryChargingMarker,
+                    connectedMarker: store.batteryConnectedMarker,
+                    noBatteryMarker: store.batteryNoBatteryMarker,
+                    monochromeCharging: store.monochromeChargingRing
                 ),
                 connection: store.connectionIconOptions,
                 volume: VolumeIconOptions(
@@ -281,7 +287,8 @@ struct RingStrokeStylePreview: View {
                     ringStrokeScale: style.scale
                 ),
                 bluetooth: .standard
-            )
+            ),
+            isHighPowerMode: statusStore.highPowerMode.isHighPowerMode
         )
     }
 

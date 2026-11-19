@@ -235,11 +235,138 @@ final class PanelLevelSliderTests: XCTestCase {
         XCTAssertEqual(values, [0.2, 0.8, 1.0])
     }
 
+    // MARK: Track-click glide
+
+    func testTrackClickMapsPointerToTheThumbTravel() {
+        let slider = PanelLevelSliderView()
+        slider.frame = NSRect(x: 0, y: 0, width: controlWidth, height: 30)
+        let inset = PanelLevelSliderMetrics.horizontalInset
+        XCTAssertEqual(slider.value(forPointX: inset), 0, accuracy: 0.001)
+        XCTAssertEqual(
+            slider.value(forPointX: controlWidth - inset), 1, accuracy: 0.001
+        )
+        XCTAssertEqual(
+            slider.value(forPointX: controlWidth / 2), 0.5, accuracy: 0.001
+        )
+        XCTAssertEqual(slider.value(forPointX: -50), 0, accuracy: 0.001)
+        XCTAssertEqual(
+            slider.value(forPointX: controlWidth + 50), 1, accuracy: 0.001
+        )
+    }
+
+    func testDetachedSliderSnapsAndSettlingWindowSnapsThenAnimates() {
+        let slider = PanelLevelSliderView()
+        XCTAssertFalse(
+            slider.shouldAnimateProgrammaticChange(
+                at: ProcessInfo.processInfo.systemUptime
+            ),
+            "a detached slider must never animate"
+        )
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: controlWidth, height: 30),
+            styleMask: [], backing: .buffered, defer: false
+        )
+        window.contentView?.addSubview(slider)
+        let now = ProcessInfo.processInfo.systemUptime
+        slider.animateProgrammaticChangesAfter = now + 0.35
+        XCTAssertFalse(slider.shouldAnimateProgrammaticChange(at: now))
+        XCTAssertTrue(slider.shouldAnimateProgrammaticChange(at: now + 0.5))
+        slider.setProgrammaticValue(0.7, animated: false)
+        XCTAssertEqual(slider.doubleValue, 0.7, accuracy: 0.001)
+    }
+
+    func testClickGlideStartsFromThePreviousValue() {
+        let slider = PanelLevelSliderView()
+        slider.frame = NSRect(x: 0, y: 0, width: controlWidth, height: 30)
+        slider.doubleValue = 0.88
+        slider.animateValue(from: 0.44, to: 0.88)
+        XCTAssertEqual(
+            slider.doubleValue, 0.44, accuracy: 0.001,
+            "the glide must begin at the old position, not the jumped target"
+        )
+        slider.cancelValueAnimation()
+    }
+
+    func testThumbHiddenUntilHover() {
+        let slider = PanelLevelSliderView()
+        slider.frame = NSRect(x: 0, y: 0, width: controlWidth, height: 30)
+        XCTAssertFalse(slider.isThumbVisible, "the thumb starts hidden")
+        slider.setHovering(true)
+        XCTAssertTrue(slider.isThumbVisible, "hover reveals the thumb")
+        slider.setHovering(false)
+        XCTAssertFalse(slider.isThumbVisible, "leaving hides the thumb again")
+    }
+
     func testDisabledControlDoesNotAcceptUserInput() {
         let slider = PanelLevelSliderView()
         slider.isEnabled = false
         slider.frame = NSRect(x: 0, y: 0, width: controlWidth, height: 30)
         XCTAssertFalse(slider.isEnabled)
         XCTAssertFalse(slider.acceptsFirstResponder)
+    }
+
+    // MARK: Issue #331 – frozen gesture geometry (regression guard)
+
+    func testTrackingGeometryFreezesTheTrackRectForTheWholeGesture() {
+        var geometry = PanelLevelSliderTrackingGeometry(
+            liveRect: NSRect(x: 0, y: 0, width: controlWidth, height: 30)
+        )
+        geometry.begin()
+        XCTAssertEqual(geometry.trackRect.width, controlWidth, accuracy: 0.001)
+
+        // A relayout collapses the live width mid-gesture.
+        geometry.updateLiveRect(NSRect(x: 0, y: 0, width: 0, height: 30))
+        XCTAssertEqual(
+            geometry.trackRect.width,
+            controlWidth,
+            accuracy: 0.001,
+            "the tracked width must stay frozen while the pointer owns the gesture"
+        )
+
+        geometry.end()
+        XCTAssertEqual(
+            geometry.trackRect.width,
+            0,
+            accuracy: 0.001,
+            "outside a gesture the live bounds drive hit-testing again"
+        )
+    }
+
+    func testTrackingGeometryDoesNotFreezeADegenerateStart() {
+        var geometry = PanelLevelSliderTrackingGeometry(
+            liveRect: NSRect(x: 0, y: 0, width: 0, height: 30)
+        )
+        geometry.begin()
+        XCTAssertEqual(geometry.trackRect.width, 0, accuracy: 0.001)
+        geometry.updateLiveRect(NSRect(x: 0, y: 0, width: controlWidth, height: 30))
+        XCTAssertEqual(geometry.trackRect.width, controlWidth, accuracy: 0.001)
+    }
+
+    func testCellTrackRectFreezesWhenGestureStartsAndCollapsesMidDrag() {
+        let slider = PanelLevelSliderView()
+        slider.frame = NSRect(x: 0, y: 0, width: controlWidth, height: 30)
+        let cell = slider.cell as? PanelLevelSliderCell
+
+        XCTAssertEqual(cell?.trackRect.width ?? 0, controlWidth, accuracy: 0.001)
+
+        slider.startGestureTracking()
+        XCTAssertEqual(cell?.trackRect.width ?? 0, controlWidth, accuracy: 0.001)
+
+        // A SwiftUI relayout collapses the control while the mouse is still down.
+        slider.setFrameSize(NSSize(width: 0, height: 30))
+        XCTAssertEqual(
+            cell?.trackRect.width ?? 0,
+            controlWidth,
+            accuracy: 0.001,
+            "a mid-gesture width collapse must not change the mapping rect (#331)"
+        )
+    }
+
+    func testThumbCenterStaysFiniteForNonFiniteValue() {
+        let x = PanelLevelSliderMetrics.thumbCenterX(for: .nan, width: controlWidth)
+        XCTAssertTrue(x.isFinite)
+        XCTAssertEqual(x, PanelLevelSliderMetrics.horizontalInset, accuracy: 0.001)
+        let infinite = PanelLevelSliderMetrics.thumbCenterX(for: .infinity, width: controlWidth)
+        XCTAssertTrue(infinite.isFinite)
     }
 }

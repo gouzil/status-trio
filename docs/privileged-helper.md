@@ -1,9 +1,11 @@
 # Privileged power helper
 
-Status Trio ships one privileged helper. It serves two app features: turning
-macOS Low Power Mode on or off, and applying the macOS Charge Limit used by
-Sailing Mode. Both operations need root; the helper exposes only fixed,
-feature-level commands and never an arbitrary SMC key writer.
+Status Trio ships one privileged helper. It exists for power-management writes
+that no unprivileged process may perform: power mode (Low/High), the
+`disablesleep` flag that keeps a Mac awake with the lid closed (issue #295),
+the macOS Charge Limit used by Sailing Mode, and the fixed-key `ACLC` MagSafe
+LED state. Those are fixed feature-level commands; the helper never exposes an
+arbitrary SMC key writer.
 
 ## Why a helper at all
 
@@ -163,7 +165,7 @@ satisfy it. That is intentional: relaxing the requirement to make Ad-hoc work
 would let any unsigned binary drive the daemon. Local end-to-end testing
 therefore needs a Developer ID identity (see below), not an Ad-hoc build.
 
-## Sailing Mode (protocol version 3)
+## Sailing Mode (protocol version 4)
 
 Sailing Mode needs the system's Manual Charge Limit, whose preference domain is
 root-owned: `com.apple.smartcharging.topoffprotection` under `/var/root`.
@@ -196,7 +198,7 @@ local build has no team identifier and will always show the helper as
 unavailable; the Login Items pane cannot authorize it. Unit tests use a fake
 transport.
 
-## MagSafe LED (protocol version 4)
+## MagSafe LED (protocol version 5)
 
 The optional MagSafe LED mirror uses the fixed SMC key `ACLC`. Unlike the
 Charge Limit path, this is a hardware LED write: `0` hands control back to
@@ -267,3 +269,81 @@ is false.
   `powermode` rather than `lowpowermode`. The daemon writes
   `pmset -a lowpowermode 0|1`, which remains the accepted argument, and reads the
   state back through `ProcessInfo`.
+
+## Build variants
+
+`scripts/build-app.sh` takes `PRIVILEGED_HELPER=1|0` (default `1`).
+
+- `1` copies and signs the daemon and its plist, and writes
+  `STIncludesPrivilegedHelper=true` into `Info.plist`.
+- `0` omits both and writes `false`. This is what an App-Store-style build needs,
+  since a root LaunchDaemon cannot ship there.
+
+At runtime the app reads `STIncludesPrivilegedHelper`; when it is false the Low
+Power Mode control is not offered at all, rather than offered and failing.
+`scripts/verify-privileged-helper-bundle.sh` enforces both directions: the helper
+and plist are present and well-formed when the flag is true, and absent when it
+is false.
+
+## What can and cannot be verified
+
+- **CI / static**: the daemon is signed and hardened, its `minos` is 13.0 and its
+  SDK is 26+, its plist names the right `Label`/`BundleProgram`/`MachServices`/
+  `AssociatedBundleIdentifiers`/`ThrottleInterval`, and it embeds the
+  Apple-anchored client requirement. `scripts/verify-privileged-helper-bundle.sh`
+  checks all of this, and the non-publishing release workflow runs it.
+- **Not in CI**: the live XPC round trip and the actual `pmset` write. A CI
+  runner cannot grant the administrator approval a LaunchDaemon needs, so these
+  are a manual Developer-ID check: build with a Developer ID identity, install
+  the app, tick the control, approve it in Login Items, and confirm
+  `sudo launchctl print system/com.lingsmbp.StatusTrio.PowerHelper` shows the
+  daemon and that toggling the switch changes `pmset -g`.
+  Also disable the App feature, wait for the last connection to end plus the
+  5-second idle window, and verify the job remains registered with
+  `state = not running`. Re-enable the feature without another system grant,
+  and repeat to verify there are no ordinary unregister/register cycles.
+- **Local, without root or a Developer ID**: the daemon's own lifetime, because a
+  user LaunchAgent can run the same binary under the same `MachServices` name
+  (`logout` moves the name back to the system domain). `swift build -c release
+  --product StatusTrioPowerHelper`, copy the binary somewhere outside
+  `~/Documents`, register a LaunchAgent for it with `ThrottleInterval 1`, and
+  send it one Mach message. There is no approved app here, so the connection is
+  rejected — the daemon still has to disappear about 5 seconds later, which is
+  the case that used to leak a root process. Measured on macOS 27: the daemon
+  exited with status 0 five seconds after the rejected connection, and a second
+  message one second later started a new one immediately. A copy of the daemon
+  built with the client requirement removed was used to confirm the other half —
+  a connection that stays open keeps the process alive, and it exits 5 seconds
+  after that connection is invalidated. Running the helper out of `~/Documents`
+  hangs it inside `dyld` instead: a launchd-spawned process gets no TCC grant for
+  that folder.
+
+## Notes
+
+- macOS 26 renamed the Battery settings control from "Low Power Mode" to a
+  unified **Power Mode** (Automatic / Low / High). `pmset -g` now prints
+  `powermode` rather than `lowpowermode`. The daemon writes
+  `pmset -a lowpowermode 0|1`, which remains the accepted argument, and reads the
+  state back through `ProcessInfo`.
+
+## `disablesleep` and protocol version 3 (#295)
+
+The "keep awake with the lid closed" quick action needs a second kind of
+power-management write: `pmset -a disablesleep 0|1`. Ordinary `IOPMAssertion`s
+(including `PreventUserIdleSystemSleep`) cannot stop the forced sleep that
+happens when the lid closes, so it goes through the same daemon.
+
+- The protocol gained `readDisableSleep` / `setDisableSleep` and was bumped to
+  `PowerHelperProtocolVersion.disableSleep = 3`. The app reads the version handshake
+  before using these methods and reports an outdated daemon as "helper needs
+  updating" rather than failing silently — the same rule the High Power Mode
+  methods follow.
+- `DisableSleepCommand` owns the argument shape and the `pmset -g` `SleepDisabled`
+  parse as a pure value, so both are unit-tested without root.
+- **Residual safety.** `disablesleep` is a persisted system setting: it survives
+  the app quitting and even a reboot. The app therefore records that *it* turned
+  `disablesleep` on (`sleepControl.ownsDisableSleep`). On launch it only writes
+  `disablesleep 0` when that marker is set and the system still reports
+  `SleepDisabled 1`; a value the user set by hand is never touched. Quitting the
+  app resets the setting through `applicationShouldTerminate` (a `.terminateLater`
+  reply with a timeout) so a normal quit never leaves the Mac unable to sleep.

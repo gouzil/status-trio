@@ -6,17 +6,56 @@ import XCTest
 
 @MainActor
 final class SettingsViewTests: XCTestCase {
+    func testPanelDetailCopyMatchesTheSideBySideBehaviour() throws {
+        let suite = "SettingsViewTests.panelDetailCopy.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let localization = Localization(defaults: defaults, preferredLanguages: ["zh-Hans"])
+        XCTAssertEqual(localization.resolvedLanguage, .simplifiedChinese)
+
+        XCTAssertEqual(localization.string(.settingsPanelShowsDetailsAlongside), "并排显示详情")
+        let alongside = localization.string(.settingsPanelShowsDetailsAlongsideDescription)
+        XCTAssertTrue(alongside.contains("右侧"))
+        XCTAssertTrue(alongside.contains("左侧"))
+        XCTAssertEqual(localization.string(.settingsPanelReturnsToSummaryOnOpen), "重新打开时恢复详情页")
+        let reopen = localization.string(.settingsPanelReturnsToSummaryOnOpenDescription)
+        XCTAssertTrue(reopen.contains("上次收起"))
+        XCTAssertTrue(reopen.contains("详情"))
+        XCTAssertEqual(localization.string(.commonCloseDetail), "关闭详情")
+    }
+
     func testSettingsViewDimensionsAndSections() {
-        XCTAssertEqual(SettingsView.Section.allCases.count, 9)
+        XCTAssertEqual(SettingsView.Section.allCases.count, 11)
         XCTAssertEqual(SettingsView.sidebarWidth, 196)
         XCTAssertEqual(SettingsView.width, 720)
         XCTAssertEqual(SettingsView.height, 530)
+        // #304: the window is resizable, so the minimums must sit below the
+        // default size and still leave room for the fixed sidebar.
+        XCTAssertEqual(SettingsView.minimumWidth, 640)
+        XCTAssertEqual(SettingsView.minimumHeight, 460)
+        XCTAssertLessThan(SettingsView.minimumWidth, SettingsView.width)
+        XCTAssertLessThan(SettingsView.minimumHeight, SettingsView.height)
+        XCTAssertGreaterThan(
+            SettingsView.minimumWidth - SettingsView.sidebarWidth,
+            320,
+            "The detail column needs room for its widest 180pt control plus a label."
+        )
+    }
+
+    func testMenuBarPreviewFollowsSystemAppearanceUntilManuallyOverridden() {
+        // #290: the top live preview used to open dark regardless of the real
+        // menu bar. With no manual override it must mirror the system appearance.
+        XCTAssertFalse(SettingsView.previewIsDark(override: nil, systemColorScheme: .light))
+        XCTAssertTrue(SettingsView.previewIsDark(override: nil, systemColorScheme: .dark))
+        // A tap on the card's toggle wins over the system appearance.
+        XCTAssertTrue(SettingsView.previewIsDark(override: true, systemColorScheme: .light))
+        XCTAssertFalse(SettingsView.previewIsDark(override: false, systemColorScheme: .dark))
     }
 
     func testSidebarListsEveryStatusElementBeforeTheAppWidePanes() {
         XCTAssertEqual(
             SettingsView.Section.allCases,
-            [.appIcon, .battery, .network, .bluetooth, .audio, .brightness, .popover, .general, .about]
+            [.appIcon, .battery, .keepAwake, .network, .bluetooth, .audio, .brightness, .monitor, .popover, .general, .about]
         )
         XCTAssertEqual(SettingsView.Section.allCases.first, .appIcon)
         // The brightness hub sits directly after the audio pane.
@@ -695,9 +734,8 @@ final class SettingsViewTests: XCTestCase {
 
         XCTAssertTrue(audio.contains("volumeScrollGroup"))
         XCTAssertTrue(audio.contains("settingsAudioVolumeScrollGroup"))
-        XCTAssertTrue(audio.contains("scrollScopeLabel"))
-        XCTAssertTrue(audio.contains("popupScrollAdjustsVolume"))
-        XCTAssertTrue(audio.contains("popupVolumeScrollScope"))
+        XCTAssertTrue(audio.contains("popupPanelScrollAdjustsVolume"))
+        XCTAssertTrue(audio.contains("settingsPopupPanelScroll"))
         XCTAssertFalse(audio.contains("popupVolumeNaturalScrolling"))
         XCTAssertFalse(audio.contains("settingsPopupVolumeScrollNatural"))
 
@@ -717,11 +755,9 @@ final class SettingsViewTests: XCTestCase {
         XCTAssertTrue(audioBody.contains("inputDeviceOrderGroup"))
         XCTAssertTrue(audioBody.contains("externalVolumeGroup"))
         XCTAssertFalse(
-            popover.contains("popupScrollAdjustsVolume"),
+            popover.contains("popupPanelScrollAdjustsVolume"),
             "the panel pane must not own the volume-scroll switch"
         )
-        XCTAssertFalse(popover.contains("popupVolumeScrollScope"))
-        XCTAssertFalse(popover.contains("scrollScopeLabel"))
     }
 
     /// The compatibility note tells users whose display DDC Status Trio cannot
@@ -767,8 +803,7 @@ final class SettingsViewTests: XCTestCase {
             .fullyCharged,
             .stateReadFailed,
             .noActiveChargeLimit,
-            .unrecognizedChargeLimitState,
-            .restoredLimit(90)
+            .unrecognizedChargeLimitState
         ]
 
         for reason in reasons {
@@ -786,13 +821,6 @@ final class SettingsViewTests: XCTestCase {
                 "\(reason) lost the Chinese prefix"
             )
         }
-
-        XCTAssertTrue(
-            ChargeToFullNowHiddenReasonText.text(
-                for: .restoredLimit(90),
-                localization: localization
-            ).contains("90%")
-        )
     }
 }
 

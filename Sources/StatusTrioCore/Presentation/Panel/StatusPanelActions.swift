@@ -8,9 +8,11 @@ final class StatusPanelActions {
     private let inputDevices: () -> [AudioInputDevice]
     private let selectInputDevice: (AudioInputDevice) -> Void
     private let setVolumeCommand: (Double) -> Void
+    private let beginVolumeCommand: () -> Void
     private let finishVolumeCommand: () -> Void
     private let setBrightnessCommand: (String, Double) -> Void
     private let finishBrightnessCommand: (String) -> Void
+    private let beginBrightnessCommand: (String) -> Void
     private let toggleMuteCommand: () -> Void
     private let setInputScalarCommand: (Double, UUID) -> Void
     private let toggleInputMuteCommand: () -> Void
@@ -48,6 +50,7 @@ final class StatusPanelActions {
     private let refreshVolumeListeningModes: () -> Void
     private let stopVolumeListeningModes: () -> Void
     private let selectInputSourceCommand: (String) -> Void
+    private let setVPNPowerCommand: (Bool) -> Void
 
     private static let summaryBatteryLevelsToken = "bluetooth.summary"
     private static let nearbyBatteryDevicesToken = "bluetooth.summary.nearbyBatteryDevices"
@@ -64,9 +67,11 @@ final class StatusPanelActions {
         inputDevices: @escaping () -> [AudioInputDevice] = { [] },
         selectInput: @escaping (AudioInputDevice) -> Void = { _ in },
         setVolume: @escaping (Double) -> Void = { _ in },
+        beginVolumeAdjustment: @escaping () -> Void = {},
         finishVolumeAdjustment: @escaping () -> Void = {},
         setBrightness: @escaping (String, Double) -> Void = { _, _ in },
         finishBrightnessAdjustment: @escaping (String) -> Void = { _ in },
+        beginBrightnessAdjustment: @escaping (String) -> Void = { _ in },
         toggleMute: @escaping () -> Void = {},
         setInputScalar: @escaping (Double, UUID) -> Void = { _, _ in },
         toggleInputMute: @escaping () -> Void = {},
@@ -96,6 +101,7 @@ final class StatusPanelActions {
         activateWiFiDetails: @escaping (WiFiNameAccess) -> Void = { _ in },
         closeWiFiDetails: @escaping () -> Void = {},
         setWiFiPower: @escaping (Bool) -> Void = { _ in },
+        setVPNPower: @escaping (Bool) -> Void = { _ in },
         refreshWiFi: @escaping (WiFiNameAccess) -> Void = { _ in },
         openWiredDetails: @escaping () -> Void = {},
         closeWiredDetails: @escaping () -> Void = {},
@@ -110,9 +116,11 @@ final class StatusPanelActions {
         self.inputDevices = inputDevices
         self.selectInputDevice = selectInput
         self.setVolumeCommand = setVolume
+        self.beginVolumeCommand = beginVolumeAdjustment
         self.finishVolumeCommand = finishVolumeAdjustment
         self.setBrightnessCommand = setBrightness
         self.finishBrightnessCommand = finishBrightnessAdjustment
+        self.beginBrightnessCommand = beginBrightnessAdjustment
         self.toggleMuteCommand = toggleMute
         self.setInputScalarCommand = setInputScalar
         self.toggleInputMuteCommand = toggleInputMute
@@ -150,6 +158,7 @@ final class StatusPanelActions {
         self.refreshVolumeListeningModes = refreshVolumeListeningModes
         self.stopVolumeListeningModes = stopVolumeListeningModes
         self.selectInputSourceCommand = selectInputSource
+        self.setVPNPowerCommand = setVPNPower
     }
 
     convenience init(
@@ -164,9 +173,11 @@ final class StatusPanelActions {
             inputDevices: { store.liveInput.devices },
             selectInput: { device in store.selectInputDevice(device.id) },
             setVolume: { scalar in store.setVolume(scalar) },
+            beginVolumeAdjustment: { store.beginVolumeAdjustment() },
             finishVolumeAdjustment: { store.finishVolumeAdjustment() },
             setBrightness: { id, scalar in store.setBrightness(scalar, forDisplayID: id) },
             finishBrightnessAdjustment: { id in store.finishBrightnessAdjustment(displayID: id) },
+            beginBrightnessAdjustment: { id in store.beginBrightnessAdjustment(displayID: id) },
             toggleMute: { store.toggleMute() },
             setInputScalar: { scalar, requestID in store.setInputScalar(scalar, requestID: requestID) },
             toggleInputMute: { store.toggleInputMute() },
@@ -199,7 +210,7 @@ final class StatusPanelActions {
                     return store.bluetoothDevices.devices
                 }
                 let config = ListeningModePreview.Configuration(
-                    isEnabled: settings.previewsBluetoothListeningMode,
+                    isEnabled: settings.isListeningModePreviewActive,
                     deviceName: settings.bluetoothListeningModePreviewDeviceName,
                     deviceCount: settings.bluetoothListeningModePreviewDeviceCount,
                     languageCode: settings.bluetoothListeningModePreviewLanguage
@@ -220,6 +231,7 @@ final class StatusPanelActions {
             activateWiFiDetails: { store.wifiNetworks.activate(nameAccess: $0) },
             closeWiFiDetails: { store.wifiNetworks.deactivate() },
             setWiFiPower: { store.setWiFiPower($0) },
+            setVPNPower: { store.setVPNPower($0) },
             refreshWiFi: { store.wifiNetworks.refreshNow(nameAccess: $0) },
             openWiredDetails: { store.activatePrimaryLinkPanel() },
             closeWiredDetails: { store.closePrimaryLinkPanel() },
@@ -232,11 +244,13 @@ final class StatusPanelActions {
                 // state so no controls are presented anywhere. Re-enabling it
                 // reruns this same refresh path to rediscover live devices.
                 guard settings.showsBluetoothListeningMode else {
-                    store.bluetoothListeningModes.stop()
+                    // Master switch off: release the kept-alive Redmi control
+                    // sessions too, not just the panel-scoped state.
+                    store.bluetoothListeningModes.shutdown()
                     return
                 }
                 let config = ListeningModePreview.Configuration(
-                    isEnabled: settings.previewsBluetoothListeningMode,
+                    isEnabled: settings.isListeningModePreviewActive,
                     deviceName: settings.bluetoothListeningModePreviewDeviceName,
                     deviceCount: settings.bluetoothListeningModePreviewDeviceCount,
                     languageCode: settings.bluetoothListeningModePreviewLanguage
@@ -258,6 +272,10 @@ final class StatusPanelActions {
         setVolumeCommand(min(1, max(0, scalar)))
     }
 
+    func beginVolumeAdjustment() {
+        beginVolumeCommand()
+    }
+
     func finishVolumeAdjustment() {
         finishVolumeCommand()
     }
@@ -265,6 +283,11 @@ final class StatusPanelActions {
     func setBrightness(_ scalar: Double, forDisplayID displayID: String) {
         guard scalar.isFinite, !displayID.isEmpty else { return }
         setBrightnessCommand(displayID, min(1, max(0, scalar)))
+    }
+
+    func beginBrightnessAdjustment(displayID: String) {
+        guard !displayID.isEmpty else { return }
+        beginBrightnessCommand(displayID)
     }
 
     func finishBrightnessAdjustment(displayID: String) {
@@ -400,6 +423,9 @@ final class StatusPanelActions {
     func volumeListChanged() { refreshVolumeListeningModes() }
     func volumeListDisappeared() { stopVolumeListeningModes() }
     func setWiFiPower(_ enabled: Bool) { setWiFiPowerCommand(enabled) }
+
+    func setVPNPower(_ enabled: Bool) { setVPNPowerCommand(enabled) }
+
     func refreshWiFi() { refreshWiFiCommand(wifiNameAccess()) }
     private func bluetoothDevice(address: String) -> BluetoothDevice? {
         let key = BluetoothBatteryReader.normalizedAddress(address)

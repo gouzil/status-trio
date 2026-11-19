@@ -66,9 +66,58 @@ final class IconPresentationMapperTests: XCTestCase {
 
         XCTAssertEqual(fullScene.outerRing?.gap, RingGapStyle.value)
         XCTAssertEqual(fullScene.outerRing?.accessory, RingAccessoryState.text(IconTextState(text: "100", color: .primary, scale: 1.8)))
-        XCTAssertEqual(absentScene.outerRing?.gap, RingGapStyle.value)
-        XCTAssertEqual(absentScene.outerRing?.accessory, RingAccessoryState.text(IconTextState(text: "100", color: .primary, scale: 1.8)))
+        XCTAssertEqual(
+            absentScene.outerRing?.segments,
+            [RingSegmentState(progress: 1, color: .primary)],
+            "A Mac with no battery defaults to a full black/white ring"
+        )
+        // With no battery a legacy `.percentage` marker falls back to the plug,
+        // never to a number.
+        XCTAssertEqual(absentScene.outerRing?.gap, .indicator)
+        XCTAssertEqual(absentScene.outerRing?.accessory, .symbol(IconSymbolState(
+            source: .primitive(.plug), color: .primary, scale: 1.8)))
         XCTAssertNil(absentScene.outerRing?.effect)
+    }
+
+    func testABatteryLessMacDefaultsToMonochromeAndKeepsPowerModeColours() {
+        // A battery-less Mac keeps a full decorative ring. With no explicit
+        // choice it defaults to black/white, but Low/High Power Mode still win.
+        let options = BatteryIconOptions(
+            showsPercentage: true, showsChargingIndicator: false,
+            usesStatusColors: true, criticalThreshold: 95, connectedIndicator: .bolt
+        )
+        let plain = BatteryStatus(rawPercentage: nil, isPresent: false, isCharging: false,
+                                  isLowPowerMode: false, isConnectedToPower: false)
+        let plainRing = scene(snapshot: snapshot(battery: plain), batteryOptions: options).outerRing
+        XCTAssertEqual(plainRing?.segments, [RingSegmentState(progress: 1, color: .primary)])
+
+        let stranger = BatteryStatus(rawPercentage: nil, isPresent: false, isCharging: true,
+                                     isCharged: false, isLowPowerMode: true, isConnectedToPower: true)
+        let ring = scene(snapshot: snapshot(battery: stranger), batteryOptions: options).outerRing
+        XCTAssertEqual(ring?.segments, [RingSegmentState(progress: 1, color: .lowPower)])
+        XCTAssertEqual(ring?.gap, .closed, "no top marker keeps the ring closed")
+        XCTAssertNil(ring?.accessory)
+        XCTAssertNil(ring?.effect)
+
+        // An explicit "off" opts into the connected-to-power colour instead.
+        let connectedOptions = BatteryIconOptions(
+            showsPercentage: true, showsChargingIndicator: false,
+            usesStatusColors: true, criticalThreshold: 95, connectedIndicator: .bolt,
+            monochromeCharging: false
+        )
+        let connectedRing = scene(snapshot: snapshot(battery: plain), batteryOptions: connectedOptions).outerRing
+        XCTAssertEqual(connectedRing?.segments, [RingSegmentState(progress: 1, color: .powered)])
+    }
+
+    func testABatteryLessMacCanShowTheChosenBoltMarker() {
+        let absent = BatteryStatus(rawPercentage: nil, isPresent: false, isCharging: false,
+                                   isLowPowerMode: false, isConnectedToPower: false)
+        let options = BatteryIconOptions(showsPercentage: true, showsChargingIndicator: true,
+                                         usesStatusColors: false, connectedIndicator: .bolt)
+        let ring = scene(snapshot: snapshot(battery: absent), batteryOptions: options).outerRing
+        XCTAssertEqual(ring?.gap, .indicator)
+        XCTAssertEqual(ring?.accessory, .symbol(IconSymbolState(
+            source: .primitive(.bolt), color: .primary, scale: 1.8)))
     }
 
     func testBatteryUsesPlugWhenConnectedPercentageIsDisabledAndCanHidePercentage() {
@@ -361,18 +410,25 @@ final class IconPresentationMapperTests: XCTestCase {
                        "A Mac with no battery must not invent a percentage or a 0 W reading")
     }
 
-    func testBatteryPercentageCenterShowsOneHundredWhenBatteryIsAbsent() {
-        // A Mac with no battery reports 100 through `BatteryStatus.percentage`.
-        // The connection slot must show that same value instead of falling back
-        // to the network glyph, matching the top battery indicator.
+    func testBatteryPercentageCenterFallsBackToTheNetworkGlyphWhenBatteryIsAbsent() {
+        // A Mac with no battery must not invent 100%. The centre slot falls
+        // through to the network glyph, matching how the panel falls back to
+        // `battery.slash` instead of drawing a level.
         let absent = BatteryStatus(rawPercentage: nil, isPresent: false, isCharging: false,
                                    isLowPowerMode: false, isConnectedToPower: false)
         let config = ConnectionIconOptions(
             centerSource: .batteryPercentage,
             prioritizesNetworkErrors: false
         )
-        let center = scene(snapshot: snapshot(battery: absent), connectionOptions: config).center
-        XCTAssertEqual(center, .text(IconTextState(text: "100", color: .primary, scale: 1)))
+        let center = scene(
+            snapshot: snapshot(battery: absent, wifi: WiFiStatus(state: .connected, rssi: -75)),
+            connectionOptions: config
+        ).center
+        XCTAssertEqual(center, .symbol(IconSymbolState(
+            source: .symbol(name: "wifi", variableValue: 0.66, fallback: nil),
+            color: .primary,
+            scale: 1
+        )))
     }
 
     func testOffAndUnavailableWifiShareOneVisualState() {
@@ -410,7 +466,7 @@ final class IconPresentationMapperTests: XCTestCase {
             connectionOptions: ConnectionIconOptions(centerSource: .bluetoothDevice),
             bluetoothOptions: bluetooth
         ).center
-        XCTAssertEqual(connected, .symbol(IconSymbolState(source: .symbol(name: "custom.device", variableValue: nil, fallback: "dot.radiowaves.left.and.right"), color: .bluetooth, scale: 1.6)))
+        XCTAssertEqual(connected, .symbol(IconSymbolState(source: .symbol(name: "custom.device", variableValue: nil, fallback: "dot.radiowaves.left.and.right"), color: .bluetoothIcon, scale: 1.6)))
 
         let error = scene(
             snapshot: snapshot(wifi: WiFiStatus(state: .noInternet, rssi: nil)),
@@ -434,7 +490,7 @@ final class IconPresentationMapperTests: XCTestCase {
                 bluetooth: options
             )).center,
             .symbol(IconSymbolState(source: .image(url: URL(fileURLWithPath: "/audio.png"), fallbackSymbol: "headphones"),
-                                    color: .bluetooth, scale: 1.6)))
+                                    color: .bluetoothIcon, scale: 1.6)))
 
         let error = snapshot(connection: .wifi, wifi: WiFiStatus(state: .noInternet, rssi: -45),
             volume: VolumeStatus(scalar: 0.5, isMuted: false, deviceName: "Output", currentDevice: PresentationFixtures.bluetoothDevice))
@@ -600,8 +656,12 @@ final class IconPresentationMapperTests: XCTestCase {
         let absent = BatteryStatus(rawPercentage: nil, isPresent: false, isCharging: false,
                                    isLowPowerMode: false, isConnectedToPower: true)
         let scene = chargingScene(battery: absent, source: .chargingStatus)
-        // A machine with no battery has no status to invent and no ring to close.
-        XCTAssertNotEqual(scene.outerRing?.gap, .closed)
+        // A machine with no battery has no status to invent: the ring stays a
+        // plain full ring and the centre falls back to the network glyph.
+        XCTAssertEqual(scene.outerRing?.segments.first?.progress, 1)
+        XCTAssertEqual(scene.outerRing?.gap, .indicator)
+        XCTAssertEqual(scene.outerRing?.accessory, .symbol(IconSymbolState(
+            source: .primitive(.plug), color: .primary, scale: 1.8)))
         guard case .symbol? = scene.center else {
             return XCTFail("expected the network glyph fallback")
         }

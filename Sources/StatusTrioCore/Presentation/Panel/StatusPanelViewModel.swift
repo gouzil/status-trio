@@ -1,3 +1,4 @@
+import AppKit
 import Combine
 import Foundation
 
@@ -17,9 +18,59 @@ private final class YieldingPanelPresentationUpdateScheduler: PanelPresentationU
 }
 
 @MainActor
+private struct PanelSettingsFingerprint: Equatable {
+    let sections: [PopupSection]
+    let showsBatteryPowerInfoBar: Bool
+    let batteryPowerOptions: BatteryPowerDisplayOptions
+    let showsBatteryPowerFlow: Bool
+    let showsHighEnergyApps: Bool
+    let showsLocalIPAddress: Bool
+    let returnsToSummaryOnOpen: Bool
+    let hiddenBrightnessDisplayIDs: Set<String>
+    let showsChargeToFullNowButton: Bool
+    let showsBluetoothListeningMode: Bool
+    let previewsBluetoothListeningMode: Bool
+    let previewDeviceName: String
+    let previewDeviceCount: Int
+    let previewLanguageCode: String
+    let showsBluetoothBatteryLevels: Bool
+    let showsNearbyBluetoothBatteryDevices: Bool
+    let bluetoothDeviceListOptions: BluetoothDeviceListOptions
+    let outputDeviceListPreferences: AudioOutputListPreferences
+    let inputDeviceListPreferences: AudioInputListPreferences
+    let externalVolumeConfigurations: [String: ExternalVolumeConfiguration]
+    let inputSourceMarkerStyle: InputSourceMarkerStyle
+
+    init(settings: SettingsStore) {
+        sections = settings.visiblePopupSections
+        showsBatteryPowerInfoBar = settings.showsBatteryPowerInfoBar
+        batteryPowerOptions = settings.batteryPowerDisplayOptions
+        showsBatteryPowerFlow = settings.showsBatteryPowerFlow
+        showsHighEnergyApps = settings.showsHighEnergyApps
+        showsLocalIPAddress = settings.showsLocalIPAddress
+        returnsToSummaryOnOpen = settings.returnsToSummaryOnOpen
+        hiddenBrightnessDisplayIDs = settings.hiddenBrightnessDisplayIDs
+        showsChargeToFullNowButton = settings.showsChargeToFullNowButton
+        showsBluetoothListeningMode = settings.showsBluetoothListeningMode
+        previewsBluetoothListeningMode = settings.previewsBluetoothListeningMode
+        previewDeviceName = settings.bluetoothListeningModePreviewDeviceName
+        previewDeviceCount = settings.bluetoothListeningModePreviewDeviceCount
+        previewLanguageCode = settings.bluetoothListeningModePreviewLanguage
+        showsBluetoothBatteryLevels = settings.showsBluetoothBatteryLevels
+        showsNearbyBluetoothBatteryDevices = settings.showsNearbyBluetoothBatteryDevices
+        bluetoothDeviceListOptions = settings.bluetoothDeviceListOptions
+        outputDeviceListPreferences = settings.outputDeviceListPreferences
+        inputDeviceListPreferences = settings.inputDeviceListPreferences
+        externalVolumeConfigurations = settings.externalVolumeConfigurations
+        inputSourceMarkerStyle = settings.inputSourceMarkerStyle
+    }
+}
+
+@MainActor
 final class StatusPanelViewModel: ObservableObject {
-    private struct RefreshRegions: OptionSet {
-        let rawValue: UInt8
+
+    struct RefreshRegions: OptionSet {
+        let rawValue: UInt16
         static let batteryDetails = Self(rawValue: 1 << 0)
         static let wifiDetails = Self(rawValue: 1 << 1)
         static let wiredDetailsAndNetwork = Self(rawValue: 1 << 2)
@@ -70,8 +121,23 @@ final class StatusPanelViewModel: ObservableObject {
     /// the ungated `chargeToFullNowPresentation` above.
     @Published private(set) var summaryChargeToFullNowPresentation: ChargeToFullNowPresentation = .hidden
     @Published private(set) var visiblePopupSections: [PopupSection]
-    @Published private(set) var route: StatusPanelRoute = .summary
+    @Published private(set) var route: StatusPanelRoute = .summary {
+        didSet {
+            guard route != oldValue else { return }
+            routeDidChange?(route)
+        }
+    }
+    @Published private(set) var detailPresentation: StatusPanelDetailPresentation = .inline
+
+    /// Called after `route` commits a new value, before the next render pass.
+    /// The window owner places the attached detail from here; reading route
+    /// from a `@Published` subscriber would see the not-yet-committed value.
+    var routeDidChange: ((StatusPanelRoute) -> Void)?
     @Published private(set) var wifiDisclosure = WiFiPanelDisclosureState()
+    /// The panel background actually drawn, after Reduce Transparency collapses
+    /// it to `.solid`. The SwiftUI card layer reads this to pick the matching
+    /// card surface instead of guessing from `ColorScheme`.
+    @Published private(set) var effectivePanelBackgroundStyle: PanelBackgroundStyle
 
     /// The summary sections actually rendered. The brightness section is
     /// dropped when every display is hidden, so a fully hidden list leaves no
@@ -102,12 +168,36 @@ final class StatusPanelViewModel: ObservableObject {
     private let localization: Localization
     private let inputSourceController: InputSourceController
     private let chargeToFullNow: ChargeToFullNowController?
+    private let vpnPower: VPNPowerController
     private let updateScheduler: any PanelPresentationUpdateScheduling
     let actions: StatusPanelActions
     private var cancellables: Set<AnyCancellable> = []
     private var sourceDemandCancellables: Set<AnyCancellable> = []
     private var subscribedSourceDemand: SourceDemand?
     @Published private var bluetoothPresentationRevision = 0
+    /// The card's fine-grained metrics source. Deliberately not part of the
+    /// panel's @Published snapshot: a 2-second tick must not re-render other
+    /// sections or the icon.
+    var hardwareMonitor: HardwareMonitorObservable { store.hardwareMetrics.observable }
+    var topApps: TopAppsObservable { store.topApps.observable }
+    /// Card tiles in the user's chosen order, filtered to enabled metrics.
+    @Published private(set) var hardwareMonitorMetrics: [HardwareMonitorMetric]
+    /// Shared per-metric colours shown on the card bars (same field as the ring).
+    @Published private(set) var hardwareMonitorMetricColors: [HardwareMonitorMetric: IconRGBA]
+    @Published private(set) var statusPanelBoldTextEnabled: Bool
+    @Published private(set) var statusPanelMediumTextEnabled: Bool
+    /// Broadband caps (Mbps) for the network-speed tiles.
+    @Published private(set) var hardwareSpeedCapsMbps: [HardwareMonitorMetric: Double]
+    /// Which hardware-summary blocks are visible.
+    @Published private(set) var showsHardwareRings: Bool
+    @Published private(set) var showsHardwareSummaryRow: Bool
+    /// Whether detail pages show the ranked top-application list.
+    @Published private(set) var showsHardwareTopApps: Bool
+    /// Which ring cards and bottom info-bar items the summary draws; hidden
+    /// items collapse so the rest divide the width evenly.
+    @Published private(set) var enabledHardwareRingSlots: Set<HardwareRingSlot>
+    @Published private(set) var enabledHardwareSummaryMetrics: Set<HardwareSummaryMetric>
+
     private var isStarted = false
     private var bluetoothIsExpanded = false
     /// Whether the volume section has published a real, non-empty device list
@@ -120,12 +210,18 @@ final class StatusPanelViewModel: ObservableObject {
     /// The newest level-only reading waiting for the next coalesced publish.
     private var pendingLevelVolumeStatus: VolumeStatus?
     private var levelVolumePublishTask: Task<Void, Never>?
-    /// A drag emits levels far faster than the row can usefully draw them.
-    /// Coalescing to 10 Hz stops the panel hosting view from laying out the
-    /// whole tree on every tick (#263); the slider's local draft keeps the
-    /// gesture responsive in between.
+    /// True while the wheel is driving the volume. Wheel events arrive slowly
+    /// enough that the drag-tuning coalescer would only make the row lag behind
+    /// the pointer, so those level changes publish on the same runloop.
+    private var isWheelAdjustingVolume = false
+    /// Coalesces non-gesture (background monitor) level changes to 10 Hz so the
+    /// panel hosting view does not lay out the whole tree on every poll (#263).
+    /// A user gesture — wheel or slider drag/click — bypasses this entirely and
+    /// publishes each 30 Hz slider report, so the row stays glued to the pointer.
     static let levelVolumePublishInterval: Duration = .milliseconds(100)
     private var pendingRefreshRegions: RefreshRegions = []
+    private var lastPanelSettingsFingerprint: PanelSettingsFingerprint?
+    private var panelSettingsCheckScheduled = false
     private var lifecycleGeneration = 0
 
     /// Tests observe deliveries from the single popup-snapshot subscription
@@ -134,6 +230,18 @@ final class StatusPanelViewModel: ObservableObject {
 
     var isShowingDetailPage: Bool { route != .summary }
 
+    /// True whenever the summary page is on screen: either it is the route, or
+    /// a selected detail page is shown alongside it.
+    var isSummaryVisible: Bool {
+        route == .summary || detailPresentation == .alongside
+    }
+
+    /// The open system-monitor detail page, if the route is one.
+    private var activeDetailKind: HardwareDetailKind? {
+        if case let .hardwareDetail(kind) = route { return kind }
+        return nil
+    }
+
     init(
         store: SystemStatusStore,
         settings: SettingsStore,
@@ -141,7 +249,8 @@ final class StatusPanelViewModel: ObservableObject {
         actions: StatusPanelActions,
         updateScheduler: any PanelPresentationUpdateScheduling = YieldingPanelPresentationUpdateScheduler(),
         inputSourceController: InputSourceController? = nil,
-        chargeToFullNow: ChargeToFullNowController? = nil
+        chargeToFullNow: ChargeToFullNowController? = nil,
+        vpnPower: VPNPowerController? = nil
     ) {
         let resolvedInputSourceController = inputSourceController ?? InputSourceController()
         self.store = store
@@ -150,9 +259,23 @@ final class StatusPanelViewModel: ObservableObject {
         self.localization = localization
         self.inputSourceController = resolvedInputSourceController
         self.chargeToFullNow = chargeToFullNow
+        self.vpnPower = vpnPower ?? store.vpnPower
         self.updateScheduler = updateScheduler
         self.actions = actions
         visiblePopupSections = settings.visiblePopupSections
+        hardwareMonitorMetrics = settings.visibleHardwareMetrics
+        hardwareMonitorMetricColors = settings.hardwareMonitorMetricColors
+        statusPanelBoldTextEnabled = settings.statusPanelBoldTextEnabled
+        statusPanelMediumTextEnabled = settings.statusPanelMediumTextEnabled
+        showsHardwareRings = settings.showsHardwareRings
+        showsHardwareSummaryRow = settings.showsHardwareSummaryRow
+        showsHardwareTopApps = settings.showsHardwareTopApps
+        enabledHardwareRingSlots = settings.enabledHardwareRingSlots
+        enabledHardwareSummaryMetrics = settings.enabledHardwareSummaryMetrics
+        hardwareSpeedCapsMbps = [
+            .downloadSpeed: settings.hardwareDownloadCapMbps,
+            .uploadSpeed: settings.hardwareUploadCapMbps
+        ]
         battery = PanelPresentationMapper.battery(
             store.popupSnapshot.battery,
             powerSample: store.powerSampling.systemPower,
@@ -183,6 +306,10 @@ final class StatusPanelViewModel: ObservableObject {
                     settings: settings
                 ),
                 deviceList: settings.outputDeviceListPreferences,
+                showsAirPodsSystemControls: settings.showsSpatialAudioControls
+                    || settings.showsConversationAwarenessControls,
+                showsSpatialAudioControls: settings.showsSpatialAudioControls,
+                showsConversationAwarenessControls: settings.showsConversationAwarenessControls,
                 localization: localization
             )
         )
@@ -194,7 +321,8 @@ final class StatusPanelViewModel: ObservableObject {
         inputSource = InputSourcePanelMapper.map(
             state: resolvedInputSourceController.state,
             failure: resolvedInputSourceController.selectionFailure,
-            localization: localization
+            localization: localization,
+            markerStyle: settings.inputSourceMarkerStyle
         )
         brightness = BrightnessPanelMapper.map(
             store.popupSnapshot.brightness,
@@ -217,6 +345,10 @@ final class StatusPanelViewModel: ObservableObject {
             localization: localization
         )
         wiredDetails = PanelDetailMapper.wired(details: store.primaryLink.details, localization: localization)
+        effectivePanelBackgroundStyle = PanelBackgroundStyle.renderStyle(
+            for: settings.panelBackgroundStyle,
+            reduceTransparency: NSWorkspace.shared.accessibilityDisplayShouldReduceTransparency
+        )
         refreshAll()
     }
 
@@ -224,13 +356,33 @@ final class StatusPanelViewModel: ObservableObject {
         guard !isStarted else { return }
         isStarted = true
         lifecycleGeneration &+= 1
+        lastPanelSettingsFingerprint = PanelSettingsFingerprint(settings: settings)
+        panelSettingsCheckScheduled = false
         let sections = settings.visiblePopupSections
         if visiblePopupSections != sections { visiblePopupSections = sections }
+        let metrics = settings.visibleHardwareMetrics
+        if hardwareMonitorMetrics != metrics { hardwareMonitorMetrics = metrics }
+        if hardwareMonitorMetricColors != settings.hardwareMonitorMetricColors {
+            hardwareMonitorMetricColors = settings.hardwareMonitorMetricColors
+        }
+        if statusPanelBoldTextEnabled != settings.statusPanelBoldTextEnabled {
+            statusPanelBoldTextEnabled = settings.statusPanelBoldTextEnabled
+        }
+        if statusPanelMediumTextEnabled != settings.statusPanelMediumTextEnabled {
+            statusPanelMediumTextEnabled = settings.statusPanelMediumTextEnabled
+        }
+        let caps: [HardwareMonitorMetric: Double] = [
+            .downloadSpeed: settings.hardwareDownloadCapMbps,
+            .uploadSpeed: settings.hardwareUploadCapMbps
+        ]
+        if hardwareSpeedCapsMbps != caps { hardwareSpeedCapsMbps = caps }
         subscribeToPopupPresentationSources()
         subscribeToChargeToFullNow()
+        subscribeToEffectivePanelBackgroundStyle()
         reconcileSourceSubscriptions()
         refreshAll()
         updatePowerSamplingDemand()
+        updateHardwareMetricsDemand()
 
         // A no-battery Mac gets its panel title from the shared whole-machine
         // reading, and the provisional info bar shows the other rails; refresh
@@ -269,8 +421,9 @@ final class StatusPanelViewModel: ObservableObject {
 
         store.$isPopoverVisible
             .dropFirst()
-            .sink { [weak self] _ in
+            .sink { [weak self] visible in
                 self?.coalesceControllerUpdate([.bluetooth, .volume])
+                self?.updateHardwareMetricsDemand(popoverVisible: visible)
             }
             .store(in: &cancellables)
 
@@ -283,11 +436,114 @@ final class StatusPanelViewModel: ObservableObject {
                 self?.settingsSectionsChanged(order: order, enabled: enabled)
             }
             .store(in: &cancellables)
+
+        Publishers.CombineLatest(
+            settings.$hardwareMonitorMetricOrder,
+            settings.$enabledHardwareMonitorMetrics
+        )
+            .removeDuplicates { $0.0 == $1.0 && $0.1 == $1.1 }
+            .sink { [weak self] _, _ in
+                guard let self else { return }
+                let metrics = self.settings.visibleHardwareMetrics
+                if self.hardwareMonitorMetrics != metrics { self.hardwareMonitorMetrics = metrics }
+                self.updateHardwareMetricsDemand()
+            }
+            .store(in: &cancellables)
+
+        settings.$hardwareMonitorMetricColors
+            .removeDuplicates()
+            .sink { [weak self] colors in
+                guard let self else { return }
+                if self.hardwareMonitorMetricColors != colors { self.hardwareMonitorMetricColors = colors }
+            }
+            .store(in: &cancellables)
+
+        settings.$hardwareBackgroundHistoryEnabled
+            .removeDuplicates()
+            .sink { [weak self] enabled in self?.updateHardwareMetricsDemand(backgroundHistoryEnabled: enabled) }
+            .store(in: &cancellables)
+
+        settings.$hardwarePanelRefreshSeconds
+            .removeDuplicates()
+            .sink { [weak self] seconds in self?.updateHardwareMetricsDemand(panelSeconds: seconds) }
+            .store(in: &cancellables)
+
+        settings.$showsHardwareRings
+            .removeDuplicates()
+            .sink { [weak self] value in
+                guard let self, self.showsHardwareRings != value else { return }
+                self.showsHardwareRings = value
+            }
+            .store(in: &cancellables)
+
+        settings.$showsHardwareSummaryRow
+            .removeDuplicates()
+            .sink { [weak self] value in
+                guard let self, self.showsHardwareSummaryRow != value else { return }
+                self.showsHardwareSummaryRow = value
+            }
+            .store(in: &cancellables)
+
+        settings.$showsHardwareTopApps
+            .removeDuplicates()
+            .sink { [weak self] value in
+                guard let self, self.showsHardwareTopApps != value else { return }
+                self.showsHardwareTopApps = value
+                self.updateHardwareMetricsDemand()
+            }
+            .store(in: &cancellables)
+
+        settings.$enabledHardwareRingSlots
+            .removeDuplicates()
+            .sink { [weak self] slots in
+                guard let self, self.enabledHardwareRingSlots != slots else { return }
+                self.enabledHardwareRingSlots = slots
+            }
+            .store(in: &cancellables)
+
+        settings.$enabledHardwareSummaryMetrics
+            .removeDuplicates()
+            .sink { [weak self] metrics in
+                guard let self, self.enabledHardwareSummaryMetrics != metrics else { return }
+                self.enabledHardwareSummaryMetrics = metrics
+            }
+            .store(in: &cancellables)
+
+        settings.$statusPanelBoldTextEnabled
+            .removeDuplicates()
+            .sink { [weak self] enabled in
+                guard let self else { return }
+                if self.statusPanelBoldTextEnabled != enabled { self.statusPanelBoldTextEnabled = enabled }
+            }
+            .store(in: &cancellables)
+
+        settings.$statusPanelMediumTextEnabled
+            .removeDuplicates()
+            .sink { [weak self] enabled in
+                guard let self else { return }
+                if self.statusPanelMediumTextEnabled != enabled { self.statusPanelMediumTextEnabled = enabled }
+            }
+            .store(in: &cancellables)
+
+        Publishers.CombineLatest(settings.$hardwareDownloadCapMbps, settings.$hardwareUploadCapMbps)
+            .removeDuplicates { $0.0 == $1.0 && $0.1 == $1.1 }
+            .sink { [weak self] download, upload in
+                guard let self else { return }
+                let caps: [HardwareMonitorMetric: Double] = [.downloadSpeed: download, .uploadSpeed: upload]
+                if self.hardwareSpeedCapsMbps != caps { self.hardwareSpeedCapsMbps = caps }
+            }
+            .store(in: &cancellables)
         // Non-section settings are delivered from `willSet`; only queue the
         // remap here. The scheduler drains after this mutation commits, so its
         // refresh reads the new stored values.
+        //
+        // `objectWillChange` covers every one of the store's ~90 properties,
+        // including ones no panel row reads (icon size, app icon, telemetry).
+        // A snapshot of the settings the panel actually consumes gates the
+        // remap, so a slider drag that does not affect the panel no longer
+        // re-maps every row while it moves.
         settings.objectWillChange
-            .sink { [weak self] in self?.coalesceControllerUpdate(.all) }
+            .sink { [weak self] in self?.schedulePanelSettingsCheck() }
             .store(in: &cancellables)
         localization.$resolvedLanguage
             .dropFirst()
@@ -295,21 +551,52 @@ final class StatusPanelViewModel: ObservableObject {
             .store(in: &cancellables)
     }
 
+    /// Keeps the SwiftUI card surface in sync with the rendered panel background
+    /// while the panel is open: a settings change and a Reduce Transparency
+    /// toggle both recompute the effective style. This mirrors the AppKit layer's
+    /// own calculation so the content and the window never disagree.
+    private func subscribeToEffectivePanelBackgroundStyle() {
+        settings.$panelBackgroundStyle
+            .removeDuplicates()
+            .sink { [weak self] _ in self?.refreshEffectivePanelBackgroundStyle() }
+            .store(in: &cancellables)
+        NSWorkspace.shared.notificationCenter
+            .publisher(for: NSWorkspace.accessibilityDisplayOptionsDidChangeNotification)
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in self?.refreshEffectivePanelBackgroundStyle() }
+            .store(in: &cancellables)
+    }
+
+    private func refreshEffectivePanelBackgroundStyle() {
+        let next = PanelBackgroundStyle.renderStyle(
+            for: settings.panelBackgroundStyle,
+            reduceTransparency: NSWorkspace.shared.accessibilityDisplayShouldReduceTransparency
+        )
+        if next != effectivePanelBackgroundStyle {
+            effectivePanelBackgroundStyle = next
+        }
+    }
+
     func stop() {
         guard isStarted else { return }
         isStarted = false
         lifecycleGeneration &+= 1
         pendingRefreshRegions = []
+        lastPanelSettingsFingerprint = nil
+        panelSettingsCheckScheduled = false
         volumeDeviceRowsLoaded = false
         cancelLevelVolumePublish()
         lastLiveVolumeStatus = nil
         sourceDemandCancellables.removeAll()
+        store.mihomoTunnel.deactivate()
         subscribedSourceDemand = nil
         chargeToFullNow?.clearDemand()
         chargeToFullNowPresentation = .hidden
         summaryChargeToFullNowPresentation = .hidden
         store.powerSampling.end(.panel)
         store.powerSampling.end(.powerInfoBar)
+        store.hardwareMetrics.end(.panel)
+        store.topApps.setDemand(nil)
         cancellables.removeAll()
     }
 
@@ -319,7 +606,7 @@ final class StatusPanelViewModel: ObservableObject {
             showSummaryPage()
             return
         }
-        transition(to: .battery)
+        guard transition(to: .battery) else { return }
         actions.batteryDetailsAppeared()
         refreshBatteryDetails()
     }
@@ -329,11 +616,14 @@ final class StatusPanelViewModel: ObservableObject {
             showSummaryPage()
             return
         }
-        wifiDisclosure = WiFiPanelDisclosureState(
-            showsDetails: showsDetailsInitially,
-            showsMore: false
-        )
-        transition(to: .wifi)
+        let opensNewPage = route != .wifi
+        if opensNewPage {
+            wifiDisclosure = WiFiPanelDisclosureState(
+                showsDetails: showsDetailsInitially,
+                showsMore: false
+            )
+        }
+        guard transition(to: .wifi) else { return }
         actions.wifiDetailsOpened()
         refreshWiFiDetails()
     }
@@ -343,7 +633,7 @@ final class StatusPanelViewModel: ObservableObject {
             showSummaryPage()
             return
         }
-        transition(to: .ethernet)
+        guard transition(to: .ethernet) else { return }
         actions.wiredDetailsOpened()
         refreshWiredDetailsAndNetwork()
     }
@@ -356,8 +646,25 @@ final class StatusPanelViewModel: ObservableObject {
         transition(to: .inputSource)
     }
 
+    /// Opens one unified system-monitor detail page. Requires the hardware
+    /// monitor section to be visible (same gate as the summary).
+    func showHardwareDetail(_ kind: HardwareDetailKind) {
+        guard settings.visiblePopupSections.contains(.hardwareMonitor) else {
+            showSummaryPage()
+            return
+        }
+        transition(to: .hardwareDetail(kind))
+    }
+
     func showSummaryPage() {
         closeCurrentPage()
+    }
+
+    /// Switches where the selected detail page is shown without closing it.
+    func setDetailPresentation(_ presentation: StatusPanelDetailPresentation) {
+        guard detailPresentation != presentation else { return }
+        detailPresentation = presentation
+        updateHardwareMetricsDemand()
     }
 
     func setWiFiShowsDetails(_ showsDetails: Bool) {
@@ -398,7 +705,7 @@ final class StatusPanelViewModel: ObservableObject {
         case .ethernet:
             actions.wiredDetailsOpened()
             refreshWiredDetailsAndNetwork()
-        case .inputSource:
+        case .inputSource, .hardwareDetail:
             break
         }
     }
@@ -487,7 +794,9 @@ final class StatusPanelViewModel: ObservableObject {
     }
 
     private func mapVPN(_ status: VPNStatus) -> PanelSummaryState? {
-        PanelPresentationMapper.vpn(status, localization: localization)
+        PanelPresentationMapper.vpn(
+            status, powerState: vpnPower.state, localization: localization
+        )
     }
 
     private func mapVolume(_ status: VolumeStatus) -> VolumePanelState {
@@ -515,6 +824,10 @@ final class StatusPanelViewModel: ObservableObject {
             previewLanguageCode: previewConfiguration.languageCode,
             previewLocalization: PreviewLocalization.forCode(previewConfiguration.languageCode),
             deviceListPlaceholder: deviceListPlaceholder,
+            showsAirPodsSystemControls: settings.showsSpatialAudioControls
+                || settings.showsConversationAwarenessControls,
+            showsSpatialAudioControls: settings.showsSpatialAudioControls,
+            showsConversationAwarenessControls: settings.showsConversationAwarenessControls,
             localization: localization
         )
     }
@@ -536,7 +849,7 @@ final class StatusPanelViewModel: ObservableObject {
 
     private var currentPreviewConfiguration: ListeningModePreview.Configuration {
         ListeningModePreview.Configuration(
-            isEnabled: settings.showsBluetoothListeningMode && settings.previewsBluetoothListeningMode,
+            isEnabled: settings.isListeningModePreviewActive,
             deviceName: settings.bluetoothListeningModePreviewDeviceName,
             deviceCount: settings.bluetoothListeningModePreviewDeviceCount,
             languageCode: settings.bluetoothListeningModePreviewLanguage
@@ -545,7 +858,7 @@ final class StatusPanelViewModel: ObservableObject {
 
     private func makeListeningModeTaskID(outputDevices: [AudioOutputDevice]) -> String {
         let configuration = ListeningModePreview.Configuration(
-            isEnabled: settings.showsBluetoothListeningMode && settings.previewsBluetoothListeningMode,
+            isEnabled: settings.isListeningModePreviewActive,
             deviceName: settings.bluetoothListeningModePreviewDeviceName,
             deviceCount: settings.bluetoothListeningModePreviewDeviceCount,
             languageCode: settings.bluetoothListeningModePreviewLanguage
@@ -557,7 +870,7 @@ final class StatusPanelViewModel: ObservableObject {
             return "off::\(store.popoverOpenGeneration)"
         }
         let connected = BluetoothDevicePresentation.grouped(store.bluetoothDevices.devices).connected
-            .filter { $0.isAirPods || $0.isHuaweiAudio }
+            .filter { $0.isAirPods || $0.isHuaweiAudio || $0.isRedmiAudio || $0.isOppoAudio }
             .map { BluetoothBatteryReader.normalizedAddress($0.id) }
             .joined(separator: ",")
         let preview = configuration.isEnabled ? "|preview" : ""
@@ -718,6 +1031,64 @@ final class StatusPanelViewModel: ObservableObject {
     /// The panel summary and a no-battery page need the shared sampler only
     /// while the customer can see them. The details page registers its own
     /// demand, so closing the panel never cuts a sample it is still using.
+    /// The hardware card samples only while it is actually on screen: the
+    /// panel is open, the summary is visible (as the route or beside a detail),
+    /// and the section is visible. Switching pages, hiding the module or
+    /// closing the panel ends the demand immediately, so a closed panel never
+    /// keeps a hardware timer alive.
+    private func updateHardwareMetricsDemand(popoverVisible: Bool? = nil, backgroundHistoryEnabled: Bool? = nil,
+                                             panelSeconds: Int? = nil) {
+        // `@Published` publishes in willSet, so a subscriber must pass the new
+        // value in rather than read `store.isPopoverVisible` (still the old one).
+        let sectionOn = visiblePopupSections.contains(.hardwareMonitor)
+        let panelOpen = isStarted && (popoverVisible ?? store.isPopoverVisible) && sectionOn
+        let detailKind = activeDetailKind
+        let summaryVisible = panelOpen && isSummaryVisible
+        let detailVisible = panelOpen && detailKind != nil
+        // @Published fires in willSet, so a settings subscriber must pass the new
+        // value in rather than read the not-yet-committed stored property.
+        let backgroundHistory = backgroundHistoryEnabled ?? settings.hardwareBackgroundHistoryEnabled
+        let panelRefresh = panelSeconds ?? settings.hardwarePanelRefreshSeconds
+        // Background history follows the panel cadence, so opening a detail page
+        // shows the same resolution the panel would have recorded.
+        store.hardwareMetrics.backgroundIntervalSeconds = TimeInterval(panelRefresh)
+        store.hardwareMetrics.panelIntervalSeconds = TimeInterval(panelRefresh)
+        // Only the visible detail page pays for its structured payload and the
+        // per-page expensive work (frequency for CPU, session totals for network).
+        store.hardwareMetrics.setDetailDemand(detailVisible ? detailKind : nil)
+        store.topApps.setDemand(detailVisible && showsHardwareTopApps ? detailKind?.topAppMetric : nil)
+        if summaryVisible || detailVisible {
+            // The compact summary is fixed: four rings plus download/upload,
+            // average fan and disk read/write. It no longer follows the card
+            // metric order, so every group has data even when the user's card
+            // selection changed. An alongside detail unions its own metrics on
+            // top so the visible summary and the detail share one demand.
+            store.hardwareMetrics.end(.background)
+            var metrics: Set<HardwareMetricID> = []
+            if summaryVisible {
+                metrics.formUnion(HardwareMetricsService.hardwareSummaryMetricIDs)
+            }
+            if let detailKind, detailVisible {
+                metrics.formUnion(HardwareMetricsService.detailMetricIDs(for: detailKind))
+            }
+            store.hardwareMetrics.begin(.panel, metrics: metrics)
+            if detailVisible {
+                // Read immediately so the page's structured payload appears on
+                // open instead of waiting for the next scheduled interval.
+                store.hardwareMetrics.forceRefresh()
+            }
+        } else {
+            store.hardwareMetrics.end(.panel)
+            // Optional low-frequency background sampling keeps the summary warm
+            // while the panel is closed (off by default to preserve idle power).
+            if isStarted, sectionOn, backgroundHistory {
+                store.hardwareMetrics.begin(.background, metrics: HardwareMetricsService.hardwareSummaryMetricIDs)
+            } else {
+                store.hardwareMetrics.end(.background)
+            }
+        }
+    }
+
     private func updatePowerSamplingDemand(showsPowerInfoBar: Bool? = nil) {
         let panelVisible = isStarted && visiblePopupSections.contains(.battery)
         if panelVisible {
@@ -800,11 +1171,14 @@ final class StatusPanelViewModel: ObservableObject {
         subscribedSourceDemand = demand
 
         if demand.contains(.vpn) {
-            store.$vpnStatus
+            store.mihomoTunnel.activate()
+            Publishers.CombineLatest(store.$vpnStatus, vpnPower.$state)
                 .dropFirst()
-                .compactMap { [weak self] status -> PanelSummaryState? in
+                .compactMap { [weak self] status, powerState -> PanelSummaryState? in
                     guard let self, isVisible(.vpn) else { return nil }
-                    return mapVPN(status)
+                    return PanelPresentationMapper.vpn(
+                        status, powerState: powerState, localization: localization
+                    )
                 }
                 .removeDuplicates()
                 .sink { [weak self] state in
@@ -813,6 +1187,7 @@ final class StatusPanelViewModel: ObservableObject {
                 }
                 .store(in: &sourceDemandCancellables)
         }
+        if !demand.contains(.vpn) { store.mihomoTunnel.deactivate() }
         if demand.contains(.volume) {
             store.$liveVolume
                 .dropFirst()
@@ -877,6 +1252,17 @@ final class StatusPanelViewModel: ObservableObject {
                     coalesceControllerUpdate(regions)
                 }
                 .store(in: &sourceDemandCancellables)
+            // Discovery settling without a control must repaint the row from the
+            // placeholder to the "unavailable" fallback (#354), so re-map when
+            // the phase changes even though no presentation was published.
+            store.bluetoothListeningModes.$airPodsDiscoveryPhase
+                .dropFirst()
+                .sink { [weak self] _ in
+                    guard let self, isStarted,
+                          isVisible(.bluetooth) || isVisible(.volume) else { return }
+                    coalesceControllerUpdate(regions)
+                }
+                .store(in: &sourceDemandCancellables)
         }
     }
 
@@ -931,6 +1317,7 @@ final class StatusPanelViewModel: ObservableObject {
         if visiblePopupSections != sections { visiblePopupSections = sections }
         reconcileSourceSubscriptions(deliveredSections: sections)
         updatePowerSamplingDemand()
+        updateHardwareMetricsDemand()
         if !isRouteAvailable(route) { closeCurrentPage() }
         coalesceControllerUpdate(.all)
     }
@@ -1035,14 +1422,26 @@ final class StatusPanelViewModel: ObservableObject {
         }
     }
 
-    private func transition(to next: StatusPanelRoute) {
-        guard route != next else { return }
-        if route != .summary { closeCurrentPage() }
+    @discardableResult
+    private func transition(to next: StatusPanelRoute) -> Bool {
+        guard route != next else { return false }
+        // Release the previous page without publishing a summary route in
+        // between: one committed change keeps an attached detail window from
+        // closing and reopening when the user switches pages beside it.
+        if route != .summary { endCurrentPageActions() }
         route = next
+        updateHardwareMetricsDemand()
+        return true
     }
 
     private func closeCurrentPage() {
         guard route != .summary else { return }
+        endCurrentPageActions()
+        route = .summary
+        updateHardwareMetricsDemand()
+    }
+
+    private func endCurrentPageActions() {
         switch route {
         case .battery:
             actions.batteryDetailsClosed()
@@ -1050,12 +1449,11 @@ final class StatusPanelViewModel: ObservableObject {
             actions.wifiDetailsClosed()
         case .ethernet:
             actions.wiredDetailsClosed()
-        case .inputSource:
+        case .inputSource, .hardwareDetail:
             break
         case .summary:
-            return
+            break
         }
-        route = .summary
     }
 
     private func isRouteAvailable(_ route: StatusPanelRoute) -> Bool {
@@ -1072,9 +1470,30 @@ final class StatusPanelViewModel: ObservableObject {
                 && store.popupSnapshot.connection == .ethernet
         case .inputSource:
             return sections.contains(.inputSource)
+        case .hardwareDetail:
+            return sections.contains(.hardwareMonitor)
         }
     }
 
+
+    /// Queues one settings check per run-loop turn. `objectWillChange` fires
+    /// before the value is stored, so the comparison has to happen after a
+    /// yield; by then a burst of writes has settled and the newest values are
+    /// read once.
+    private func schedulePanelSettingsCheck() {
+        guard isStarted, !panelSettingsCheckScheduled else { return }
+        panelSettingsCheckScheduled = true
+        Task { @MainActor [weak self] in
+            await Task.yield()
+            guard let self else { return }
+            self.panelSettingsCheckScheduled = false
+            guard self.isStarted else { return }
+            let next = PanelSettingsFingerprint(settings: self.settings)
+            guard next != self.lastPanelSettingsFingerprint else { return }
+            self.lastPanelSettingsFingerprint = next
+            self.coalesceControllerUpdate(.all)
+        }
+    }
 
     private func coalesceControllerUpdate(_ regions: RefreshRegions) {
         guard isStarted else { return }
@@ -1115,7 +1534,7 @@ final class StatusPanelViewModel: ObservableObject {
                 )
             }
             if regions.contains(.vpn), isVisible(.vpn) {
-                publishVPN(PanelPresentationMapper.vpn(store.vpnStatus, localization: localization))
+                publishVPN(mapVPN(store.vpnStatus))
             }
         }
     }
@@ -1129,15 +1548,34 @@ final class StatusPanelViewModel: ObservableObject {
     /// availability, control source, external transition) publishes at once; a
     /// pure level change is coalesced so a drag cannot invalidate the panel on
     /// every tick (#263).
+    ///
+    /// An active user gesture — a wheel event here, or a slider drag/click
+    /// flagged on the store — bypasses the coalescer entirely so the row
+    /// follows at the slider's 30 Hz report rate instead of the 10 Hz coalesced
+    /// rate. Background monitor reads never set either flag, so they still
+    /// coalesce.
     private func receiveLiveVolume(_ status: VolumeStatus) {
         let previous = lastLiveVolumeStatus
         lastLiveVolumeStatus = status
-        if let previous, status.changesOnlyLevel(comparedTo: previous) {
+        if let previous,
+           status.changesOnlyLevel(comparedTo: previous),
+           !isWheelAdjustingVolume,
+           !store.isVolumeGestureActive {
             pendingLevelVolumeStatus = status
             scheduleLevelVolumePublish()
         } else {
             publishVolume(mapVolume(status))
         }
+    }
+
+    /// Marks a wheel-driven volume change so the level publish skips the drag
+    /// coalescer for the duration of one event.
+    func beginWheelVolumeAdjustment() {
+        isWheelAdjustingVolume = true
+    }
+
+    func endWheelVolumeAdjustment() {
+        isWheelAdjustingVolume = false
     }
 
     private func scheduleLevelVolumePublish() {
@@ -1192,7 +1630,12 @@ final class StatusPanelViewModel: ObservableObject {
         state: InputSourceState,
         failure: InputSourceController.SelectionFailure?
     ) {
-        let next = InputSourcePanelMapper.map(state: state, failure: failure, localization: localization)
+        let next = InputSourcePanelMapper.map(
+            state: state,
+            failure: failure,
+            localization: localization,
+            markerStyle: settings.inputSourceMarkerStyle
+        )
         guard inputSource != next else { return }
         inputSource = next
     }

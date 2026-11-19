@@ -60,7 +60,7 @@ final class ChargeToFullNowDiagnosticsTests: XCTestCase {
         backend.deviceState = .disabled
         XCTAssertEqual(
             controller.hiddenReasons(battery: battery(), batterySectionVisible: true),
-            [.noActiveChargeLimit]
+            []
         )
         backend.deviceState = state(raw: 1, limit: 82)
         XCTAssertEqual(
@@ -127,7 +127,7 @@ final class ChargeToFullNowDiagnosticsTests: XCTestCase {
         for _ in 0..<20 { await Task.yield() }
     }
 
-    func testRestoredWaitingUsesCurrentBatteryAndBackendState() async {
+    func testRestoreReturnsStraightToTheActionWithoutHiddenReason() async {
         let backend = DiagnosticsStubChargeController(deviceState: .temporaryOverride)
         backend.restoreState = state(raw: 1, limit: 90)
         let store = VolatileChargeToFullNowSessionStore(
@@ -148,29 +148,62 @@ final class ChargeToFullNowDiagnosticsTests: XCTestCase {
         )
         controller.performPrimaryAction()
         for _ in 0..<100 {
-            if controller.presentation == .limitRestored(limit: 90) { break }
+            if controller.presentation == .available { break }
             await Task.yield()
         }
-        XCTAssertEqual(controller.presentation, .limitRestored(limit: 90))
+        // The restore-limit feature is off: after a verified restore the action
+        // follows the live state again, so Settings has nothing to explain.
+        XCTAssertEqual(controller.presentation, .available)
         XCTAssertEqual(
             controller.hiddenReasons(battery: battery(), batterySectionVisible: true),
-            [.restoredLimit(90)]
-        )
-
-        // At the restored limit there is nothing left to wait for, so the
-        // explanatory reason disappears even though the presentation is
-        // still showing the restored state until the next update.
-        XCTAssertEqual(
-            controller.hiddenReasons(
-                battery: battery(percentage: 90),
-                batterySectionVisible: true
-            ),
             []
         )
+
         backend.deviceState = .unavailable
         XCTAssertEqual(
             controller.hiddenReasons(battery: battery(), batterySectionVisible: true),
             [.stateReadFailed]
+        )
+    }
+
+    func testPausedChargeWithoutNativeLimitHasNoHiddenReason() {
+        // #292: a paused charge with no sub-100% native limit now offers the
+        // action, so Settings must not claim a missing limit.
+        let backend = DiagnosticsStubChargeController(deviceState: .overridablePause)
+        let controller = ChargeToFullNowController(backend: backend)
+
+        XCTAssertEqual(
+            controller.hiddenReasons(
+                battery: battery(isCharging: false),
+                batterySectionVisible: true
+            ),
+            []
+        )
+    }
+
+    func testNonOverridablePauseReportsAnOverridableReason() {
+        let backend = DiagnosticsStubChargeController(deviceState: .disabled)
+        let controller = ChargeToFullNowController(backend: backend)
+
+        XCTAssertEqual(
+            controller.hiddenReasons(
+                battery: battery(isCharging: false),
+                batterySectionVisible: true
+            ),
+            [.unrecognizedChargeLimitState]
+        )
+    }
+
+    func testChargingNormallyWithoutNativeLimitHasNoHiddenReason() {
+        let backend = DiagnosticsStubChargeController(deviceState: .disabled)
+        let controller = ChargeToFullNowController(backend: backend)
+
+        XCTAssertEqual(
+            controller.hiddenReasons(
+                battery: battery(isCharging: true),
+                batterySectionVisible: true
+            ),
+            []
         )
     }
 
@@ -185,12 +218,13 @@ final class ChargeToFullNowDiagnosticsTests: XCTestCase {
     private func battery(
         present: Bool = true,
         connected: Bool = true,
-        percentage: Int = 60
+        percentage: Int = 60,
+        isCharging: Bool = true
     ) -> BatteryStatus {
         BatteryStatus(
             rawPercentage: percentage,
             isPresent: present,
-            isCharging: true,
+            isCharging: isCharging,
             isCharged: false,
             isLowPowerMode: false,
             isConnectedToPower: connected
@@ -264,6 +298,14 @@ private extension ChargeToFullNowDeviceState {
         mclEnabledRawValue: 0,
         mclLimit: 80,
         chargingOverrideAllowed: false
+    )
+
+    /// Optimized Battery Charging paused with no sub-100% limit; the system
+    /// reports the pause as overridable.
+    static let overridablePause = ChargeToFullNowDeviceState(
+        mclEnabledRawValue: 0,
+        mclLimit: 100,
+        chargingOverrideAllowed: true
     )
 
     static let temporaryOverride = ChargeToFullNowDeviceState(

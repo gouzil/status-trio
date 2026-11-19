@@ -2,6 +2,7 @@ import AppKit
 import SwiftUI
 
 struct NetworkStatusView: View {
+    @Environment(\.statusPanelBoldTextEnabled) private var panelBoldText
     @EnvironmentObject private var localization: Localization
     var showsWiFiPowerControl = false
     var wifiPowerIsOn = false
@@ -36,11 +37,11 @@ struct NetworkStatusView: View {
     }
 
     var body: some View {
-        HStack(alignment: .center, spacing: PanelSummaryActionMetrics.iconGap) {
+        HStack(alignment: .center, spacing: PanelSummaryActionMetrics.actionSpacing) {
             Button(action: { activateRow() }) {
                 HStack(alignment: .center, spacing: 10) {
                     PanelSymbolView(source: state.symbol)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(state.tint.color(caution: .orange))
                         .frame(
                             width: PanelSummaryActionMetrics.hitTarget,
                             height: PanelSummaryActionMetrics.hitTarget
@@ -49,7 +50,7 @@ struct NetworkStatusView: View {
 
                     VStack(alignment: .leading, spacing: 2) {
                         Text(state.title)
-                            .font(.headline)
+                            .font(.headline.weight(panelBoldText ? .semibold : .regular))
                             .lineLimit(1)
                             .truncationMode(.tail)
                         subtitle
@@ -73,7 +74,8 @@ struct NetworkStatusView: View {
                 Button(action: { activateRow() }) {
                     PanelActionGlyph(
                         systemName: "chevron.right",
-                        font: .caption.weight(.semibold)
+                        font: .caption.weight(.semibold),
+                        size: PanelSummaryActionMetrics.actionSlot
                     )
                 }
                 .buttonStyle(.plain)
@@ -83,7 +85,7 @@ struct NetworkStatusView: View {
 
             if state.showsSettings {
                 Button(action: isWired ? onOpenNetworkSettings : onOpenWiFiSettings) {
-                    PanelActionGlyph(systemName: "gearshape")
+                    PanelActionGlyph(systemName: "gearshape", size: PanelSummaryActionMetrics.actionSlot)
                 }
                 .labelStyle(.iconOnly)
                 .buttonStyle(.plain)
@@ -119,7 +121,7 @@ struct NetworkStatusView: View {
                 confirmingPowerOff = true
             }
         } label: {
-            PanelActionGlyph(systemName: "power")
+            PanelActionGlyph(systemName: "power", size: PanelSummaryActionMetrics.actionSlot)
         }
         .buttonStyle(.plain)
         .foregroundStyle(wifiPowerIsOn ? Color.accentColor : Color.secondary)

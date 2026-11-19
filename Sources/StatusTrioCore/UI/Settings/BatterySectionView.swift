@@ -73,8 +73,7 @@ struct BatterySectionView: View {
         )
     }
 
-    /// A Mac without a battery reports 100 as its level; spell that out at the
-    /// top of the page so nobody reads the placeholder as a real reading.
+    /// Explain why a Mac without a battery does not display a battery percentage.
     private var noBatteryNoticeGroup: some View {
         SettingsGroup {
             SettingsHintRow(text: localization.string(.settingsBatteryNoBatteryNotice))
@@ -115,13 +114,21 @@ struct BatterySectionView: View {
                 .padding(.horizontal, SettingsMetrics.rowPaddingH)
                 .padding(.bottom, 8)
         }
-        if chargeToFullNow?.isSettingAvailable == true {
-            chargeToFullNowContent
-        }
-        systemChargeLimitUnavailableNote
+        SettingsHintRow(
+            text: localization.string(.settingsBatteryChargeToFullNowOptimizedNote)
+        )
+        // Restore-limit feature turned off for now: the "Restore Limit After
+        // Cancelling" row and its "cannot read the charge limit" note are
+        // commented out because the system does not report a usable limit.
+        // if chargeToFullNow?.isSettingAvailable == true {
+        //     chargeToFullNowContent
+        // }
+        // systemChargeLimitUnavailableNote
     }
 
 
+    // Commented out with the restore-limit feature (see chargeManagementContent).
+    #if false
     @ViewBuilder
     private var chargeToFullNowContent: some View {
         if let chargeToFullNow, chargeToFullNow.isSettingAvailable {
@@ -196,6 +203,7 @@ struct BatterySectionView: View {
             .padding(.bottom, 6)
         }
     }
+    #endif
 
     /// Sailing Mode: the interval charge-limit controller and its two bounds.
     private var sailingModeGroup: some View {
@@ -520,7 +528,7 @@ struct BatterySectionView: View {
                 // Reported on the description's own line: one short state, not
                 // a block of rows under the switch.
                 subtitleStatus: helper.isEnabled ? lowPowerModeHelperStatus : nil,
-                isOn: helper.isEnabledBinding
+                isOn: $store.controlsLowPowerMode
             )
             .disabled(!helper.isAvailable)
 

@@ -5,7 +5,7 @@ extension ChargeToFullNowPresentation {
     /// button but still explains why the action cannot run; a restored limit
     /// stays visible while the battery charges up to it.
     var showsActionArea: Bool {
-        showsButton || self == .unavailable || isRestoredLimit
+        showsButton || self == .unavailable
     }
 }
 
@@ -13,7 +13,10 @@ extension ChargeToFullNowPresentation {
 /// details page. Keeping one view guarantees both surfaces use the same label,
 /// progress, cancel confirmation, and error notices.
 struct ChargeToFullNowActionView: View {
+    @Environment(\.statusPanelMediumTextEnabled) private var panelMediumText
     @EnvironmentObject private var localization: Localization
+    @Environment(\.panelCardSurfaceStyle) private var cardStyle
+    @Environment(\.colorScheme) private var scheme
     let presentation: ChargeToFullNowPresentation
     let onAction: () -> Void
 
@@ -41,12 +44,12 @@ struct ChargeToFullNowActionView: View {
                             Spacer(minLength: 8)
 
                             Text(actionLabel)
-                                .font(.caption.weight(.medium))
+                                .font(.caption.weight(panelMediumText ? .medium : .regular))
                                 .lineLimit(1)
                                 .minimumScaleFactor(0.7)
                         } else {
                             Text(actionLabel)
-                                .font(.caption.weight(.medium))
+                                .font(.caption.weight(panelMediumText ? .medium : .regular))
                                 .lineLimit(1)
                                 .minimumScaleFactor(0.7)
 
@@ -56,28 +59,23 @@ struct ChargeToFullNowActionView: View {
                     .foregroundStyle(.primary)
                     .padding(.horizontal, 10)
                     .frame(maxWidth: .infinity, minHeight: 28)
-                    .background(
-                        RoundedRectangle(cornerRadius: 7, style: .continuous)
-                            .fill(Color.secondary.opacity(0.08))
-                    )
-                    .overlay {
-                        RoundedRectangle(cornerRadius: 7, style: .continuous)
-                            .strokeBorder(Color.secondary.opacity(0.12))
-                    }
+                    .modifier(ChargeActionSurface(cardStyle: cardStyle, scheme: scheme))
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
-                .disabled(presentation.isApplying || presentation.isCancelling)
+                .disabled(presentation.isApplying || presentation.isCancelling || presentation == .chargingToFull)
                 .accessibilityLabel(actionLabel)
-            }
-
-            if case .limitRestored(let limit) = presentation {
-                restoredLimitRow(limit: limit)
             }
 
             switch presentation {
             case .failed:
                 notice(.batteryActionChargeToFullNowFailed)
+            case .unavailable:
+                notice(
+                    localization.string(.batteryActionChargeToFullNowUnavailable),
+                    color: .secondary,
+                    showsIcon: false
+                )
             case .cancelConfirmationRequired:
                 notice(
                     localization.string(
@@ -112,18 +110,16 @@ struct ChargeToFullNowActionView: View {
                  .available,
                  .applying,
                  .chargingToFull,
-                 .cancelling,
-                 .unavailable,
-                 .limitRestored:
+                 .cancelling:
                 EmptyView()
             }
         }
     }
 
     private var chargingLabel: String? {
-        presentation == .chargingToFull
-            ? localization.string(.batteryActionChargeToFullNowCharging)
-            : nil
+        // Charging-to-full is now a disabled status row; the label comes from
+        // actionLabel, so no separate prefix is needed.
+        nil
     }
 
     private var actionLabel: String {
@@ -131,7 +127,8 @@ struct ChargeToFullNowActionView: View {
         case .applying:
             localization.string(.batteryActionChargeToFullNowApplying)
         case .chargingToFull:
-            localization.string(.batteryActionCancelChargeToFullNow)
+            // Cancel removed: show a non-interactive charging status instead.
+            localization.string(.batteryActionChargeToFullNowCharging)
         case .cancelling:
             localization.string(.batteryActionCancelChargeToFullNowApplying)
         case .cancelFailed, .cancelPending:
@@ -146,7 +143,7 @@ struct ChargeToFullNowActionView: View {
                 .batteryActionCancelChargeToFullNowConfirmFallback,
                 target
             )
-        case .hidden, .available, .failed, .unavailable, .limitRestored:
+        case .hidden, .available, .failed, .unavailable:
             localization.string(.batteryActionChargeToFullNow)
         }
     }
@@ -163,36 +160,9 @@ struct ChargeToFullNowActionView: View {
              .cancelPending,
              .cancelling,
              .cancelFailed,
-             .cancelLimitChangedConfirmation,
-             .limitRestored:
+             .cancelLimitChangedConfirmation:
             false
         }
-    }
-
-    /// A static confirmation replaces the button until the battery finishes
-    /// charging to the restored limit, so cancelling cannot bounce the user
-    /// straight back into another Charge to Full Now request.
-    private func restoredLimitRow(limit: Int) -> some View {
-        HStack(spacing: 7) {
-            Image(systemName: "checkmark.circle.fill")
-                .frame(width: 14, height: 14)
-                .foregroundStyle(.green)
-
-            Text(restoredLimitText(limit))
-            .font(.caption)
-            .foregroundStyle(.secondary)
-            .lineLimit(1)
-            .minimumScaleFactor(0.7)
-
-            Spacer(minLength: 0)
-        }
-        .padding(.horizontal, 10)
-        .frame(maxWidth: .infinity, minHeight: 28, alignment: .leading)
-        .accessibilityElement(children: .combine)
-    }
-
-    private func restoredLimitText(_ limit: Int) -> String {
-        localization.format(.batteryActionCancelChargeToFullNowRestored, limit)
     }
 
     private func notice(_ key: LocalizationKey) -> some View {
@@ -217,5 +187,40 @@ struct ChargeToFullNowActionView: View {
         .font(.caption2)
         .foregroundStyle(color)
         .fixedSize(horizontal: false, vertical: true)
+    }
+}
+
+/// Panel-aware surface for the Charge to Full Now action: interactive native
+/// glass on Liquid Glass, a light wash over the frosted panel, and an opaque
+/// adaptive base on solid — with a 10pt corner aligned to the cards.
+private struct ChargeActionSurface: ViewModifier {
+    let cardStyle: PanelCardSurfaceStyle
+    let scheme: ColorScheme
+
+    private var shape: RoundedRectangle {
+        RoundedRectangle(cornerRadius: 10, style: .continuous)
+    }
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        switch cardStyle {
+        case .glass:
+            if #available(macOS 26.0, *), PanelCardSurfaceExperiment.useNative {
+                content.glassEffect(.regular.interactive(), in: shape)
+            } else {
+                content
+                    .background(shape.fill(Color.secondary.opacity(0.08)))
+                    .overlay { shape.strokeBorder(Color.secondary.opacity(0.12)) }
+            }
+        case .material:
+            content
+                .background(shape.fill(Color.secondary.opacity(0.10)))
+                .overlay { shape.strokeBorder(Color.secondary.opacity(0.14)) }
+        case .solid:
+            content
+                .background(shape.fill(Color.secondary.opacity(0.06)))
+                .background(shape.fill(PanelCardSurfaceStyle.solidBase(scheme: scheme)))
+                .overlay { shape.strokeBorder(Color.secondary.opacity(0.18)) }
+        }
     }
 }

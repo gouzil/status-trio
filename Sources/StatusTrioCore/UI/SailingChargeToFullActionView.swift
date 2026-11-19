@@ -31,7 +31,7 @@ enum SailingChargeToFullActionPolicy {
              .cancelFailed,
              .cancelLimitChangedConfirmation:
             return true
-        case .hidden, .available, .failed, .unavailable, .limitRestored:
+        case .hidden, .available, .failed, .unavailable:
             break
         }
 

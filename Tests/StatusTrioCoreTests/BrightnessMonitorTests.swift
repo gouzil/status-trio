@@ -122,6 +122,57 @@ final class BrightnessMonitorTests: XCTestCase {
         )
     }
 
+    func testBuiltInUsesDisplayServicesByDefault() {
+        let builtin = DisplayDescriptor(id: "cg-uuid", name: "Built-in", isBuiltin: true, displayID: 5)
+        var madeDisplayServices = 0
+        var madeBetterDisplay: [String] = []
+        let monitor = BrightnessMonitor(
+            catalog: FakeCatalog([builtin]),
+            makeDisplayServices: { id, onUpdate in
+                madeDisplayServices += 1
+                return DisplayServicesBrightnessController(displayID: id) { onUpdate($0) }
+            },
+            makeBetterDisplay: { uuid, update in
+                madeBetterDisplay.append(uuid)
+                return BetterDisplayBrightnessCoordinator(
+                    client: QuietBetterDisplayClient(), displayUUID: uuid, onUpdate: update
+                )
+            },
+            isBetterDisplayRunning: { true }
+        )
+        monitor.start()
+        monitor.setDetailsVisible(true)
+        XCTAssertEqual(madeDisplayServices, 1)
+        XCTAssertTrue(madeBetterDisplay.isEmpty)
+        monitor.stop()
+    }
+
+    func testBuiltInUsesBetterDisplayWhenCombinedOptionOn() {
+        let builtin = DisplayDescriptor(id: "cg-uuid", name: "Built-in", isBuiltin: true, displayID: 5)
+        var madeDisplayServices = 0
+        var madeBetterDisplay: [String] = []
+        let monitor = BrightnessMonitor(
+            catalog: FakeCatalog([builtin]),
+            makeDisplayServices: { id, onUpdate in
+                madeDisplayServices += 1
+                return DisplayServicesBrightnessController(displayID: id) { onUpdate($0) }
+            },
+            makeBetterDisplay: { uuid, update in
+                madeBetterDisplay.append(uuid)
+                return BetterDisplayBrightnessCoordinator(
+                    client: QuietBetterDisplayClient(), displayUUID: uuid, onUpdate: update
+                )
+            },
+            isBetterDisplayRunning: { true }
+        )
+        monitor.setUseBetterDisplayCombinedBrightness(true)
+        monitor.start()
+        monitor.setDetailsVisible(true)
+        XCTAssertEqual(madeBetterDisplay, ["cg-uuid"])
+        XCTAssertEqual(madeDisplayServices, 0)
+        monitor.stop()
+    }
+
     func testExternalDisplayResolvesTheCGUUIDNotTheEDIDUUID() {
         let external = DisplayDescriptor(
             id: "EDID-UUID",
@@ -453,11 +504,15 @@ final class BrightnessMonitorTests: XCTestCase {
         ])
         monitor.start()
         monitor.setDetailsVisible(true)
-        try? await Task.sleep(for: .milliseconds(120))
+        // Poll until at least two visible reads happen instead of a fixed sleep;
+        // a loaded CI runner can delay the refresh loop past a fixed window.
+        await waitForRequests(client, count: 2)
         let visibleReads = client.requestCount
         XCTAssertGreaterThan(visibleReads, 1, "external changes have no push notification; visible polling must refresh")
 
         monitor.setDetailsVisible(false)
+        // Let an in-flight poll settle before taking the hidden baseline.
+        try? await Task.sleep(for: .milliseconds(50))
         let hiddenReads = client.requestCount
         try? await Task.sleep(for: .milliseconds(120))
         XCTAssertEqual(client.requestCount, hiddenReads, "hiding the panel must stop external polling")
