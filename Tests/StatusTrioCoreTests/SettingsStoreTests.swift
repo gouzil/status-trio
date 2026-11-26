@@ -13,6 +13,20 @@ final class SettingsStoreTests: XCTestCase {
         XCTAssertEqual(store.iconSize, 24, accuracy: 0.001)
     }
 
+    func testBackgroundUITestingHardwareMonitorOverrideDoesNotPersist() {
+        let suite = makeSuite()
+        defer { clear(suite) }
+
+        let forced = SettingsStore(
+            defaults: suite.defaults,
+            backgroundUITestingForcesHardwareMonitor: true
+        )
+        XCTAssertTrue(forced.visiblePopupSections.contains(.hardwareMonitor))
+
+        let normal = SettingsStore(defaults: suite.defaults)
+        XCTAssertFalse(normal.enabledPopupSections.contains(.hardwareMonitor))
+    }
+
     func testConnectedPowerIndicatorDefaultsToPlugAndFeedsTheIconOptions() {
         let store = SettingsStore(defaults: makeSuite().defaults)
 
@@ -477,7 +491,7 @@ final class SettingsStoreTests: XCTestCase {
         let first = SettingsStore(defaults: suite.defaults)
         first.connectionCenterSource = .bluetoothDevice
         first.prioritizesNetworkErrors = false
-        first.usesBluetoothAudioVolumeColor = true
+        first.bluetoothVolumeColor = .custom(BluetoothVolumeColorSelection.legacyBlue)
         first.showsBluetoothBatteryLevels = true
         first.bluetoothSymbolScale = 1.45
 
@@ -488,10 +502,15 @@ final class SettingsStoreTests: XCTestCase {
         XCTAssertTrue(second.showsBluetoothBatteryLevels)
         XCTAssertEqual(second.bluetoothSymbolScale, 1.45, accuracy: 0.001)
         XCTAssertEqual(
+            second.bluetoothVolumeColor,
+            .custom(BluetoothVolumeColorSelection.legacyBlue)
+        )
+        XCTAssertEqual(
             second.bluetoothAudioIconOptions,
             BluetoothAudioIconOptions(
                 usesVolumeColor: true,
-                symbolScale: 1.45
+                symbolScale: 1.45,
+                volumeColorRole: .custom(BluetoothVolumeColorSelection.legacyBlue)
             )
         )
     }

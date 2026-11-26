@@ -8,7 +8,18 @@ import AppKit
 /// per primitive, and lets a real appearance (including high contrast) decide
 /// the variant instead of a hard-coded aqua/darkAqua guess.
 struct BatteryStatusColorPalette {
+    /// The plain discharging baseline: the label colour, matching the renderer's
+    /// `foreground` so a `.system` selection is pixel-identical to the old look.
+    let discharging: CGColor
+    /// True while the discharging role is still the system default. The renderer
+    /// then reuses its own exact `foreground`, keeping `.discharging` pixel-for-
+    /// pixel identical to the old `.primary` ring on every surface (the Dock's
+    /// near-black ink differs from `labelColor`, so a palette colour would drift).
+    let dischargingIsSystem: Bool
     let charging: CGColor
+    /// Connected to power without charging (#389). Its `.system` baseline is the
+    /// same green as `charging`, so an upgrade never changes the connected look.
+    let connected: CGColor
     let lowPower: CGColor
     let highPower: CGColor
     let critical: CGColor
@@ -17,15 +28,25 @@ struct BatteryStatusColorPalette {
 
     static func resolved(appearance: NSAppearance) -> Self {
         var result = Self(
+            discharging: CGColor(gray: 0, alpha: 1),
+            dischargingIsSystem: true,
             charging: CGColor(gray: 1, alpha: 1),
+            connected: CGColor(gray: 1, alpha: 1),
             lowPower: CGColor(gray: 1, alpha: 1),
             highPower: CGColor(gray: 1, alpha: 1),
             critical: CGColor.redFallback,
             bluetoothIcon: CGColor(gray: 0, alpha: 1)
         )
         appearance.performAsCurrentDrawingAppearance {
+            // The discharging baseline must equal the renderer's `foreground`
+            // (black in light, white in dark), so derive it from the label colour
+            // exactly the way `renderEnvironment` derives its ink.
+            let isDark = (NSColor.labelColor.usingColorSpace(.deviceRGB)?.brightnessComponent ?? 0) > 0.5
             result = Self(
+                discharging: CGColor(gray: isDark ? 1 : 0, alpha: 1),
+                dischargingIsSystem: true,
                 charging: rgb(.systemGreen),
+                connected: rgb(.systemGreen),
                 lowPower: rgb(.systemYellow),
                 highPower: rgb(.systemBlue),
                 critical: rgb(.systemRed),
@@ -46,7 +67,10 @@ struct BatteryStatusColorPalette {
         let brightness = NSColor(cgColor: foreground)?.usingColorSpace(.deviceRGB)?.brightnessComponent ?? 0
         let resolved = resolved(dark: brightness >= 0.5)
         return Self(
+            discharging: foreground,
+            dischargingIsSystem: true,
             charging: resolved.charging,
+            connected: resolved.connected,
             lowPower: resolved.lowPower,
             highPower: resolved.highPower,
             critical: critical,
@@ -60,7 +84,9 @@ struct BatteryStatusColorPalette {
 
     func color(for role: BatteryStatusColorRole) -> CGColor {
         switch role {
+        case .discharging: discharging
         case .charging: charging
+        case .connected: connected
         case .lowPower: lowPower
         case .highPower: highPower
         case .critical: critical
@@ -80,7 +106,10 @@ struct BatteryStatusColorPalette {
             ).color
         }
         return Self(
+            discharging: resolve(.discharging, discharging),
+            dischargingIsSystem: statusColors.discharging.isSystem,
             charging: resolve(.charging, charging),
+            connected: resolve(.connected, connected),
             lowPower: resolve(.lowPower, lowPower),
             highPower: resolve(.highPower, highPower),
             critical: resolve(.critical, critical),
@@ -97,7 +126,10 @@ struct BatteryStatusColorPalette {
         darkAppearance: Bool
     ) -> Self {
         Self(
+            discharging: discharging,
+            dischargingIsSystem: dischargingIsSystem,
             charging: charging,
+            connected: connected,
             lowPower: lowPower,
             highPower: highPower,
             critical: critical,

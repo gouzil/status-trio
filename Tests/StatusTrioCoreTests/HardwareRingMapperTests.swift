@@ -225,6 +225,26 @@ final class HardwareRingMapperTests: XCTestCase {
         XCTAssertEqual(text.text, "55°")
     }
 
+    func testDualRingTopAndRightTemperatureRenderWithTemperatureSample() {
+        let snap = snapshot([
+            .cpuUsage: sample(20, unit: .percent),
+            .cpuTemperature: sample(66, unit: .celsius)
+        ])
+        let config = HardwareRingConfiguration(
+            layout: .dual,
+            primaryMetric: .cpuUsage,
+            secondaryMetric: .cpuTemperature,
+            topContent: .value(.cpuTemperature))
+        let state = HardwareRingMapper.resolve(snapshot: snap, configuration: config, now: now)
+        guard case let .text(text)? = state.accessory else {
+            return XCTFail("expected temperature text accessory")
+        }
+        XCTAssertEqual(text.text, "66°")
+        XCTAssertEqual(state.segments.count, 2)
+        XCTAssertGreaterThan(state.segments[1].progress, 0,
+                             "the right CPU temperature arc must not be inactive")
+    }
+
     func testHiddenTopMarker() {
         let snap = snapshot([.cpuUsage: sample(45, unit: .percent)])
         let config = HardwareRingConfiguration(layout: .single, primaryMetric: .cpuUsage, topContent: .hidden)
@@ -259,4 +279,296 @@ final class HardwareRingMapperTests: XCTestCase {
         guard case let .text(text)? = valueState.accessory else { return XCTFail("expected text") }
         XCTAssertEqual(text.scale, HardwareRingMapper.topValueTextScale(for: .percent) * 1.5, accuracy: 0.0001)
     }
+
+    // MARK: - Top-marker-only metrics (volume / Wi-Fi signal)
+
+    private func auxiliarySample(_ value: Double?, availability: HardwareMetricAvailability = .measured) -> HardwareMetricSample {
+        HardwareMetricSample(value: value, unit: .percent, sampledAt: now, source: .mach, availability: availability)
+    }
+
+    func testTopValueShowsVolumeFromAuxiliarySample() {
+        let snap = snapshot([.cpuUsage: sample(45, unit: .percent)])
+        let config = HardwareRingConfiguration(
+            layout: .single, primaryMetric: .cpuUsage, topContent: .value(.volume),
+            color: HardwareRingColorConfiguration(monochrome: false, thresholdColors: true)
+        )
+        let state = HardwareRingMapper.resolve(
+            snapshot: snap, configuration: config,
+            auxiliarySamples: [.volume: auxiliarySample(37)], now: now
+        )
+        guard case let .text(text)? = state.accessory else { return XCTFail("expected text") }
+        XCTAssertEqual(text.text, "37")
+        XCTAssertEqual(text.color, .custom(HardwareRingColorConfiguration.recommendedBaseColor(for: .volume)))
+        XCTAssertEqual(state.gap, .value)
+    }
+
+    func testTopValueShowsWiFiSignalFromAuxiliarySample() {
+        let snap = snapshot([.cpuUsage: sample(45, unit: .percent)])
+        let config = HardwareRingConfiguration(
+            layout: .single, primaryMetric: .cpuUsage, topContent: .value(.wifiSignal),
+            color: HardwareRingColorConfiguration(monochrome: false, thresholdColors: true)
+        )
+        let state = HardwareRingMapper.resolve(
+            snapshot: snap, configuration: config,
+            auxiliarySamples: [.wifiSignal: auxiliarySample(80)], now: now
+        )
+        guard case let .text(text)? = state.accessory else { return XCTFail("expected text") }
+        XCTAssertEqual(text.text, "80")
+        XCTAssertEqual(text.color, .custom(HardwareRingColorConfiguration.recommendedBaseColor(for: .wifiSignal)))
+    }
+
+    func testBatteryLevelArcUsesBatteryStatusColorAndIgnoresMetricOverride() {
+        let snap = snapshot([.cpuUsage: sample(20, unit: .percent)])
+        let config = HardwareRingConfiguration(
+            layout: .single, primaryMetric: .batteryLevel, topContent: .hidden,
+            color: HardwareRingColorConfiguration(monochrome: false, thresholdColors: true)
+        )
+        let state = HardwareRingMapper.resolve(
+            snapshot: snap, configuration: config,
+            metricColors: [.batteryLevel: IconRGBA(red: 1, green: 0, blue: 0, alpha: 1)],
+            auxiliarySamples: [.batteryLevel: auxiliarySample(10)],
+            batteryArcColor: .critical, now: now
+        )
+        XCTAssertEqual(state.segments.count, 1)
+        XCTAssertEqual(state.segments[0].progress, 0.10, accuracy: 0.0001)
+        XCTAssertEqual(state.segments[0].color, .critical)
+    }
+
+    func testBatteryLevelArcStaysPrimaryWhenMonochrome() {
+        let snap = snapshot([.cpuUsage: sample(20, unit: .percent)])
+        let config = HardwareRingConfiguration(
+            layout: .single, primaryMetric: .batteryLevel, topContent: .hidden,
+            color: HardwareRingColorConfiguration(monochrome: true, thresholdColors: false)
+        )
+        let state = HardwareRingMapper.resolve(
+            snapshot: snap, configuration: config,
+            auxiliarySamples: [.batteryLevel: auxiliarySample(10)],
+            batteryArcColor: .critical, now: now
+        )
+        XCTAssertEqual(state.segments[0].color, .primary)
+    }
+
+    func testTopVolumeUsesCustomSharedColor() {
+        let snap = snapshot([.cpuUsage: sample(45, unit: .percent)])
+        let config = HardwareRingConfiguration(
+            layout: .single, primaryMetric: .cpuUsage, topContent: .value(.volume),
+            color: HardwareRingColorConfiguration(monochrome: false, thresholdColors: true)
+        )
+        let custom = IconRGBA(red: 0.1, green: 0.2, blue: 0.3, alpha: 1)
+        let state = HardwareRingMapper.resolve(
+            snapshot: snap, configuration: config,
+            metricColors: [.volume: custom],
+            auxiliarySamples: [.volume: auxiliarySample(50)], now: now
+        )
+        guard case let .text(text)? = state.accessory else { return XCTFail("expected text") }
+        XCTAssertEqual(text.color, .custom(custom))
+    }
+
+    func testTopVolumeMonochromeKeepsPrimaryColor() {
+        let snap = snapshot([.cpuUsage: sample(45, unit: .percent)])
+        let config = HardwareRingConfiguration(
+            layout: .single, primaryMetric: .cpuUsage, topContent: .value(.volume),
+            color: HardwareRingColorConfiguration(monochrome: true, thresholdColors: false)
+        )
+        let state = HardwareRingMapper.resolve(
+            snapshot: snap, configuration: config,
+            auxiliarySamples: [.volume: auxiliarySample(50)], now: now
+        )
+        guard case let .text(text)? = state.accessory else { return XCTFail("expected text") }
+        XCTAssertEqual(text.color, .primary)
+    }
+
+    func testTopVolumePlaceholderWhenUnavailable() {
+        let snap = snapshot([.cpuUsage: sample(45, unit: .percent)])
+        let config = HardwareRingConfiguration(layout: .single, primaryMetric: .cpuUsage,
+                                               topContent: .value(.volume))
+        let state = HardwareRingMapper.resolve(
+            snapshot: snap, configuration: config,
+            auxiliarySamples: [.volume: auxiliarySample(nil, availability: .temporarilyUnavailable)],
+            now: now
+        )
+        guard case let .text(text)? = state.accessory else { return XCTFail("expected text") }
+        XCTAssertEqual(text.text, "--")
+    }
+
+    // MARK: - Status-snapshot metrics as ring arcs
+
+    func testVolumeArcUsesAuxiliarySampleAndBaseColor() {
+        let config = HardwareRingConfiguration(layout: .single, primaryMetric: .volume,
+                                               color: HardwareRingColorConfiguration(monochrome: false, thresholdColors: true))
+        let state = HardwareRingMapper.resolve(
+            snapshot: snapshot([:]), configuration: config,
+            levels: [.volume: .critical],
+            auxiliarySamples: [.volume: auxiliarySample(60)], now: now
+        )
+        XCTAssertEqual(state.segments.count, 1)
+        XCTAssertEqual(state.segments[0].progress, 0.6, accuracy: 0.0001)
+        // Threshold levels never recolour a status-snapshot reading.
+        XCTAssertEqual(state.segments[0].color,
+                       .custom(HardwareRingColorConfiguration.recommendedBaseColor(for: .volume)))
+    }
+
+    func testWiFiSignalArcUsesAuxiliarySample() {
+        let config = HardwareRingConfiguration(
+            layout: .dual, primaryMetric: .cpuUsage, secondaryMetric: .wifiSignal,
+            color: HardwareRingColorConfiguration(monochrome: false, thresholdColors: true)
+        )
+        let snap = snapshot([.cpuUsage: sample(20, unit: .percent)])
+        let state = HardwareRingMapper.resolve(
+            snapshot: snap, configuration: config,
+            auxiliarySamples: [.wifiSignal: auxiliarySample(80)], now: now
+        )
+        let right = state.segments.first { $0.position == .right }
+        XCTAssertEqual(right?.progress ?? -1, 0.8, accuracy: 0.0001)
+        XCTAssertEqual(right?.color, .custom(HardwareRingColorConfiguration.recommendedBaseColor(for: .wifiSignal)))
+    }
+
+    func testVolumeArcUnavailableKeepsTrackOnly() {
+        let config = HardwareRingConfiguration(layout: .single, primaryMetric: .volume)
+        let state = HardwareRingMapper.resolve(
+            snapshot: snapshot([:]), configuration: config,
+            auxiliarySamples: [.volume: auxiliarySample(nil, availability: .temporarilyUnavailable)], now: now
+        )
+        XCTAssertEqual(state.segments[0].progress, 0)
+        XCTAssertEqual(state.segments[0].color, .inactive)
+    }
+
+    // MARK: - Battery top markers
+
+    private func battery(
+        percent: Int = 62,
+        charging: Bool = false,
+        charged: Bool = false,
+        connected: Bool = false,
+        present: Bool = true
+    ) -> BatteryStatus {
+        BatteryStatus(
+            rawPercentage: percent,
+            isPresent: present,
+            isCharging: charging,
+            isCharged: charged,
+            isLowPowerMode: false,
+            isConnectedToPower: connected
+        )
+    }
+
+    private func singleRing(topContent: HardwareRingTopContent) -> HardwareRingConfiguration {
+        HardwareRingConfiguration(layout: .single, primaryMetric: .cpuUsage, topContent: topContent)
+    }
+
+    func testBatteryPercentageTopMarkerShowsLevelNumber() {
+        let state = HardwareRingMapper.resolve(
+            snapshot: snapshot([.cpuUsage: sample(45, unit: .percent)]),
+            configuration: singleRing(topContent: .batteryPercentage),
+            battery: battery(percent: 62), now: now
+        )
+        guard case let .text(text)? = state.accessory else {
+            return XCTFail("expected text accessory")
+        }
+        XCTAssertEqual(text.text, "62")
+        XCTAssertEqual(text.scale, HardwareRingMapper.topValueTextScale(for: .percent))
+        XCTAssertEqual(state.gap, .value)
+    }
+
+    func testBatteryPercentageTopMarkerHidesOnBatteryLessMac() {
+        let state = HardwareRingMapper.resolve(
+            snapshot: snapshot([:]), configuration: singleRing(topContent: .batteryPercentage),
+            battery: battery(percent: 100, present: false), now: now
+        )
+        XCTAssertNil(state.accessory)
+        XCTAssertEqual(state.gap, .closed)
+    }
+
+    func testChargingIndicatorShowsBoltWhileCharging() {
+        let state = HardwareRingMapper.resolve(
+            snapshot: snapshot([:]), configuration: singleRing(topContent: .chargingIndicator),
+            battery: battery(percent: 40, charging: true, connected: true), now: now
+        )
+        guard case let .symbol(symbol)? = state.accessory else {
+            return XCTFail("expected symbol accessory")
+        }
+        XCTAssertEqual(symbol.source, .primitive(.bolt))
+        XCTAssertEqual(state.gap, .indicator)
+    }
+
+    func testChargingIndicatorShowsPlugWhenFull() {
+        let state = HardwareRingMapper.resolve(
+            snapshot: snapshot([:]), configuration: singleRing(topContent: .chargingIndicator),
+            battery: battery(percent: 100, charged: true, connected: true), now: now
+        )
+        guard case let .symbol(symbol)? = state.accessory else {
+            return XCTFail("expected symbol accessory")
+        }
+        XCTAssertEqual(symbol.source, .primitive(.plug))
+    }
+
+    func testChargingIndicatorShowsLevelNumberOnBattery() {
+        let state = HardwareRingMapper.resolve(
+            snapshot: snapshot([:]), configuration: singleRing(topContent: .chargingIndicator),
+            battery: battery(percent: 37), now: now
+        )
+        guard case let .text(text)? = state.accessory else {
+            return XCTFail("expected text accessory")
+        }
+        XCTAssertEqual(text.text, "37")
+    }
+
+    func testChargingIndicatorFollowsConfiguredChargingMarker() {
+        let charging = battery(percent: 40, charging: true, connected: true)
+        let plugState = HardwareRingMapper.resolve(
+            snapshot: snapshot([:]), configuration: singleRing(topContent: .chargingIndicator),
+            battery: charging, batteryOptions: BatteryIconOptions(chargingMarker: .plug), now: now
+        )
+        guard case let .symbol(plugSymbol)? = plugState.accessory else {
+            return XCTFail("expected plug accessory")
+        }
+        XCTAssertEqual(plugSymbol.source, .primitive(.plug))
+
+        let hiddenState = HardwareRingMapper.resolve(
+            snapshot: snapshot([:]), configuration: singleRing(topContent: .chargingIndicator),
+            battery: charging, batteryOptions: BatteryIconOptions(chargingMarker: .hidden), now: now
+        )
+        XCTAssertNil(hiddenState.accessory)
+        XCTAssertEqual(hiddenState.gap, .closed)
+    }
+
+    func testChargingIndicatorFollowsConfiguredNoBatteryMarker() {
+        let hidden = HardwareRingMapper.resolve(
+            snapshot: snapshot([:]), configuration: singleRing(topContent: .chargingIndicator),
+            battery: battery(percent: 100, present: false),
+            batteryOptions: BatteryIconOptions(noBatteryMarker: .hidden), now: now
+        )
+        XCTAssertNil(hidden.accessory)
+
+        let bolt = HardwareRingMapper.resolve(
+            snapshot: snapshot([:]), configuration: singleRing(topContent: .chargingIndicator),
+            battery: battery(percent: 100, present: false),
+            batteryOptions: BatteryIconOptions(noBatteryMarker: .bolt), now: now
+        )
+        guard case let .symbol(symbol)? = bolt.accessory else {
+            return XCTFail("expected bolt accessory")
+        }
+        XCTAssertEqual(symbol.source, .primitive(.bolt))
+    }
+
+    func testChargingIndicatorDualLayoutUsesPrimitiveBolt() {
+        let config = HardwareRingConfiguration(
+            layout: .dual, primaryMetric: .cpuUsage, secondaryMetric: .gpuUsage,
+            topContent: .chargingIndicator
+        )
+        let state = HardwareRingMapper.resolve(
+            snapshot: snapshot([
+                .cpuUsage: sample(20, unit: .percent),
+                .gpuUsage: sample(30, unit: .percent),
+            ]),
+            configuration: config,
+            battery: battery(percent: 40, charging: true, connected: true), now: now
+        )
+        XCTAssertEqual(state.layout, .leftRight)
+        guard case let .symbol(symbol)? = state.accessory else {
+            return XCTFail("expected symbol accessory")
+        }
+        XCTAssertEqual(symbol.source, .primitive(.bolt))
+    }
 }
+

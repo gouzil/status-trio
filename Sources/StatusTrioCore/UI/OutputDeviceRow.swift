@@ -13,6 +13,7 @@ struct OutputDeviceRow: View {
     @Environment(\.statusPanelAnimatesDisclosures) private var animatesDisclosures
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.displayScale) private var displayScale
+    @Environment(\.statusPanelBoldTextEnabled) private var panelBoldText
     @StateObject private var disclosure = StatusPanelResizeCoordinator()
     @State private var isPresented = true
     @State private var controlsHeight: CGFloat = 0
@@ -320,7 +321,7 @@ struct OutputDeviceRow: View {
                 .frame(width: 24, height: 24)
 
                 Text(state.name)
-                    .font(.body.weight(state.selected ? .semibold : .regular))
+                    .font(.body.weight(state.selected && panelBoldText ? .semibold : .regular))
                     .lineLimit(2)
                     .fixedSize(horizontal: false, vertical: true)
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -331,7 +332,10 @@ struct OutputDeviceRow: View {
                         .foregroundStyle(.secondary)
                 }
             }
-            .padding(.vertical, 3)
+            // Same vertical insets as the Bluetooth device row (top 0 /
+            // bottom 5), so the first row sits 8pt under the controls and rows
+            // keep the Bluetooth list's rhythm.
+            .padding(.bottom, 5)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)

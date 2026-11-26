@@ -6,18 +6,40 @@ final class HardwareDetailTests: XCTestCase {
 
     // MARK: - Memory
 
-    func testMemoryDetailKeepsGaugeSemanticsAndSeparatesCache() {
+    func testMemoryDetailUsesInternalPagesForAppMemory() {
         let stats = MemoryReader.MemoryStatistics(
             activeBytes: 500, purgeableBytes: 100, wiredBytes: 200, compressedBytes: 50,
             internalBytes: 600, externalBytes: 300, freeBytes: 400, totalBytes: 1_600)
         let detail = MemoryReader.detail(from: stats, swapUsedBytes: 10, swapTotalBytes: 20,
                                          pressure: .warning, at: start)
-        XCTAssertEqual(detail.appBytes, 400)
-        XCTAssertEqual(detail.usedBytes, 650) // app + wired + compressed
-        XCTAssertEqual(detail.percent, 650.0 / 1_600 * 100, accuracy: 0.0001)
+        XCTAssertEqual(detail.appBytes, 500) // internal - purgeable
+        XCTAssertNotEqual(detail.appBytes, stats.activeBytes - stats.purgeableBytes)
+        XCTAssertEqual(detail.usedBytes, 750) // app + wired + compressed
+        XCTAssertEqual(detail.percent, 750.0 / 1_600 * 100, accuracy: 0.0001)
         XCTAssertEqual(detail.cachedBytes, 400) // external + purgeable, NOT in usedBytes
-        XCTAssertNotEqual(detail.usedBytes, detail.usedBytes + detail.cachedBytes)
         XCTAssertEqual(detail.pressure, .warning)
+    }
+
+    func testMemoryGaugeMatchesDetailForSameSnapshot() {
+        let stats = MemoryReader.MemoryStatistics(
+            activeBytes: 500, purgeableBytes: 100, wiredBytes: 200, compressedBytes: 50,
+            internalBytes: 600, externalBytes: 300, freeBytes: 400, totalBytes: 1_600)
+        let reading = MemoryReader.reading(from: stats, at: start)
+        let detail = MemoryReader.detail(from: stats, swapUsedBytes: 0, swapTotalBytes: 0,
+                                         pressure: .normal, at: start)
+        XCTAssertEqual(reading?.usedBytes, detail.usedBytes)
+        XCTAssertEqual(reading?.percent ?? -1, detail.percent, accuracy: 0.0001)
+    }
+
+    func testMemoryUsedBytesClampsAndHandlesPurgeableAboveInternal() {
+        XCTAssertEqual(
+            MemoryReader.usedBytes(internalBytes: 100, purgeableBytes: 150,
+                                  wiredBytes: 10, compressedBytes: 10, totalBytes: 1_000),
+            20)
+        XCTAssertEqual(
+            MemoryReader.usedBytes(internalBytes: 900, purgeableBytes: 0,
+                                  wiredBytes: 200, compressedBytes: 100, totalBytes: 1_000),
+            1_000)
     }
 
     func testMemoryPressureMapping() {
@@ -94,6 +116,95 @@ final class HardwareDetailTests: XCTestCase {
         XCTAssertTrue((0...1).contains(capacity.usedFraction))
     }
 
+    func testDiskFreeBytesFallsBackWhenImportantUsageIsZero() {
+        // NTFS/exFAT read-only mounts report 0 for the important-usage key.
+        XCTAssertEqual(
+            DiskCapacityReader.resolvedFreeBytes(importantUsage: 0,
+                                                  plainAvailable: 1_427_726_479_360,
+                                                  totalBytes: 1_500_166_221_824),
+            1_427_726_479_360)
+        // Internal APFS trusts the positive important-usage value.
+        XCTAssertEqual(
+            DiskCapacityReader.resolvedFreeBytes(importantUsage: 413_607_933_190,
+                                                  plainAvailable: 387_092_254_720,
+                                                  totalBytes: 1_995_218_165_760),
+            413_607_933_190)
+        // Clamped to the total when the reported free space overshoots.
+        XCTAssertEqual(
+            DiskCapacityReader.resolvedFreeBytes(importantUsage: 2_000,
+                                                  plainAvailable: 1_000,
+                                                  totalBytes: 1_500),
+            1_500)
+        XCTAssertEqual(
+            DiskCapacityReader.resolvedFreeBytes(importantUsage: nil,
+                                                  plainAvailable: nil,
+                                                  totalBytes: 100),
+            0)
+    }
+
+    func testDiskCapacityReaderEnumeratesVolumes() throws {
+        let volumes = DiskCapacityReader.readVolumes()
+        guard !volumes.isEmpty else { throw XCTSkip("no mounted volumes on this host") }
+        // The startup volume is listed first.
+        XCTAssertEqual(volumes.first?.mountPath, "/")
+        for volume in volumes {
+            XCTAssertGreaterThan(volume.totalBytes, 0)
+            XCTAssertLessThanOrEqual(volume.freeBytes, volume.totalBytes)
+            XCTAssertEqual(volume.usedBytes, volume.totalBytes - volume.freeBytes)
+            XCTAssertTrue((0...1).contains(volume.usedFraction))
+            XCTAssertTrue((0...1).contains(volume.freeFraction))
+        }
+        // No duplicate mount points.
+        XCTAssertEqual(Set(volumes.map(\.mountPath)).count, volumes.count)
+    }
+
+    func testDiskVolumeReadingFractions() {
+        let volume = DiskVolumeReading(name: "Test", mountPath: "/Volumes/Test",
+                                       totalBytes: 1_000, freeBytes: 250,
+                                       fileSystem: "APFS", isExternal: true, isReadOnly: false)
+        XCTAssertEqual(volume.usedBytes, 750)
+        XCTAssertEqual(volume.usedFraction, 0.75, accuracy: 0.0001)
+        XCTAssertEqual(volume.freeFraction, 0.25, accuracy: 0.0001)
+        let overfull = DiskVolumeReading(name: "Over", mountPath: "/Volumes/Over",
+                                        totalBytes: 1_000, freeBytes: 2_000,
+                                        fileSystem: nil, isExternal: false, isReadOnly: true)
+        XCTAssertEqual(overfull.usedBytes, 0) // free above total clamps used to 0
+    }
+
+    func testAPFSContainerIDIdentifiesSharedCapacityPool() throws {
+        guard let container = DiskCapacityReader.apfsContainerID(for: "/") else {
+            throw XCTSkip("startup volume is not APFS on this host")
+        }
+        XCTAssertTrue(container.hasPrefix("disk"))
+        XCTAssertNil(DiskCapacityReader.apfsContainerID(for: "/dev/null"))
+    }
+
+    func testReadVolumesDedupesVolumesSharingAnAPFSContainer() throws {
+        let volumes = DiskCapacityReader.readVolumes()
+        guard !volumes.isEmpty else { throw XCTSkip("no mounted volumes on this host") }
+        // At most one row per APFS container, so the same physical disk's shared
+        // capacity pool is never listed twice.
+        let containers = volumes.compactMap { DiskCapacityReader.apfsContainerID(for: $0.mountPath) }
+        XCTAssertEqual(Set(containers).count, containers.count)
+    }
+
+    func testReadVolumesExcludesDiskImages() throws {
+        let volumes = DiskCapacityReader.readVolumes()
+        guard !volumes.isEmpty else { throw XCTSkip("no mounted volumes on this host") }
+        // A mounted disk image (DMG) must never be listed as a disk.
+        for volume in volumes {
+            XCTAssertFalse(DiskCapacityReader.isDiskImage(path: volume.mountPath),
+                           "\(volume.name) at \(volume.mountPath) is a disk image")
+        }
+        // If a known disk image is mounted on this host, it must be detected and
+        // excluded (not silently treated as internal or external).
+        let diskImagePath = "/Volumes/OneSwitchOfficial-440"
+        if FileManager.default.fileExists(atPath: diskImagePath) {
+            XCTAssertTrue(DiskCapacityReader.isDiskImage(path: diskImagePath))
+            XCTAssertFalse(volumes.contains { $0.mountPath == diskImagePath })
+        }
+    }
+
     // MARK: - History store
 
     private func usageSnapshot(_ value: Double, at date: Date) -> HardwareMetricsSnapshot {
@@ -115,10 +226,12 @@ final class HardwareDetailTests: XCTestCase {
         // Same timestamp must not append a duplicate.
         store.ingest(usageSnapshot(99, at: start))
         XCTAssertEqual(store.points.count, 1)
-        store.ingest(usageSnapshot(20, at: start.addingTimeInterval(30)))
-        store.ingest(usageSnapshot(30, at: start.addingTimeInterval(70)))
+        let older = start.addingTimeInterval(HardwareDetailHistoryStore.window + 20)
+        let newest = start.addingTimeInterval(HardwareDetailHistoryStore.window + 50)
+        store.ingest(usageSnapshot(20, at: older))
+        store.ingest(usageSnapshot(30, at: newest))
         XCTAssertEqual(store.points.count, 2)
-        XCTAssertEqual(store.points.first?.date, start.addingTimeInterval(30))
+        XCTAssertEqual(store.points.first?.date, older)
         store.stop()
         XCTAssertTrue(store.points.isEmpty)
     }
@@ -158,6 +271,35 @@ final class HardwareDetailTests: XCTestCase {
         XCTAssertEqual(store.points.first?.values.first ?? nil, 0)
     }
 
+    /// The panel-session history buffer holds every primary metric in one row.
+    /// Seeding a detail page must take only the metric that page draws; a CPU
+    /// row's value must never leak into the GPU/RAM series (that used to be
+    /// drawn on a 0–100% axis and clamped to a bogus 100%).
+    @MainActor
+    func testSeededHistoryOnlyUsesItsOwnMetric() {
+        let observable = HardwareMonitorObservable(snapshot: .empty)
+        for index in 0..<5 {
+            let date = start.addingTimeInterval(Double(index) * 2)
+            var snapshot = HardwareMetricsSnapshot.empty
+            snapshot.samples[.cpuUsage] = HardwareMetricSample(value: 100, unit: .percent,
+                                                               sampledAt: date, source: .mach, availability: .measured)
+            snapshot.samples[.gpuUsage] = HardwareMetricSample(value: 10, unit: .percent,
+                                                               sampledAt: date, source: .ioAccelerator, availability: .measured)
+            observable.update(snapshot, now: date)
+        }
+
+        let store = HardwareDetailHistoryStore(seriesCount: 1)
+        store.start(observable: observable,
+                    timestamp: { $0[.gpuUsage].sampledAt },
+                    values: { [$0[.gpuUsage].value] },
+                    seedRows: observable.historyRowsForDetail,
+                    seedMetricIDs: [.gpuUsage])
+        XCTAssertEqual(store.points.count, 5)
+        for point in store.points {
+            XCTAssertEqual(point.values.first ?? nil, 10, "GPU history must not inherit the CPU row's 100%")
+        }
+    }
+
     @MainActor
     func testHistorySurvivesStaleAndPayloadClear() {
         let observable = HardwareMonitorObservable(snapshot: .empty)
@@ -173,6 +315,32 @@ final class HardwareDetailTests: XCTestCase {
         XCTAssertEqual(observable.historyRowsForDetail.count, 1)
         observable.clearHistory()
         XCTAssertTrue(observable.historyRowsForDetail.isEmpty)
+    }
+
+    /// The panel renders `panelSnapshot`, so clearing only the live copy would
+    /// leave a previous page's detail payload to reappear as cached data.
+    @MainActor
+    func testClearDetailPayloadsAlsoClearsPanelSnapshot() {
+        let observable = HardwareMonitorObservable(snapshot: .empty)
+        var snapshot = HardwareMetricsSnapshot.empty
+        snapshot.cpuDetail = CPUDetailReading(
+            usage: 42,
+            breakdown: CPUTimeBreakdown(user: 20, system: 5, idle: 75, nice: 0),
+            perCoreUsage: [40, 44],
+            topology: nil,
+            groupUsage: nil,
+            frequency: nil,
+            sampledAt: start)
+        snapshot.samples[.cpuUsage] = HardwareMetricSample(value: 42, unit: .percent,
+                                                           sampledAt: start, source: .mach, availability: .measured)
+        observable.update(snapshot, now: start)
+        XCTAssertNotNil(observable.snapshot.cpuDetail)
+        XCTAssertNotNil(observable.panelSnapshot.cpuDetail)
+
+        observable.clearDetailPayloads(except: nil)
+
+        XCTAssertNil(observable.snapshot.cpuDetail)
+        XCTAssertNil(observable.panelSnapshot.cpuDetail)
     }
 
     // MARK: - Chart geometry
@@ -219,7 +387,7 @@ final class HardwareDetailTests: XCTestCase {
     func testChartSpansFullWidthWithoutSideGaps() {
         let now = Date()
         let width: CGFloat = 300
-        // History younger than the 60 s window used to leave a left gap.
+        // History younger than the chart window used to leave a left gap.
         let shortHistory = geometryPoints([-8, -4], now: now)
         let samples = HardwareDetailChartGeometry.samples(points: shortHistory, series: 0, now: now,
                                                           yMaximum: 100, size: CGSize(width: width, height: 50))
@@ -240,6 +408,125 @@ final class HardwareDetailTests: XCTestCase {
         XCTAssertEqual(single.count, 2)
         XCTAssertEqual(single.first?.point.x ?? -1, 0, accuracy: 0.01)
         XCTAssertEqual(single.last?.point.x ?? -1, width, accuracy: 0.01)
+    }
+
+    // MARK: - Shared network timeline
+
+    private func networkPoints(_ now: Date) -> [HardwareDetailHistoryPoint] {
+        [
+            HardwareDetailHistoryPoint(id: 0, date: now.addingTimeInterval(-2), values: [1, nil]),
+            HardwareDetailHistoryPoint(id: 1, date: now.addingTimeInterval(-1), values: [2, 3]),
+            HardwareDetailHistoryPoint(id: 2, date: now, values: [4, 5])
+        ]
+    }
+
+    func testChartSharedDomainAlignsBothDirectionsAtOneTimestamp() {
+        let now = Date(timeIntervalSince1970: 100)
+        let points = networkPoints(now)
+        let size = CGSize(width: 100, height: 80)
+        let domain = HardwareDetailChartGeometry.domain(points: points, now: now)
+        XCTAssertNotNil(domain)
+
+        let download = HardwareDetailChartGeometry.samples(points: points, series: 0, now: now,
+                                                           yMaximum: 10, size: size, domain: domain)
+        let upload = HardwareDetailChartGeometry.samples(points: points, series: 1, now: now,
+                                                         yMaximum: 10, size: size, domain: domain)
+        let middle = now.addingTimeInterval(-1)
+        XCTAssertEqual(download.first { $0.date == middle }?.point.x ?? -1, 50, accuracy: 0.01)
+        XCTAssertEqual(upload.first { $0.date == middle }?.point.x ?? -1, 50, accuracy: 0.01)
+    }
+
+    func testChartSharedDomainKeepsLoneSeriesAtItsRealTime() {
+        let now = Date(timeIntervalSince1970: 100)
+        let points = [
+            HardwareDetailHistoryPoint(id: 0, date: now.addingTimeInterval(-2), values: [1, nil]),
+            HardwareDetailHistoryPoint(id: 1, date: now.addingTimeInterval(-1), values: [2, 3]),
+            HardwareDetailHistoryPoint(id: 2, date: now, values: [4, nil])
+        ]
+        let size = CGSize(width: 100, height: 80)
+        let domain = HardwareDetailChartGeometry.domain(points: points, now: now)
+
+        let upload = HardwareDetailChartGeometry.samples(points: points, series: 1, now: now,
+                                                         yMaximum: 10, size: size, domain: domain)
+        XCTAssertEqual(upload.count, 1)
+        XCTAssertEqual(upload.first?.point.x ?? -1, 50, accuracy: 0.01,
+                       "a lone upload sample must not be stretched across the full width")
+    }
+
+    func testChartSharedDomainSingleTimestampStaysFullWidth() {
+        let now = Date(timeIntervalSince1970: 100)
+        let points = [HardwareDetailHistoryPoint(id: 0, date: now, values: [2, 3])]
+        let size = CGSize(width: 100, height: 80)
+        let domain = HardwareDetailChartGeometry.domain(points: points, now: now)
+
+        let download = HardwareDetailChartGeometry.samples(points: points, series: 0, now: now,
+                                                           yMaximum: 10, size: size, domain: domain)
+        XCTAssertEqual(download.first?.point.x ?? -1, 0, accuracy: 0.01)
+        XCTAssertEqual(download.last?.point.x ?? -1, 100, accuracy: 0.01)
+    }
+
+    // MARK: - Fan page
+
+    private func fanSample(_ rpm: Double?, availability: HardwareMetricAvailability,
+                           maximum: Double? = nil, label: String? = nil,
+                           fanless: Bool = false) -> HardwareMetricSample {
+        HardwareMetricSample(value: rpm, unit: .rpm, source: .smc,
+                             availability: availability, sensorLabel: label,
+                             metadata: HardwareMetricMetadata(maximum: maximum, isFanless: fanless))
+    }
+
+    func testFanDetailKnownZeroIsFanlessWithoutInventedCard() {
+        var snapshot = HardwareMetricsSnapshot()
+        snapshot.fanCount = 0
+        snapshot.samples[.fanRPM(index: 0)] = fanSample(nil, availability: .unsupported, fanless: true)
+
+        let page = FanDetailPresentation(snapshot: snapshot)
+
+        XCTAssertEqual(page.fanCount, 0)
+        XCTAssertTrue(page.isFanless)
+        XCTAssertTrue(page.rows.isEmpty)
+        XCTAssertNil(page.averageRPM)
+    }
+
+    func testFanDetailUnreadCountDoesNotInventOneFan() {
+        var snapshot = HardwareMetricsSnapshot()
+        snapshot.samples[.fanRPM(index: 0)] = fanSample(nil, availability: .temporarilyUnavailable)
+
+        let page = FanDetailPresentation(snapshot: snapshot)
+
+        XCTAssertNil(page.fanCount)
+        XCTAssertFalse(page.isFanless)
+        XCTAssertTrue(page.rows.isEmpty, "an unread FNum must not become one placeholder fan")
+        XCTAssertNil(page.averageRPM)
+    }
+
+    func testFanDetailKeepsUnmeasuredFanButAveragesOnlyReadableOnes() {
+        var snapshot = HardwareMetricsSnapshot()
+        snapshot.fanCount = 2
+        snapshot.samples[.fanRPM(index: 0)] = fanSample(1_500, availability: .measured, maximum: 5_000, label: "Left")
+        snapshot.samples[.fanRPM(index: 1)] = fanSample(nil, availability: .temporarilyUnavailable, maximum: 5_000)
+
+        let page = FanDetailPresentation(snapshot: snapshot)
+
+        XCTAssertEqual(page.fanCount, 2)
+        XCTAssertEqual(page.rows.count, 2)
+        XCTAssertEqual(page.rows[0].rpm, 1_500)
+        XCTAssertNil(page.rows[1].rpm)
+        XCTAssertEqual(page.rows[0].sensorLabel, "Left")
+        XCTAssertEqual(page.averageRPM, 1_500)
+    }
+
+    func testFanDetailStaleAverageKeepsValueAndFlag() {
+        var snapshot = HardwareMetricsSnapshot()
+        snapshot.fanCount = 1
+        snapshot.samples[.fanRPM(index: 0)] = fanSample(1_200, availability: .stale, maximum: 4_000)
+
+        let page = FanDetailPresentation(snapshot: snapshot)
+
+        XCTAssertEqual(page.averageRPM, 1_200)
+        XCTAssertTrue(page.isAverageStale)
+        XCTAssertFalse(page.isFanless)
+        XCTAssertEqual(page.rows.count, 1)
     }
 
     // MARK: - Formatting

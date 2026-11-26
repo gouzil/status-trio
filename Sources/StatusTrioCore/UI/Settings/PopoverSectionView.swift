@@ -126,6 +126,45 @@ struct PopoverSectionView: View {
                     PanelBackgroundStylePreview(style: style)
                 }
             )
+            SettingsDivider()
+            // A single switch drives both weight tiers: on restores the old,
+            // heavier look (semibold titles/values plus medium-weight
+            // captions); off keeps today's regular weight. That is why setting
+            // it also flips `statusPanelMediumTextEnabled` — do not split it
+            // into a second row or drop the medium flag, or the panel will no
+            // longer match the classic appearance.
+            SettingsToggleRow(
+                symbol: "bold",
+                tint: .purple,
+                title: localization.string(.settingsPanelBoldText),
+                subtitle: localization.string(.settingsPanelBoldTextDescription),
+                isOn: Binding(
+                    get: { store.statusPanelBoldTextEnabled },
+                    set: { store.applyPanelBoldTextToggle($0) }
+                )
+            )
+            SettingsDivider()
+            // Appearance also owns how the panel's level sliders look; the
+            // generic slider styling used to live on the General page (#359).
+            SettingsRow(
+                "slider.horizontal.3",
+                tint: .teal,
+                title: localization.string(.settingsPanelLevelSliderColor),
+                subtitle: localization.string(.settingsPanelLevelSliderColorDescription)
+            ) {
+                PanelLevelSliderColorRow(
+                    store: store,
+                    localization: localization
+                )
+            }
+            SettingsDivider()
+            SettingsToggleRow(
+                symbol: "rectangle.portrait.arrowtriangle.2.outward",
+                tint: .teal,
+                title: localization.string(.settingsPanelLevelSliderThickness),
+                subtitle: localization.string(.settingsPanelLevelSliderThicknessDescription),
+                isOn: $store.panelLevelSliderMatchesBrightnessThickness
+            )
         }
     }
 

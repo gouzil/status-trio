@@ -35,6 +35,13 @@ private final class ControllableClient: DisableSleepClienting, @unchecked Sendab
     private var _setCalls: [Bool] = []
     private var _readCalls = 0
     private var _pending: [(Bool, CheckedContinuation<Bool, Error>)] = []
+    private var _landSetButThrow = false
+    private var _failReadCount = 0
+    private var _failReadOnCall: Int?
+    private var _suspendReads = false
+    private var _pendingReads: [CheckedContinuation<Bool, Error>] = []
+    private var _helperUnavailableReadCount = 0
+    private var _readRejectPayload: String?
 
     init(disableSleep: Bool = false, version: Int = 3, versionThrows: Bool = false,
          readThrows: Bool = false, autoComplete: Bool = true, failSetCount: Int = 0) {
@@ -47,6 +54,28 @@ private final class ControllableClient: DisableSleepClienting, @unchecked Sendab
     var readCalls: Int { lock.withLock { _readCalls } }
     var pendingCount: Int { lock.withLock { _pending.count } }
     func setFailSetCount(_ v: Int) { lock.withLock { _failSetCount = v } }
+    /// Makes the next write land in the helper but answer with an error, the
+    /// shape of a reply lost after the privileged side already applied it.
+    func setLandSetButThrow(_ v: Bool) { lock.withLock { _landSetButThrow = v } }
+    func setFailReadCount(_ v: Int) { lock.withLock { _failReadCount = v } }
+    func setFailReadOnCall(_ call: Int) { lock.withLock { _failReadOnCall = call } }
+    func setSuspendReads(_ v: Bool) { lock.withLock { _suspendReads = v } }
+    func setReadThrows(_ v: Bool) { lock.withLock { _readThrows = v } }
+    /// Makes the next reads fail as a daemon rejection carrying a specific
+    /// payload (a coded `DS-*` message or a legacy codeless one).
+    func setReadRejectPayload(_ v: String?) { lock.withLock { _readRejectPayload = v } }
+    /// Makes the next `n` reads fail as a cold/unreachable helper (XPC timeout),
+    /// the transient error the controller must retry before reporting failure.
+    func setHelperUnavailableReadCount(_ v: Int) { lock.withLock { _helperUnavailableReadCount = v } }
+    var pendingReadCount: Int { lock.withLock { _pendingReads.count } }
+    func completeNextRead(_ value: Bool) {
+        let next = lock.withLock { () -> CheckedContinuation<Bool, Error>? in
+            guard !_pendingReads.isEmpty else { return nil }
+            _disableSleep = value
+            return _pendingReads.removeFirst()
+        }
+        next?.resume(returning: value)
+    }
 
     func protocolVersion() async throws -> Int {
         try lock.withLock {
@@ -55,10 +84,28 @@ private final class ControllableClient: DisableSleepClienting, @unchecked Sendab
         }
     }
     func readDisableSleep() async throws -> Bool {
-        try lock.withLock {
+        enum Decision { case fail(String), helperUnavailable, complete(Bool), suspend }
+        let decision: Decision = lock.withLock {
             _readCalls += 1
-            if _readThrows { throw Failure.failed }
-            return _disableSleep
+            if let payload = _readRejectPayload { return .fail(payload) }
+            if _helperUnavailableReadCount > 0 {
+                _helperUnavailableReadCount -= 1
+                return .helperUnavailable
+            }
+            if let failOn = _failReadOnCall, _readCalls == failOn { return .fail("DS-R5: unparseable pmset output") }
+            if _failReadCount > 0 { _failReadCount -= 1; return .fail("DS-R5: unparseable pmset output") }
+            if _readThrows { return .fail("DS-R5: unparseable pmset output") }
+            if _suspendReads { return .suspend }
+            return .complete(_disableSleep)
+        }
+        switch decision {
+        case .fail(let payload): throw HighPowerModeClientError.rejected(payload)
+        case .helperUnavailable: throw HighPowerModeClientError.helperUnavailable
+        case .complete(let value): return value
+        case .suspend:
+            return try await withCheckedThrowingContinuation { cont in
+                lock.withLock { _pendingReads.append(cont) }
+            }
         }
     }
     func setDisableSleep(_ enabled: Bool) async throws -> Bool {
@@ -66,6 +113,11 @@ private final class ControllableClient: DisableSleepClienting, @unchecked Sendab
         let decision: Decision = lock.withLock {
             _setCalls.append(enabled)
             if _failSetCount > 0 { _failSetCount -= 1; return .fail }
+            if _landSetButThrow {
+                _landSetButThrow = false
+                _disableSleep = enabled
+                return .fail
+            }
             if _autoComplete { _disableSleep = enabled; return .complete(enabled) }
             return .suspend
         }
@@ -103,14 +155,17 @@ final class SleepControlSafetyTests: XCTestCase {
     private func make(
         client: ControllableClient,
         readiness: ProbeReadiness = ProbeReadiness(isReady: true),
-        ownership: ProbeOwnership = ProbeOwnership()
+        ownership: ProbeOwnership = ProbeOwnership(),
+        recoveryRetryDelay: TimeInterval = 2
     ) -> SleepControlController {
         SleepControlController(
             assertion: ProbeAssertion(),
             client: client,
             helperReadiness: readiness,
             ownership: ownership,
-            lidDisableRetryDelays: [0, 0, 0]
+            lidDisableRetryDelays: [0, 0, 0],
+            lidRecoveryRetryDelay: recoveryRetryDelay,
+            lidReadRetryDelays: [0, 0]
         )
     }
 
@@ -232,8 +287,81 @@ final class SleepControlSafetyTests: XCTestCase {
         control.setLidSleep(true)
         await waitUntil { control.lidSleepExternalState == .stateUnreadable }
         XCTAssertEqual(control.lidSleepExternalState, .stateUnreadable)
+        XCTAssertEqual(control.lidSleepFailureCode, "DS-R5",
+                       "an unparseable daemon read must expose its diagnostic code")
         XCTAssertTrue(client.setCalls.isEmpty)
         XCTAssertFalse(control.isPreventingLidSleep)
+    }
+
+    /// A coded daemon rejection surfaces its code so a report can be triaged.
+    func testDaemonRejectionExposesItsCode() async {
+        let client = ControllableClient()
+        client.setReadRejectPayload("DS-R4: SleepDisabled not found in `pmset -g`")
+        let control = make(client: client)
+        control.setLidSleep(true)
+        await waitUntil { control.lidSleepExternalState == .stateUnreadable }
+        XCTAssertEqual(control.lidSleepFailureCode, "DS-R4")
+        XCTAssertEqual(control.lidSleepFailureDetail, "SleepDisabled not found in `pmset -g`")
+    }
+
+    /// An older helper that sends no code falls back to DS-R0 rather than
+    /// guessing a specific cause.
+    func testLegacyCodelessRejectionFallsBack() async {
+        let client = ControllableClient()
+        client.setReadRejectPayload("Disable sleep state is unavailable.")
+        let control = make(client: client)
+        control.setLidSleep(true)
+        await waitUntil { control.lidSleepExternalState == .stateUnreadable }
+        XCTAssertEqual(control.lidSleepFailureCode, "DS-R0")
+        XCTAssertEqual(control.lidSleepFailureDetail, "Disable sleep state is unavailable.")
+    }
+
+    /// A cold helper that times out on the very first read must be retried and
+    /// then enable normally — this is the #383 regression.
+    func testColdStartReadTimeoutRetriesThenEnables() async {
+        let client = ControllableClient()
+        client.setHelperUnavailableReadCount(1)
+        let control = make(client: client)
+        control.setLidSleep(true)
+        await waitUntil { control.isPreventingLidSleep }
+        XCTAssertTrue(control.isPreventingLidSleep)
+        XCTAssertNil(control.lidSleepExternalState, "a recovered read must not leave a notice")
+        XCTAssertNil(control.lidSleepFailureCode)
+        XCTAssertEqual(client.setCalls, [true])
+        XCTAssertEqual(client.readCalls, 2, "the first timeout is retried once")
+    }
+
+    /// When the helper never answers, the copy must say it is starting rather
+    /// than claiming the value is unreadable.
+    func testPersistentReadTimeoutReportsHelperStarting() async {
+        let client = ControllableClient()
+        client.setHelperUnavailableReadCount(99)
+        let control = make(client: client)
+        control.setLidSleep(true)
+        await waitUntil { control.lidSleepExternalState == .helperStarting }
+        XCTAssertEqual(control.lidSleepExternalState, .helperStarting)
+        XCTAssertEqual(control.lidSleepFailureCode, "DS-H1",
+                       "an exhausted helper timeout reports the helper-side code")
+        XCTAssertTrue(client.setCalls.isEmpty)
+        XCTAssertFalse(control.isPreventingLidSleep)
+        XCTAssertEqual(client.readCalls, 3, "initial read plus the two bounded retries")
+    }
+
+    /// A later successful read clears a stale "unreadable" notice instead of
+    /// leaving it hanging in the card.
+    func testSuccessfulEnableClearsStaleUnreadableNotice() async {
+        let client = ControllableClient(readThrows: true)
+        let control = make(client: client)
+        control.setLidSleep(true)
+        await waitUntil { control.lidSleepExternalState == .stateUnreadable }
+        await waitUntil { !control.isApplyingLidSleep }
+
+        client.setReadThrows(false)
+        control.setLidSleep(true)
+        await waitUntil { control.isPreventingLidSleep }
+        XCTAssertTrue(control.isPreventingLidSleep)
+        XCTAssertNil(control.lidSleepExternalState)
+        XCTAssertEqual(client.setCalls, [true])
     }
 
     func testTimerCloseFailureRetriesThenSucceeds() async {
@@ -280,5 +408,147 @@ final class SleepControlSafetyTests: XCTestCase {
         control.start()
         await waitUntil { control.helperCapability == .needsUpdate }
         XCTAssertEqual(control.helperCapability, .needsUpdate)
+    }
+
+    /// A reply lost after the privileged write already landed, followed by an
+    /// unreadable status, must not be treated as "definitely off".
+    func testLostEnableReplyKeepsRecoveryMarkerForNextLaunch() async {
+        let client = ControllableClient()
+        let ownership = ProbeOwnership()
+        let control = make(client: client, ownership: ownership)
+        client.setLandSetButThrow(true)
+        client.setFailReadOnCall(2)
+
+        control.setLidSleep(true)
+        await waitUntil { !control.isApplyingLidSleep && control.lastError != nil }
+
+        XCTAssertTrue(client.disableSleep)
+        XCTAssertTrue(ownership.ownsDisableSleep)
+        XCTAssertTrue(control.needsTerminationCleanup)
+        XCTAssertFalse(control.isPreventingLidSleep)
+        control.stop()
+
+        // The next launch must confirm the system is off before dropping the
+        // durable recovery marker.
+        let restarted = make(client: client, ownership: ownership)
+        restarted.start()
+        await waitUntil { !ownership.ownsDisableSleep }
+        XCTAssertFalse(client.disableSleep)
+    }
+
+    func testUnplugDuringInitialReadDoesNotWriteEnable() async {
+        let client = ControllableClient()
+        client.setSuspendReads(true)
+        let control = make(client: client)
+        control.allowsLidSleepOnBattery = false
+        control.updatePowerState(battery: battery(connected: true))
+
+        control.setLidSleep(true)
+        await waitUntil { client.pendingReadCount == 1 }
+        control.updatePowerState(battery: battery(connected: false))
+        client.completeNextRead(false)
+        await waitUntil { !control.isApplyingLidSleep }
+
+        XCTAssertFalse(client.setCalls.contains(true))
+        XCTAssertFalse(control.isPreventingLidSleep)
+        XCTAssertFalse(client.disableSleep)
+    }
+
+    func testReadinessRecoveryDoesNotClearIntentionalLidSleep() async {
+        let client = ControllableClient()
+        let readiness = ProbeReadiness(isReady: true)
+        let control = make(client: client, readiness: readiness)
+        control.start()
+        await waitUntil { control.helperCapability == .available }
+        control.setLidSleep(true)
+        await waitUntil { control.isPreventingLidSleep }
+        XCTAssertEqual(client.setCalls, [true])
+
+        readiness.setReady(false)
+        await waitUntil { control.helperCapability == .unavailable }
+        readiness.setReady(true)
+        await waitUntil { control.helperCapability == .available }
+        for _ in 0..<40 { await Task.yield() }
+
+        XCTAssertTrue(control.isPreventingLidSleep)
+        XCTAssertEqual(client.setCalls, [true])
+        XCTAssertTrue(client.disableSleep)
+    }
+
+    // MARK: - Residual recovery must never act on a newer session
+
+    func testSuspendedRecoveryReadDoesNotDisableNewSession() async {
+        let client = ControllableClient(disableSleep: true)
+        let ownership = ProbeOwnership(owns: true)
+        let control = make(client: client, ownership: ownership)
+        client.setSuspendReads(true)
+        control.start()
+        await waitUntil { client.pendingReadCount == 1 }
+
+        // The user turns lid sleep on while the residual read is still out.
+        client.setSuspendReads(false)
+        control.setLidSleep(true)
+        client.completeNextRead(true)
+        await waitUntil { control.isPreventingLidSleep }
+
+        XCTAssertFalse(client.setCalls.contains(false),
+                       "recovery must not turn off a session the user just enabled")
+        XCTAssertTrue(ownership.ownsDisableSleep)
+        XCTAssertTrue(control.isPreventingLidSleep)
+    }
+
+    func testSuspendedRecoveryReadOffKeepsOwnershipForNewSession() async {
+        let client = ControllableClient(disableSleep: true)
+        let ownership = ProbeOwnership(owns: true)
+        let control = make(client: client, ownership: ownership)
+        client.setSuspendReads(true)
+        control.start()
+        await waitUntil { client.pendingReadCount == 1 }
+
+        client.setSuspendReads(false)
+        control.setLidSleep(true)
+        client.completeNextRead(false)
+        await waitUntil { control.isPreventingLidSleep }
+
+        XCTAssertFalse(client.setCalls.contains(false))
+        XCTAssertTrue(ownership.ownsDisableSleep,
+                      "an off reading that raced a new session must keep the durable marker")
+    }
+
+    func testShutdownDuringSuspendedRecoveryReadWritesNothing() async {
+        let client = ControllableClient(disableSleep: true)
+        let ownership = ProbeOwnership(owns: true)
+        let control = make(client: client, ownership: ownership)
+        client.setSuspendReads(true)
+        control.start()
+        await waitUntil { client.pendingReadCount == 1 }
+
+        control.stop()
+        client.completeNextRead(true)
+        await waitUntil { !control.isApplyingLidSleep }
+
+        XCTAssertEqual(client.setCalls, [])
+        XCTAssertTrue(ownership.ownsDisableSleep)
+    }
+
+    func testRecoveryRetryDoesNotServeANewerSession() async {
+        let client = ControllableClient()
+        let ownership = ProbeOwnership()
+        let control = make(client: client, ownership: ownership, recoveryRetryDelay: 0.05)
+        client.setLandSetButThrow(true)
+        client.setFailReadOnCall(2)
+        control.setLidSleep(true)
+        await waitUntil { !control.isApplyingLidSleep && control.lastError != nil }
+        XCTAssertTrue(control.needsTerminationCleanup)
+
+        // The user retries and succeeds before the stale retry timer fires.
+        control.setLidSleep(true)
+        await waitUntil { control.isPreventingLidSleep }
+        let settledCalls = client.setCalls
+        try? await Task.sleep(for: .milliseconds(250))
+
+        XCTAssertEqual(client.setCalls, settledCalls,
+                       "a stale retry must not issue another write")
+        XCTAssertTrue(control.isPreventingLidSleep)
     }
 }

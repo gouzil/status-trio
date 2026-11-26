@@ -4,12 +4,18 @@ enum IconColorRole: Equatable, Hashable, Sendable {
     static let inactiveTrackOpacity = 0.22
 
     case primary
+    /// Plain battery discharge, not connected to power (#357). Resolves to the
+    /// user-chosen discharging colour; `.system` keeps the label colour.
+    case discharging
     case inactive
     case critical
     case lowPower
     /// High Power Mode ring colour (#235).
     case highPower
     case powered
+    /// Connected to power without charging (#389). Resolves to the user-chosen
+    /// connected colour; `.system` keeps the same green baseline as `powered`.
+    case connected
     /// The volume footer's Bluetooth tint.
     case bluetooth
     case custom(IconRGBA)

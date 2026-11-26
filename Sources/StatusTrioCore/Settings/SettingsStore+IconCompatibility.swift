@@ -5,14 +5,15 @@ import Foundation
 ///
 /// The individual `@Published` icon settings on `SettingsStore` remain the
 /// values the settings UI edits. `iconConfiguration` is the V1 representation
-/// that the editor/tests read and write, persisted under
-/// `iconConfigurationDefaultsKey`. `updateIconConfiguration` writes a mutated
-/// V1 config back into the individual settings; the runtime renders from the
-/// projection derived from those individual settings so the UI stays the
-/// source of truth for what is on screen.
+/// used by legacy compatibility reads and tests, persisted under
+/// `iconConfigurationDefaultsKey` only by explicit updates. `updateIconConfiguration`
+/// writes a mutated V1 config back into the individual settings; the runtime
+/// renders from the projection derived from those individual settings so the UI
+/// stays the source of truth for what is on screen.
 @MainActor
 extension SettingsStore {
     static let iconConfigurationDefaultsKey = "iconConfigurationV1"
+    static let iconSlotBindingsDefaultsKey = "iconSlotBindingsV1"
 
     /// V1 projection of the current individual icon settings. Used by the
     /// runtime (`AppEnvironment`'s mapScene) so settings-surface edits render.
@@ -57,17 +58,22 @@ extension SettingsStore {
             configuration.composition.center = SlotSelection(primary: .automaticLegacy, fallback: .network)
         }
 
-        // Outer ring: the Mac battery by default, or the AirPods battery with the
-        // Mac battery as an optional fallback when no AirPods are connected
-        // (mirroring the centre's network fallback), or system monitoring.
+        // Outer ring: the Mac battery by default, or the AirPods battery with a
+        // configurable fallback when no AirPods are connected — the Mac battery
+        // ring (historical), the custom system-monitoring ring, or nothing
+        // (mirroring the centre's network fallback).
         if appearance.outerRingContent == .hardwareMonitor {
             configuration.composition.outerRing = SlotSelection(primary: .hardwareMonitor)
             configuration.behaviors.airPodsRing = .single
             configuration.behaviors.showsAirPodsTopSymbol = false
         } else if appearance.outerRingContent == .airPodsBattery {
+            let ringFallback: RingSource = switch appearance.airPodsRingFallback {
+            case .battery: .systemBattery
+            case .hardwareMonitor: .hardwareMonitor
+            }
             configuration.composition.outerRing = SlotSelection(
                 primary: .airPodsBattery,
-                fallback: appearance.airPodsRingFallsBackToBattery ? .systemBattery : nil
+                fallback: ringFallback
             )
             configuration.behaviors.airPodsRing = appearance.airPodsRingUsesDualRing ? .dual : .single
             configuration.behaviors.showsAirPodsTopSymbol = appearance.showsAirPodsTopSymbolInRing
@@ -119,6 +125,12 @@ extension SettingsStore {
             symbolScale: bluetooth.symbolScale,
             networkIconSymbolOverride: bluetooth.networkIconSymbolOverride
         )
+        // The settings toggle is the live authority for the global
+        // network-problem override. The legacy one-time compatibility fold only
+        // seeds the stored V1 payload; deriving the runtime scene from that stale
+        // payload would ignore later clicks on the toggle.
+        configuration.composition.centerOverride.networkProblemOverridesPrimary =
+            connection.prioritizesNetworkErrors
         configuration.behaviors.systemVolumeFooter = SystemVolumeFooterBehavior(
             displayStyle: volume.displayStyle
         )
@@ -127,6 +139,12 @@ extension SettingsStore {
         configuration.appearance.outerRing.strokeScale = battery.ringStrokeScale
         configuration.appearance.footer.strokeScale = volume.ringStrokeScale
         configuration.appearance.bluetoothIconColor = BluetoothIconColorConfiguration(bluetooth.iconColor)
+        configuration.appearance.airPodsLeftArcColor =
+            BluetoothIconColorConfiguration(appearance.airPodsLeftArcColor)
+        configuration.appearance.airPodsRightArcColor =
+            BluetoothIconColorConfiguration(appearance.airPodsRightArcColor)
+        configuration.appearance.airPodsSingleArcColor =
+            BluetoothIconColorConfiguration(appearance.airPodsSingleArcColor)
         configuration.appearance.inputSourceMarkerStyle = inputSourceMarkerStyle
         configuration.appearance.bluetoothSymbolScale = bluetooth.symbolScale
         // The palette applies `symbolScale / classic` as the centre factor over the
@@ -150,7 +168,10 @@ extension SettingsStore {
             prioritizesNetworkErrorsOverInputSource: connectionIconOptions.prioritizesNetworkErrors,
             batteryFullThreshold: batteryIconOptions.fullThreshold,
             bluetoothAudioIconChoice: bluetoothAudioIconOptions.iconChoice,
-            bottomIndicatorSource: bottomIndicatorSource
+            bottomIndicatorSource: bottomIndicatorSource,
+            bottomIndicatorMetric: bottomIndicatorMetric,
+            bottomIndicatorStyle: effectiveBottomIndicatorStyle,
+            bluetoothVolumeColorRole: bluetoothVolumeColorRole
         )
     }
 
@@ -174,8 +195,8 @@ extension SettingsStore {
         set {}
     }
 
-    /// AirPods icon device selection, persisted so the retained designer model
-    /// and the resolver demand bridge can read the same value.
+    /// AirPods icon device selection, persisted so the settings surface and the
+    /// resolver demand bridge can read the same value.
     private static let airPodsIconDeviceAddressDefaultsKey = "airPodsIconDeviceAddress"
     private static let connectedBluetoothIconDeviceAddressDefaultsKey = "connectedBluetoothIconDeviceAddress"
     private static let refreshesAirPodsBatteryForIconDefaultsKey = "refreshesAirPodsBatteryForIcon"
@@ -196,7 +217,10 @@ extension SettingsStore {
     // MARK: - V1 persistence
 
     /// Seeds `iconConfiguration` from stored V1 data or migrates the legacy
-    /// defaults, then mirrors it onto the individual settings.
+    /// defaults for in-memory compatibility reads.
+    ///
+    /// Launch does not write the resolved value back to V1 or to the individual
+    /// settings; only an explicit compatibility update persists it.
     func bootstrapIconConfiguration() {
         let stored = defaults.data(forKey: Self.iconConfigurationDefaultsKey)
         var resolved: IconConfigurationV1
@@ -229,13 +253,13 @@ extension SettingsStore {
         canPersistIconConfiguration = (stored == nil || loadError == nil)
         // Do not write the seeded configuration back onto the individual
         // settings: those are main's persisted values and are the source the
-        // runtime projection reads. Only explicit editor writes mirror back.
-        // Always write the resolved configuration back once (a fresh migration
-        // seeds the key; a stored payload is rewritten only when normalization
-        // changed it). A corrupt payload was left untouched above.
-        if loadError == nil, let data = try? IconConfigurationCodec.encode(resolved) {
-            defaults.set(data, forKey: Self.iconConfigurationDefaultsKey)
-        }
+        // runtime projection reads. Only explicit legacy/test updates mirror back.
+        //
+        // Do not seed or normalize `iconConfigurationDefaultsKey` at launch
+        // either. The retired 2.0 designer's automatic writeback is gone; the
+        // stored payload remains a read-compatibility input until an explicit
+        // `updateIconConfiguration` call writes a new one. A corrupt payload was
+        // left untouched above.
     }
 
     /// Mutates the V1 configuration, persists it, and mirrors the result onto the
@@ -299,6 +323,9 @@ extension SettingsStore {
         showsWiFiIconForInternetSharing = behaviors.networkCenter.showsWiFiIconForInternetSharing
 
         bluetoothIconColor = appearance.bluetoothIconColor.selection
+        airPodsLeftArcColor = appearance.airPodsLeftArcColor.selection
+        airPodsRightArcColor = appearance.airPodsRightArcColor.selection
+        airPodsSingleArcColor = appearance.airPodsSingleArcColor.selection
         bluetoothSymbolScale = appearance.bluetoothSymbolScale
         bluetoothNetworkIconSymbolName = behaviors.bluetoothAudioCenter.networkIconSymbolOverride
         inputSourceMarkerStyle = appearance.inputSourceMarkerStyle
@@ -307,5 +334,216 @@ extension SettingsStore {
             abs($0.scale - appearance.outerRing.strokeScale)
                 < abs($1.scale - appearance.outerRing.strokeScale)
         } ?? .regular
+    }
+
+    // MARK: - Slot bindings
+
+    /// Bindings used for one published settings snapshot.
+    ///
+    /// Built-in slot choices follow the individual settings that just changed,
+    /// so the same snapshot is correct even though `@Published` delivers the
+    /// legacy value before its `didSet` can persist the binding update. External
+    /// primaries and fallbacks are preserved verbatim.
+    func effectiveIconSlotBindings(
+        appearance: StatusIconAppearance,
+        inputSourceMarkerStyle: InputSourceMarkerStyle,
+        bottomIndicatorSource: BottomIndicatorSource,
+        bottomIndicatorMetric: BottomIndicatorMetric = .cpuUsage
+    ) -> IconSlotBindingsV1 {
+        let derived = IconSlotBindingsV1.migrated(
+            from: Self.iconConfiguration(
+                from: appearance,
+                inputSourceMarkerStyle: inputSourceMarkerStyle),
+            bottomIndicatorSource: bottomIndicatorSource
+        )
+        var result = iconSlotBindings
+        for slot in IconSlot.allCases {
+            let stored = result.selection(for: slot)
+            if let primary = stored.primary, !primary.pluginID.hasPrefix("builtin.") {
+                continue
+            }
+            // Built-in (including a nil/hidden) primary always follows the current
+            // individual settings. Requiring a non-nil stored primary here left the
+            // footer unbound after switching Hidden → back to a visible source.
+            let fallbackIsExternal = stored.fallback.map { !$0.pluginID.hasPrefix("builtin.") } ?? false
+            var selection = derived.selection(for: slot)
+            if fallbackIsExternal { selection.fallback = stored.fallback }
+            result.setSelection(selection, for: slot)
+        }
+        return result.normalized()
+    }
+
+    /// Seeds the slot binding store once from the live individual settings.
+    ///
+    /// A missing payload is migrated and persisted immediately. A malformed or
+    /// newer payload is left byte-for-byte intact and the current run falls back
+    /// to the per-setting projection without writing over the user's data.
+    func bootstrapIconSlotBindings() {
+        let stored = defaults.data(forKey: Self.iconSlotBindingsDefaultsKey)
+        var resolved: IconSlotBindingsV1
+        var loadError: IconSlotBindingsCodecError?
+        if let stored {
+            do {
+                resolved = try IconSlotBindingsCodec.decode(stored)
+            } catch {
+                loadError = (error as? IconSlotBindingsCodecError) ?? .malformedData
+                resolved = IconSlotBindingsV1.migrated(
+                    from: derivedIconConfigurationFromSettings(),
+                    bottomIndicatorSource: bottomIndicatorSource
+                )
+            }
+        } else {
+            resolved = IconSlotBindingsV1.migrated(
+                from: derivedIconConfigurationFromSettings(),
+                bottomIndicatorSource: bottomIndicatorSource
+            )
+        }
+        iconSlotBindingsLoadError = loadError
+        isSyncingIconSlotBindings = true
+        iconSlotBindings = resolved.normalized()
+        isSyncingIconSlotBindings = false
+        canPersistIconSlotBindings = (stored == nil || loadError == nil)
+        if stored == nil, let data = try? IconSlotBindingsCodec.encode(resolved) {
+            defaults.set(data, forKey: Self.iconSlotBindingsDefaultsKey)
+        }
+    }
+
+    /// The single setter used by the settings surface and imports.
+    ///
+    /// Unknown plugin IDs are stored verbatim. Built-in IDs also update the
+    /// legacy individual settings so previews, exports and older code paths keep
+    /// seeing the same choice; an external or hidden selection leaves the legacy
+    /// key untouched.
+    func setIconSlotBinding(
+        primary: IconContentBinding?,
+        fallback: IconContentBinding? = nil,
+        for slot: IconSlot
+    ) {
+        var bindings = iconSlotBindings
+        bindings.setSelection(.init(primary: primary, fallback: fallback).normalized(), for: slot)
+        applyIconSlotBindings(bindings, updatingLegacySlot: slot)
+    }
+
+    /// Applies an external presentation chosen in the slot's source menu.
+    ///
+    /// When the slot had no fallback, the compiled-in source being replaced is
+    /// kept as the fallback. That is what lets a missing or removed package fall
+    /// back to the built-in icon instead of leaving the slot blank with no
+    /// product path back to a built-in choice.
+    func selectExternalIconSlotSource(_ binding: IconContentBinding, for slot: IconSlot) {
+        let selection = iconSlotBindings.selection(for: slot)
+        let fallback: IconContentBinding?
+        if let existing = selection.fallback, existing != binding {
+            fallback = existing
+        } else if let replaced = selection.primary, replaced != binding, replaced.isBuiltinSource {
+            fallback = replaced
+        } else {
+            fallback = nil
+        }
+        setIconSlotBinding(primary: binding, fallback: fallback, for: slot)
+    }
+
+    func applyIconSlotBindings(_ bindings: IconSlotBindingsV1, updatingLegacySlot slot: IconSlot? = nil) {
+        let normalized = bindings.normalized()
+        guard normalized != iconSlotBindings else { return }
+        isSyncingIconSlotBindings = true
+        iconSlotBindings = normalized
+        isSyncingIconSlotBindings = false
+        canPersistIconSlotBindings = true
+        iconSlotBindingsLoadError = nil
+        if let data = try? IconSlotBindingsCodec.encode(normalized) {
+            defaults.set(data, forKey: Self.iconSlotBindingsDefaultsKey)
+        }
+        if let slot {
+            isSyncingIconSlotBindings = true
+            applyIconSlotBindingToLegacySettings(normalized.selection(for: slot), for: slot)
+            isSyncingIconSlotBindings = false
+        }
+    }
+
+    /// Mirrors the live individual settings into one legacy slot binding.
+    ///
+    /// This is what keeps existing controls and old imports working without a
+    /// second source of truth: any built-in selection made through the legacy
+    /// property lands in the binding store through this hook.
+    func synchronizeSlotBindingFromLegacySettings(for slot: IconSlot) {
+        guard !isSyncingIconSlotBindings, iconSlotBindingsLoadError == nil else { return }
+        let configuration = derivedIconConfigurationFromSettings()
+        var bindings = iconSlotBindings
+        switch slot {
+        case .outerRing:
+            let selection = configuration.composition.outerRing
+            bindings.outerRing = .init(
+                primary: IconContentLegacyAdapter.binding(for: selection.primary),
+                fallback: selection.fallback.flatMap(IconContentLegacyAdapter.binding(for:))
+            )
+        case .center:
+            let selection = configuration.composition.center
+            bindings.center = .init(
+                primary: IconContentLegacyAdapter.binding(for: selection.primary),
+                fallback: selection.fallback.flatMap(IconContentLegacyAdapter.binding(for:))
+            )
+        case .footer:
+            bindings.footer = .init(primary: IconContentLegacyAdapter.binding(for: bottomIndicatorSource))
+        }
+        guard bindings.normalized() != iconSlotBindings else { return }
+        isSyncingIconSlotBindings = true
+        iconSlotBindings = bindings.normalized()
+        isSyncingIconSlotBindings = false
+        canPersistIconSlotBindings = true
+        if let data = try? IconSlotBindingsCodec.encode(bindings) {
+            defaults.set(data, forKey: Self.iconSlotBindingsDefaultsKey)
+        }
+    }
+
+    private func applyIconSlotBindingToLegacySettings(
+        _ selection: IconSlotBindingSelection,
+        for slot: IconSlot
+    ) {
+        switch slot {
+        case .outerRing:
+            guard let binding = selection.primary,
+                  let source = IconContentLegacyAdapter.ringSource(for: binding) else { return }
+            switch source {
+            case .systemBattery, .automaticLegacy:
+                outerRingContent = .systemBattery
+            case .airPodsBattery:
+                outerRingContent = .airPodsBattery
+                if let fallback = selection.fallback,
+                   let fallbackSource = IconContentLegacyAdapter.ringSource(for: fallback) {
+                    airPodsRingFallback = fallbackSource == .hardwareMonitor ? .hardwareMonitor : .battery
+                }
+            case .hardwareMonitor:
+                outerRingContent = .hardwareMonitor
+            case .none:
+                break
+            }
+        case .center:
+            guard let binding = selection.primary,
+                  let source = IconContentLegacyAdapter.centerSource(for: binding) else { return }
+            switch source {
+            case .network, .automaticLegacy:
+                connectionCenterSource = .network
+            case .inputSource:
+                connectionCenterSource = .inputSource
+            case .systemBatteryPercentage:
+                connectionCenterSource = .batteryPercentage
+            case .bluetoothAudioOutput, .connectedBluetoothDevice, .pinnedBluetoothGlyph:
+                connectionCenterSource = .bluetoothDevice
+            case .chargingStatus:
+                connectionCenterSource = .chargingStatus
+            case .power:
+                connectionCenterSource = .power
+            case .none:
+                break
+            }
+        case .footer:
+            if let binding = selection.primary,
+               let source = IconContentLegacyAdapter.bottomIndicatorSource(for: binding) {
+                bottomIndicatorSource = source
+            } else if selection.primary == nil {
+                bottomIndicatorSource = .hidden
+            }
+        }
     }
 }

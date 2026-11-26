@@ -71,6 +71,38 @@ final class HardwareRingSettingsTests: XCTestCase {
                             HardwareMonitorMetric.cpuTemperature.metricID]))
     }
 
+    func testBatteryLevelArcDemandsBatterySampleWithoutHardwareDemand() {
+        var config = IconConfigurationV1.classic
+        config.composition.outerRing = SlotSelection(primary: .hardwareMonitor)
+        config.behaviors.hardwareRing = HardwareRingConfiguration(
+            layout: .single, primaryMetric: .batteryLevel, topContent: .hidden)
+        let dependencies = IconContentDependencyResolver.dependencies(configuration: config, targetIsAudio: false)
+        XCTAssertTrue(dependencies.samples.contains(.macBattery))
+        XCTAssertTrue(dependencies.samples.contains(.hardwareMonitor))
+        XCTAssertFalse(dependencies.hardwareMetricIDs.contains(HardwareMonitorMetric.batteryLevel.metricID))
+    }
+
+    func testBatteryTopMarkerDemandsBatterySample() {
+        var config = IconConfigurationV1.classic
+        config.composition.outerRing = SlotSelection(primary: .hardwareMonitor)
+        config.behaviors.hardwareRing = HardwareRingConfiguration(
+            layout: .single, primaryMetric: .cpuUsage, topContent: .chargingIndicator
+        )
+        let dependencies = IconContentDependencyResolver.dependencies(configuration: config, targetIsAudio: false)
+        XCTAssertTrue(dependencies.samples.contains(.macBattery))
+        XCTAssertTrue(dependencies.samples.contains(.hardwareMonitor))
+    }
+
+    func testMetricValueTopMarkerDoesNotDemandBatterySample() {
+        var config = IconConfigurationV1.classic
+        config.composition.outerRing = SlotSelection(primary: .hardwareMonitor)
+        config.behaviors.hardwareRing = HardwareRingConfiguration(
+            layout: .single, primaryMetric: .cpuUsage, topContent: .value(.cpuUsage)
+        )
+        let dependencies = IconContentDependencyResolver.dependencies(configuration: config, targetIsAudio: false)
+        XCTAssertFalse(dependencies.samples.contains(.macBattery))
+    }
+
     func testResolvesTrackOnlyRingWhenSnapshotEmpty() {
         var config = IconConfigurationV1.classic
         config.composition.outerRing = SlotSelection(primary: .hardwareMonitor)
@@ -102,6 +134,16 @@ final class HardwareRingSettingsTests: XCTestCase {
         // Other metrics keep the recommended default until edited.
         XCTAssertEqual(reopened.hardwareColor(for: .gpuUsage),
                        HardwareRingColorConfiguration.recommendedBaseColor(for: .gpuUsage))
+    }
+
+    func testDiskRingColorDefaultsAndPersists() throws {
+        let (store, defaults, _) = try makeStore()
+        XCTAssertEqual(store.hardwareDiskRingColor,
+                       HardwareRingColorConfiguration.solidStateDriveColor)
+        let custom = IconRGBA(red: 1, green: 0, blue: 0, alpha: 1)
+        store.hardwareDiskRingColor = custom
+        let reopened = SettingsStore(defaults: defaults)
+        XCTAssertEqual(reopened.hardwareDiskRingColor, custom)
     }
 
     func testRingResolverUsesSharedMetricColor() {

@@ -16,12 +16,21 @@ enum HardwareRingLayout: String, Codable, CaseIterable, Identifiable, Sendable {
 ///
 /// `automatic` follows the selected metric (single: that metric's glyph; dual:
 /// a generic monitor glyph). `symbol` pins a metric glyph, `value` shows the
-/// metric's raw value, `hidden` removes it. The top marker is part of the
-/// hardware source, not a separate top-level slot.
+/// metric's raw value. `batteryPercentage` shows the Mac battery's level
+/// number in the gap, and `chargingIndicator` shows the battery's power-state
+/// marker — the same per-state bolt / plug / percentage / hidden choice the
+/// battery page configures (#361). `hidden` removes it. The top marker is part
+/// of the hardware source, not a separate top-level slot.
 enum HardwareRingTopContent: Codable, Equatable, Hashable, Sendable {
     case automatic
     case symbol(HardwareMonitorMetric)
     case value(HardwareMonitorMetric)
+    /// The Mac battery's level percentage, drawn like the battery ring's own
+    /// percentage marker.
+    case batteryPercentage
+    /// A battery power-state marker that follows the battery page's per-state
+    /// `BatteryTopMarker` choice (bolt / plug / percentage / hidden).
+    case chargingIndicator
     case hidden
 
     /// The metric whose sample the top marker depends on, if any. `automatic`
@@ -29,8 +38,18 @@ enum HardwareRingTopContent: Codable, Equatable, Hashable, Sendable {
     /// own; the resolver combines it with the ring metrics.
     var referencedMetric: HardwareMonitorMetric? {
         switch self {
-        case .automatic, .hidden: return nil
+        case .automatic, .hidden, .batteryPercentage, .chargingIndicator: return nil
         case let .symbol(metric), let .value(metric): return metric
+        }
+    }
+
+    /// Whether the top marker reads the Mac battery rather than a hardware
+    /// metric. Battery content adds no hardware-metric sampling demand, but it
+    /// does require the battery sample.
+    var usesBatteryStatus: Bool {
+        switch self {
+        case .batteryPercentage, .chargingIndicator: return true
+        case .automatic, .symbol, .value, .hidden: return false
         }
     }
 
@@ -39,7 +58,7 @@ enum HardwareRingTopContent: Codable, Equatable, Hashable, Sendable {
     private enum CodingKeys: String, CodingKey { case kind, metric }
 
     private enum Kind: String {
-        case automatic, symbol, value, hidden
+        case automatic, symbol, value, batteryPercentage, chargingIndicator, hidden
     }
 
     func encode(to encoder: Encoder) throws {
@@ -47,6 +66,10 @@ enum HardwareRingTopContent: Codable, Equatable, Hashable, Sendable {
         switch self {
         case .automatic:
             try container.encode(Kind.automatic.rawValue, forKey: .kind)
+        case .batteryPercentage:
+            try container.encode(Kind.batteryPercentage.rawValue, forKey: .kind)
+        case .chargingIndicator:
+            try container.encode(Kind.chargingIndicator.rawValue, forKey: .kind)
         case .hidden:
             try container.encode(Kind.hidden.rawValue, forKey: .kind)
         case let .symbol(metric):
@@ -66,6 +89,10 @@ enum HardwareRingTopContent: Codable, Equatable, Hashable, Sendable {
         switch kind {
         case .automatic:
             self = .automatic
+        case .batteryPercentage:
+            self = .batteryPercentage
+        case .chargingIndicator:
+            self = .chargingIndicator
         case .hidden:
             self = .hidden
         case .symbol:
@@ -111,6 +138,10 @@ struct HardwareMetricRingOptions: Codable, Equatable, Hashable, Sendable {
         case .downloadSpeed:
             return .init(displayMinimum: 0, displayMaximum: 1000, warningThreshold: 0, criticalThreshold: 0)
         case .uploadSpeed:
+            return .init(displayMinimum: 0, displayMaximum: 100, warningThreshold: 0, criticalThreshold: 0)
+        case .volume, .wifiSignal, .batteryLevel:
+            // Status-snapshot readings are plain percentages. There is no
+            // higher-is-worse threshold for them, so the arc keeps its base colour.
             return .init(displayMinimum: 0, displayMaximum: 100, warningThreshold: 0, criticalThreshold: 0)
         }
     }
@@ -231,6 +262,9 @@ struct HardwareRingColorConfiguration: Codable, Equatable, Hashable, Sendable {
     static let fanColor = IconRGBA(red: 0.545098, green: 0.643137, blue: 0.764706, alpha: 1)      // #8BA4C3
     static let downloadColor = IconRGBA(red: 0.192157, green: 0.725490, blue: 0.521569, alpha: 1) // #31B985
     static let uploadColor = IconRGBA(red: 0.949020, green: 0.639216, blue: 0.294118, alpha: 1)   // #F2A34B
+    static let volumeColor = IconRGBA(red: 0.462745, green: 0.560784, blue: 1.000000, alpha: 1)    // #768FFF
+    static let signalStrengthColor = IconRGBA(red: 0.203922, green: 0.780392, blue: 0.349020, alpha: 1) // #34C759
+    static let batteryLevelColor = IconRGBA(red: 0.203922, green: 0.780392, blue: 0.349020, alpha: 1) // #34C759
 
     /// The recommended base colour for a metric (the default of the shared
     /// per-metric colour; used until the user picks a custom one).
@@ -245,6 +279,9 @@ struct HardwareRingColorConfiguration: Codable, Equatable, Hashable, Sendable {
         case .fan: fanColor
         case .downloadSpeed: downloadColor
         case .uploadSpeed: uploadColor
+        case .volume: volumeColor
+        case .wifiSignal: signalStrengthColor
+        case .batteryLevel: batteryLevelColor
         }
     }
 
@@ -295,6 +332,24 @@ struct HardwareRingConfiguration: Codable, Equatable, Hashable, Sendable {
 
     static let `default` = HardwareRingConfiguration()
 
+    /// Maps any CPU/GPU temperature metric to its usage counterpart. Used when
+    /// temperature monitoring is turned off so a saved ring selection cannot
+    /// keep pointing at an unreadable metric.
+    func replacingUnavailableTemperatures() -> HardwareRingConfiguration {
+        var copy = normalized()
+        copy.primaryMetric = copy.primaryMetric.withoutCPUGPUTemperature
+        copy.secondaryMetric = copy.secondaryMetric?.withoutCPUGPUTemperature
+        switch copy.topContent {
+        case .symbol(let metric):
+            copy.topContent = .symbol(metric.withoutCPUGPUTemperature)
+        case .value(let metric):
+            copy.topContent = .value(metric.withoutCPUGPUTemperature)
+        case .automatic, .batteryPercentage, .chargingIndicator, .hidden:
+            break
+        }
+        return copy.normalized()
+    }
+
     /// The top marker now offers only value or hidden. Legacy saved symbol /
     /// automatic choices migrate to a numeric value for the same metric so an
     /// upgrade never keeps drawing the unreadable menu-bar glyph.
@@ -305,7 +360,7 @@ struct HardwareRingConfiguration: Codable, Equatable, Hashable, Sendable {
             copy.topContent = .value(copy.primaryMetric)
         case let .symbol(metric):
             copy.topContent = .value(metric)
-        case .value, .hidden:
+        case .value, .hidden, .batteryPercentage, .chargingIndicator:
             break
         }
         return copy
@@ -399,6 +454,7 @@ extension HardwareMonitorMetric {
         case .cpuUsage, .gpuUsage, .memoryUsage: return true
         case .cpuTemperature, .gpuTemperature, .batteryTemperature, .fan: return false
         case .downloadSpeed, .uploadSpeed: return false
+        case .volume, .wifiSignal, .batteryLevel: return true
         }
     }
 }

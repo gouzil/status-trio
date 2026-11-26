@@ -52,12 +52,18 @@ struct IconSourceDemandBridge {
 }
 
 enum IconSourceDemandPolicy {
-    static func requiresAirPodsBattery(in configuration: IconConfigurationV1) -> Bool {
-        IconContentDependencyResolver.dependencies(configuration: configuration, targetIsAudio: false).requiresAirPodsBattery
+    static func requiresAirPodsBattery(in configuration: IconConfigurationV1,
+                                       bindings: IconSlotBindingsV1? = nil) -> Bool {
+        IconContentDependencyResolver.dependencies(
+            configuration: configuration, targetIsAudio: false, bindings: bindings
+        ).requiresAirPodsBattery
     }
 
-    static func requiresBluetoothMonitor(in configuration: IconConfigurationV1) -> Bool {
-        IconContentDependencyResolver.dependencies(configuration: configuration, targetIsAudio: false).requiresBluetoothMonitor
+    static func requiresBluetoothMonitor(in configuration: IconConfigurationV1,
+                                         bindings: IconSlotBindingsV1? = nil) -> Bool {
+        IconContentDependencyResolver.dependencies(
+            configuration: configuration, targetIsAudio: false, bindings: bindings
+        ).requiresBluetoothMonitor
     }
 
     struct HardwareRingDemands: Equatable {
@@ -68,14 +74,19 @@ enum IconSourceDemandPolicy {
     }
 
     /// Which hardware-metric demands the System Monitoring ring needs on each
-    /// surface. `nil` means "release that surface's demand". Driven purely by the
-    /// composition, the fallback source, and the icon placement.
+    /// surface. `nil` means "release that surface's demand". Driven by the
+    /// composition, the icon placement, and whether the hardware ring is the
+    /// source actually selected right now: a ring kept only as a fallback does
+    /// not sample until the fallback is on screen, and the always-available
+    /// hardware plugin makes that switch immediately observable.
     static func hardwareRingDemands(configuration: IconConfigurationV1,
-                                    placement: AppIconPlacement) -> HardwareRingDemands {
-        let composition = configuration.composition.outerRing
-        let usesHardware = composition.primary == .hardwareMonitor || composition.fallback == .hardwareMonitor
-        guard usesHardware else { return .none }
-        let metricIDs = Set(configuration.behaviors.hardwareRing.referencedMetrics.map(\.metricID))
+                                    placement: AppIconPlacement,
+                                    isHardwareRingSelected: Bool) -> HardwareRingDemands {
+        guard isHardwareRingSelected else { return .none }
+        let metricIDs = HardwareMetricDemandResolver.iconRingMetrics(
+            configuration: configuration.behaviors.hardwareRing
+        )
+        guard !metricIDs.isEmpty else { return .none }
         return HardwareRingDemands(
             menuBar: placement.showsMenuBarIcon ? metricIDs : nil,
             dock: placement.showsDockIcon ? metricIDs : nil

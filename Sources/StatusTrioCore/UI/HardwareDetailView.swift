@@ -11,6 +11,9 @@ struct HardwareDetailView: View {
     var previewHistory: [HardwareDetailHistoryPoint]? = nil
     /// Ring/card colours from settings; the chart uses the matching metric colour.
     var metricColors: [HardwareMonitorMetric: IconRGBA] = [:]
+    /// SSD ring colour; the disk page's usage bar and accent read this (SSD is
+    /// not a sampled metric, so it is not in `metricColors`).
+    var diskRingColor: IconRGBA = HardwareRingColorConfiguration.solidStateDriveColor
     /// The visible page's ranked list; nil keeps offscreen previews static.
     var topApps: TopAppsObservable? = nil
     /// User-editable broadband caps, used as the network chart's full scale.
@@ -18,6 +21,11 @@ struct HardwareDetailView: View {
     var uploadCapMbps: Double = SettingsStore.defaultHardwareUploadCapMbps
     /// When true the network chart scales to the caps instead of the window peak.
     var networkChartFixedScale: Bool = false
+    /// Detail-chart history window from the user's 1–5 minute setting.
+    var historyWindowSeconds: TimeInterval = HardwareDetailHistoryStore.window
+    /// Opens the system Activity Monitor from the header shortcut. Injectable so
+    /// tests can observe the tap without launching the app.
+    var openActivityMonitor: () -> Void = { ActivityMonitorShortcut.open() }
 
     @EnvironmentObject private var localization: Localization
     @StateObject private var history: HardwareDetailHistoryStore
@@ -25,32 +33,41 @@ struct HardwareDetailView: View {
     init(kind: HardwareDetailKind, hardware: HardwareMonitorObservable,
          onBack: @escaping () -> Void,
          metricColors: [HardwareMonitorMetric: IconRGBA] = [:],
+         diskRingColor: IconRGBA = HardwareRingColorConfiguration.solidStateDriveColor,
          topApps: TopAppsObservable? = nil,
          downloadCapMbps: Double = SettingsStore.defaultHardwareDownloadCapMbps,
          uploadCapMbps: Double = SettingsStore.defaultHardwareUploadCapMbps,
          networkChartFixedScale: Bool = false,
-         previewHistory: [HardwareDetailHistoryPoint]? = nil) {
+         historyWindowSeconds: TimeInterval = HardwareDetailHistoryStore.window,
+         previewHistory: [HardwareDetailHistoryPoint]? = nil,
+         openActivityMonitor: @escaping () -> Void = { ActivityMonitorShortcut.open() }) {
         self.kind = kind
         _hardware = ObservedObject(wrappedValue: hardware)
         self.onBack = onBack
         self.metricColors = metricColors
+        self.diskRingColor = diskRingColor
         self.topApps = topApps
         self.downloadCapMbps = downloadCapMbps
         self.uploadCapMbps = uploadCapMbps
         self.networkChartFixedScale = networkChartFixedScale
+        self.historyWindowSeconds = historyWindowSeconds
         self.previewHistory = previewHistory
+        self.openActivityMonitor = openActivityMonitor
         _history = StateObject(wrappedValue: HardwareDetailHistoryStore(seriesCount: kind.historySeriesCount,
-                                                                        seeded: previewHistory))
+                                                                        seeded: previewHistory,
+                                                                        historyWindow: historyWindowSeconds))
     }
 
-    private var snapshot: HardwareMetricsSnapshot { hardware.snapshot }
+    private var snapshot: HardwareMetricsSnapshot { hardware.panelSnapshot }
     private var now: Date { Date() }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             NavigationBackRow(accessibilityLabel: localization.string(.hardwareDetailBack),
                               title: localization.string(kind.titleKey),
-                              action: onBack)
+                              action: onBack) {
+                activityMonitorButton
+            }
             content
             if let topApps, let metric = kind.topAppMetric {
                 TopAppsListView(metric: metric, observable: topApps)
@@ -65,6 +82,19 @@ struct HardwareDetailView: View {
                           seedMetricIDs: kind.historyMetricIDs)
         }
         .onDisappear { history.stop() }
+    }
+
+    /// Header shortcut that opens the system Activity Monitor. Only the hardware
+    /// pages carry it; battery, Wi-Fi and other detail pages do not.
+    private var activityMonitorButton: some View {
+        Button(action: openActivityMonitor) {
+            PanelActionGlyph(systemName: "waveform.path.ecg", size: PanelSummaryActionMetrics.actionSlot)
+                .foregroundStyle(.secondary)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(localization.string(.hardwareDetailOpenActivityMonitor))
+        .accessibilityLabel(localization.string(.hardwareDetailOpenActivityMonitor))
     }
 
     @ViewBuilder
@@ -266,7 +296,7 @@ struct HardwareDetailView: View {
                     HardwareDetailRow(label: localization.string(.hardwareDetailTiler),
                                       value: HardwareDetailFormat.percent(detail?.tilerUtilization))
                     HardwareDetailRow(label: localization.string(.hardwareDetailGPUMemory),
-                                      value: HardwareDetailFormat.bytes(detail?.inUseSystemMemoryBytes))
+                                      value: HardwareDetailFormat.memoryBytes(detail?.inUseSystemMemoryBytes))
                     divider
                     HardwareDetailRow(label: localization.string(.hardwareDetailDevice),
                                       value: detail?.deviceName ?? HardwareDetailFormat.dash)
@@ -294,10 +324,10 @@ struct HardwareDetailView: View {
                     HardwareDetailProgressBar(fraction: (percent ?? 0) / 100, tint: accentColor)
                     HStack(spacing: 0) {
                         topMetric(localization.string(.hardwareDetailUsed),
-                                  HardwareDetailFormat.bytes(detail?.usedBytes))
+                                  HardwareDetailFormat.memoryBytes(detail?.usedBytes))
                         verticalDivider
                         topMetric(localization.string(.hardwareDetailTotal),
-                                  HardwareDetailFormat.bytes(detail?.totalBytes))
+                                  HardwareDetailFormat.memoryBytes(detail?.totalBytes))
                     }
                 }
             }
@@ -306,15 +336,15 @@ struct HardwareDetailView: View {
             HardwareDetailCard {
                 VStack(alignment: .leading, spacing: 6) {
                     HardwareDetailRow(label: localization.string(.hardwareDetailAppMemory),
-                                      value: HardwareDetailFormat.bytes(detail?.appBytes))
+                                      value: HardwareDetailFormat.memoryBytes(detail?.appBytes))
                     HardwareDetailRow(label: localization.string(.hardwareDetailWired),
-                                      value: HardwareDetailFormat.bytes(detail?.wiredBytes))
+                                      value: HardwareDetailFormat.memoryBytes(detail?.wiredBytes))
                     HardwareDetailRow(label: localization.string(.hardwareDetailCompressed),
-                                      value: HardwareDetailFormat.bytes(detail?.compressedBytes))
+                                      value: HardwareDetailFormat.memoryBytes(detail?.compressedBytes))
                     HardwareDetailRow(label: localization.string(.hardwareDetailCached),
-                                      value: HardwareDetailFormat.bytes(detail?.cachedBytes))
+                                      value: HardwareDetailFormat.memoryBytes(detail?.cachedBytes))
                     HardwareDetailRow(label: localization.string(.hardwareDetailSwapUsed),
-                                      value: HardwareDetailFormat.bytes(detail?.swapUsedBytes))
+                                      value: HardwareDetailFormat.memoryBytes(detail?.swapUsedBytes))
                     divider
                     HardwareDetailRow(label: localization.string(.hardwareDetailPressure),
                                       value: pressureText(detail?.pressure))
@@ -341,9 +371,11 @@ struct HardwareDetailView: View {
         return VStack(alignment: .leading, spacing: 12) {
             HStack(alignment: .top, spacing: 8) {
                 coloredMetricCard(title: localization.string(.hardwareDetailDownload),
-                                  value: HardwareDetailFormat.rate(download), color: .blue)
+                                  value: HardwareDetailFormat.rate(download),
+                                  color: metricColor(.downloadSpeed))
                 coloredMetricCard(title: localization.string(.hardwareDetailUpload),
-                                  value: HardwareDetailFormat.rate(upload), color: .green)
+                                  value: HardwareDetailFormat.rate(upload),
+                                  color: metricColor(.uploadSpeed))
             }
             trendCard(title: localization.string(.hardwareDetailSpeedTrend),
                       scale: .auto)
@@ -382,42 +414,36 @@ struct HardwareDetailView: View {
     }
 
     private var fanContent: some View {
-        let fans = fanItems()
-        let measured = fans.compactMap(\.rpm).filter { $0.isFinite }
-        let average = measured.isEmpty ? nil : measured.reduce(0, +) / Double(measured.count)
-        let isFanless = snapshot[.fanRPM(index: 0)].metadata.isFanless
+        let fan = FanDetailPresentation(snapshot: snapshot)
         return VStack(alignment: .leading, spacing: 12) {
             HardwareDetailCard {
                 HStack(spacing: 0) {
                     topMetric(localization.string(.hardwareDetailFanCount),
-                              HardwareDetailFormat.integer(fans.count))
+                              fan.fanCount.map { HardwareDetailFormat.integer($0) }
+                                  ?? HardwareDetailFormat.dash)
                     verticalDivider
                     topMetric(localization.string(.hardwareMonitorFanAverage),
-                              HardwareDetailFormat.rpm(average))
+                              HardwareDetailFormat.rpm(fan.averageRPM))
                 }
             }
-            if fans.isEmpty {
+            if fan.rows.isEmpty {
                 HardwareDetailCard {
-                    Text(localization.string(isFanless ? .hardwareMonitorFanless : .hardwareDetailFanUnavailable))
+                    Text(localization.string(fan.isFanless ? .hardwareMonitorFanless : .hardwareDetailFanUnavailable))
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
                 }
             } else {
-                fanCards(fans)
+                fanCards(fan.rows.map { row in
+                    FanItem(index: row.index,
+                            title: row.sensorLabel
+                                ?? String(format: localization.string(.hardwareDetailFanIndex), row.index + 1),
+                            rpm: row.rpm,
+                            maxRPM: row.maxRPM,
+                            availability: row.availability)
+                })
             }
             temperatureCard
         }
-    }
-
-    private func fanItems() -> [FanItem] {
-        snapshot.samples.compactMap { key, sample in
-            guard case .fanRPM(let index) = key else { return nil }
-            let name = sample.sensorLabel
-                ?? String(format: localization.string(.hardwareDetailFanIndex), index + 1)
-            return FanItem(index: index, title: name, rpm: sample.value,
-                           maxRPM: sample.metadata.maximum, availability: sample.availability)
-        }
-        .sorted { $0.index < $1.index }
     }
 
     @ViewBuilder
@@ -455,7 +481,7 @@ struct HardwareDetailView: View {
                     .monospacedDigit()
                     .opacity(fan.availability == .stale ? 0.5 : 1)
                 if let maxRPM = fan.maxRPM, maxRPM > 0 {
-                    HardwareDetailProgressBar(fraction: (fan.rpm ?? 0) / maxRPM, tint: .teal)
+                    HardwareDetailProgressBar(fraction: (fan.rpm ?? 0) / maxRPM, tint: metricColor(.fan))
                     Text("0 – \(Int(maxRPM.rounded())) RPM")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
@@ -488,49 +514,105 @@ struct HardwareDetailView: View {
     private var diskContent: some View {
         let detail = snapshot.diskDetail
         let capacity = detail?.capacity
-        // Fall back to the shared rate samples so entering the page (or a gap
-        // longer than the reader's 15 s baseline window) does not flash a dash.
-        let readSpeed = detail?.readBytesPerSecond ?? snapshot[.diskRead].value
-        let writeSpeed = detail?.writeBytesPerSecond ?? snapshot[.diskWrite].value
+        let volumes = detail?.volumes ?? []
+        let speeds = detail?.volumeSpeeds ?? [:]
         return VStack(alignment: .leading, spacing: 12) {
-            HardwareDetailCard {
-                VStack(alignment: .leading, spacing: 8) {
-                    HStack(alignment: .firstTextBaseline) {
-                        Text(localization.string(.hardwareDetailFreeSpace))
-                            .font(.subheadline).foregroundStyle(.secondary)
-                        Spacer(minLength: 8)
-                        Text(HardwareDetailFormat.bytes(capacity?.freeBytes))
-                            .font(.system(size: 22, weight: .semibold, design: .rounded))
-                            .monospacedDigit()
-                    }
-                    HardwareDetailProgressBar(fraction: capacity?.usedFraction ?? 0, tint: accentColor)
-                    HStack(spacing: 0) {
-                        topMetric(localization.string(.hardwareDetailTotal),
-                                  HardwareDetailFormat.bytes(capacity?.totalBytes))
-                        verticalDivider
-                        topMetric(localization.string(.hardwareDetailUsage),
-                                  HardwareDetailFormat.fractionPercent(capacity?.usedFraction))
-                    }
-                }
+            if volumes.isEmpty {
+                capacitySummaryCard(capacity)
+            } else {
+                volumeList(volumes, speeds: speeds)
             }
-            HardwareDetailCard {
-                VStack(alignment: .leading, spacing: 6) {
-                    HardwareDetailRow(label: localization.string(.hardwareDetailUsedSpace),
-                                      value: HardwareDetailFormat.bytes(capacity?.usedBytes))
-                    HardwareDetailRow(label: localization.string(.hardwareDetailFreeSpace),
-                                      value: HardwareDetailFormat.bytes(capacity?.freeBytes))
-                    HardwareDetailRow(label: localization.string(.hardwareDetailTotalSpace),
-                                      value: HardwareDetailFormat.bytes(capacity?.totalBytes))
-                    HardwareDetailRow(label: localization.string(.hardwareDetailFileSystem),
-                                      value: capacity?.fileSystem ?? HardwareDetailFormat.dash)
-                    divider
-                    HardwareDetailRow(label: localization.string(.hardwareDetailReadSpeed),
-                                      value: HardwareDetailFormat.rate(readSpeed))
-                    HardwareDetailRow(label: localization.string(.hardwareDetailWriteSpeed),
-                                      value: HardwareDetailFormat.rate(writeSpeed))
+        }
+    }
+
+    /// Fallback summary for hosts (and offscreen previews) where per-volume data
+    /// is unavailable; mirrors the old single-volume card.
+    private func capacitySummaryCard(_ capacity: DiskCapacityReading?) -> some View {
+        HardwareDetailCard {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(alignment: .firstTextBaseline) {
+                    Text(localization.string(.hardwareDetailFreeSpace))
+                        .font(.subheadline).foregroundStyle(.secondary)
+                    Spacer(minLength: 8)
+                    Text(HardwareDetailFormat.bytes(capacity?.freeBytes))
+                        .font(.system(size: 22, weight: .semibold, design: .rounded))
+                        .monospacedDigit()
+                }
+                HardwareDetailProgressBar(fraction: capacity?.usedFraction ?? 0, tint: accentColor)
+                HStack(spacing: 0) {
+                    topMetric(localization.string(.hardwareDetailTotal),
+                              HardwareDetailFormat.bytes(capacity?.totalBytes))
+                    verticalDivider
+                    topMetric(localization.string(.hardwareDetailUsage),
+                              HardwareDetailFormat.fractionPercent(capacity?.usedFraction))
                 }
             }
         }
+    }
+
+    /// Every mounted volume, one row each: name plus an external badge, the
+    /// available/total on the right, and a used-space bar tinted by free space.
+    private func volumeList(_ volumes: [DiskVolumeReading],
+                            speeds: [String: DiskThroughputReading]) -> some View {
+        HardwareDetailCard {
+            VStack(alignment: .leading, spacing: 12) {
+                ForEach(Array(volumes.enumerated()), id: \.element.id) { index, volume in
+                    volumeRow(volume, speed: speeds[volume.mountPath])
+                    if index < volumes.count - 1 { divider }
+                }
+            }
+        }
+    }
+
+    private func volumeRow(_ volume: DiskVolumeReading, speed: DiskThroughputReading?) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                Text(volume.name)
+                    .font(.system(size: 13, weight: .medium))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                if volume.isExternal {
+                    Text(localization.string(.hardwareDetailDiskExternal))
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(.secondary)
+                }
+                Spacer(minLength: 8)
+                Text(localization.format(.hardwareDetailDiskAvailable,
+                                         HardwareDetailFormat.bytes(volume.freeBytes),
+                                         HardwareDetailFormat.bytes(volume.totalBytes)))
+                    .font(.system(size: 12, weight: .medium, design: .rounded))
+                    .monospacedDigit()
+                    .foregroundStyle(volume.freeFraction <= 0.10 ? Color.red : Color.secondary)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.7)
+            }
+            HardwareDetailProgressBar(fraction: volume.usedFraction, tint: volumeTint(volume))
+            if let speed {
+                HStack(spacing: 10) {
+                    Label(HardwareDetailFormat.rate(speed.readBytesPerSecond), systemImage: "arrow.down")
+                        .labelStyle(.titleAndIcon)
+                    Label(HardwareDetailFormat.rate(speed.writeBytesPerSecond), systemImage: "arrow.up")
+                        .labelStyle(.titleAndIcon)
+                }
+                .font(.system(size: 10, weight: .regular, design: .rounded))
+                .monospacedDigit()
+                .foregroundStyle(.tertiary)
+                .accessibilityLabel(
+                    localization.string(.hardwareDetailReadSpeed) + " "
+                    + HardwareDetailFormat.rate(speed.readBytesPerSecond) + ", "
+                    + localization.string(.hardwareDetailWriteSpeed) + " "
+                    + HardwareDetailFormat.rate(speed.writeBytesPerSecond))
+            }
+        }
+        .accessibilityElement(children: .combine)
+    }
+
+    /// Free-space severity tint: red at 10% free or less, orange at 20% or less,
+    /// otherwise the user's disk accent colour so it matches the ring.
+    private func volumeTint(_ volume: DiskVolumeReading) -> Color {
+        if volume.freeFraction <= 0.10 { return .red }
+        if volume.freeFraction <= 0.20 { return .orange }
+        return accentColor
     }
 
     // MARK: - Shared pieces
@@ -576,8 +658,8 @@ struct HardwareDetailView: View {
         case .gpu: return [metricColor(.gpuUsage)]
         case .memory: return [metricColor(.memoryUsage)]
         case .network: return [metricColor(.downloadSpeed), metricColor(.uploadSpeed)]
-        case .disk: return [.orange, .purple]
-        case .fan: return [.teal]
+        case .disk: return [IconAppearanceColorConversion.color(from: diskRingColor)]
+        case .fan: return [metricColor(.fan)]
         }
     }
 
@@ -611,7 +693,8 @@ struct HardwareDetailView: View {
                 },
                 seriesMaximums: kind == .network && networkChartFixedScale
                     ? [downloadCapMbps * 125_000, uploadCapMbps * 125_000]
-                    : [])
+                    : [],
+                historyWindow: history.historyWindow)
             Text(title)
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
@@ -620,7 +703,7 @@ struct HardwareDetailView: View {
         }
         .frame(maxWidth: .infinity)
         .frame(height: 78, alignment: .topLeading)
-        .panelCardSurface(.silver(.connected), tint: .clear, cornerRadius: 13)
+        .hardwareMonitorCardSurface(.silver(.connected), cornerRadius: 13)
         .clipShape(RoundedRectangle(cornerRadius: 13, style: .continuous))
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(title)

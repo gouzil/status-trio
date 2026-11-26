@@ -39,7 +39,7 @@ for command in ruby gh shasum xmllint curl; do
 done
 
 SCHEMA_VERSION="$(manifest_value schema_version)"
-[[ "$SCHEMA_VERSION" == "1" ]] ||
+[[ "$SCHEMA_VERSION" == "1" || "$SCHEMA_VERSION" == "2" ]] ||
     die "unsupported manifest schema_version '$SCHEMA_VERSION'."
 
 SOURCE_SHA="$(manifest_value source_sha)"
@@ -57,6 +57,36 @@ RELEASE_BODY_FILE="$(manifest_value release.body_file)"
 RELEASE_NOTES_DIR="$(manifest_value release.notes_dir)"
 SIGNING_KIND="$(manifest_value signing.kind)"
 NOTARIZATION_STATUS="$(manifest_value notarization.status)"
+if [[ "$SCHEMA_VERSION" == "2" ]]; then
+    CANDIDATE_PUBLISHABLE="$(manifest_value candidate.publishable)"
+    CANDIDATE_SOURCE_SHA="$(manifest_value candidate.source_sha)"
+    CANDIDATE_BUILD_RUN_ID="$(manifest_value candidate.build_run_id)"
+    CANDIDATE_SIGNING_KIND="$(manifest_value signing.kind)"
+    VERIFICATION_LEVEL="$(manifest_value verification.level)"
+    VERIFICATION_STATUS="$(manifest_value verification.status)"
+    [[ "$CANDIDATE_PUBLISHABLE" == "true" ]] ||
+        die "candidate manifest is not publishable."
+    [[ "$CANDIDATE_SOURCE_SHA" == "$SOURCE_SHA" ]] ||
+        die "candidate.source_sha '$CANDIDATE_SOURCE_SHA' does not match source_sha '$SOURCE_SHA'."
+    [[ -n "$CANDIDATE_BUILD_RUN_ID" ]] ||
+        die "candidate.build_run_id is missing."
+    [[ "$CANDIDATE_SIGNING_KIND" == "developer_id" ]] ||
+        die "a release_candidate must be Developer ID signed."
+    [[ "$NOTARIZATION_STATUS" == "accepted_and_stapled" ]] ||
+        die "a release_candidate must be notarized and stapled."
+    case "$VERIFICATION_LEVEL" in
+        fast|strict) ;;
+        *) die "candidate verification.level '$VERIFICATION_LEVEL' is invalid." ;;
+    esac
+    case "$VERIFICATION_STATUS" in
+        passed|declared) ;;
+        *) die "candidate verification.status '$VERIFICATION_STATUS' is invalid." ;;
+    esac
+    if [[ "$VERIFICATION_LEVEL" == "strict" && "$VERIFICATION_STATUS" != "passed" ]]; then
+        die "a strict candidate must record verification.status=passed."
+    fi
+    echo "Publishing $VERIFICATION_LEVEL candidate built by run $CANDIDATE_BUILD_RUN_ID."
+fi
 TOOLCHAIN_RUNNER="$(manifest_value toolchain.runner)"
 TOOLCHAIN_XCODE="$(manifest_value toolchain.xcode)"
 TOOLCHAIN_SWIFT="$(manifest_value toolchain.swift)"
@@ -637,27 +667,48 @@ if [[ -n "$ZIP_FILENAME" ]]; then
     done
 fi
 
-PUBLIC_VERIFY_ATTEMPTS="${PUBLIC_VERIFY_ATTEMPTS:-6}"
+PUBLIC_VERIFY_ATTEMPTS="${PUBLIC_VERIFY_ATTEMPTS:-10}"
 PUBLIC_VERIFY_DELAY_SECONDS="${PUBLIC_VERIFY_DELAY_SECONDS:-5}"
 [[ "$PUBLIC_VERIFY_ATTEMPTS" =~ ^[1-9][0-9]*$ ]] ||
     die "PUBLIC_VERIFY_ATTEMPTS must be a positive integer."
 [[ "$PUBLIC_VERIFY_DELAY_SECONDS" =~ ^[0-9]+$ ]] ||
     die "PUBLIC_VERIFY_DELAY_SECONDS must be a non-negative integer."
 
-REMOTE_FEED="$TEMP_ROOT/public-appcast.xml"
+API_FEED="$TEMP_ROOT/api-appcast.xml"
+PUBLIC_FEED="$TEMP_ROOT/public-appcast.xml"
 PUBLIC_DMG_PATH="$TEMP_ROOT/public.dmg"
 PUBLIC_FEED_URL="https://raw.githubusercontent.com/$RELEASE_REPO/$RELEASE_BRANCH/$APPCAST_FILE"
 PUBLIC_DMG_SHA256=""
 PUBLIC_ERROR="$TEMP_ROOT/public-error.log"
+API_VERIFIED=false
 PUBLIC_VERIFIED=false
 
+# 1) Authenticated API confirmation. The contents API serves the just-pushed
+# commit immediately, so this answers "does the release metadata in GitHub match
+# the verified package?" It says nothing about what public clients can see.
+: > "$PUBLIC_ERROR"
+if gh api "$APPCAST_API_PATH?ref=$RELEASE_BRANCH" -H "Accept: application/vnd.github.raw" \
+        > "$API_FEED" 2>>"$PUBLIC_ERROR" &&
+    verify_appcast_item "$API_FEED" 2>>"$PUBLIC_ERROR"; then
+    API_VERIFIED=true
+fi
+if [[ "$API_VERIFIED" != "true" ]]; then
+    cat "$PUBLIC_ERROR" >&2
+    die "API verification failed: the authenticated appcast does not match the verified package."
+fi
+echo "API verification: PASS (authenticated appcast matches $TAG)."
+
+# 2) Client-facing public verification. The download URL and the raw update feed
+# are what users and Sparkle actually resolve, and the CDN can lag the push, so
+# retry with a bound. Never treat the API copy as proof that the public feed
+# propagated: report PASS only when both sides match.
 for ((attempt = 1; attempt <= PUBLIC_VERIFY_ATTEMPTS; attempt++)); do
     : > "$PUBLIC_ERROR"
     if curl -fsSL --connect-timeout 15 --max-time 300 "$DMG_URL" > "$PUBLIC_DMG_PATH" 2>"$PUBLIC_ERROR"; then
         PUBLIC_DMG_SHA256="$(file_sha256 "$PUBLIC_DMG_PATH")"
         if [[ "$PUBLIC_DMG_SHA256" == "$DMG_SHA256" ]] &&
-            curl -fsSL --connect-timeout 15 --max-time 300 "$PUBLIC_FEED_URL" > "$REMOTE_FEED" 2>>"$PUBLIC_ERROR" &&
-            verify_appcast_item "$REMOTE_FEED" 2>>"$PUBLIC_ERROR"; then
+            curl -fsSL --connect-timeout 15 --max-time 300 "$PUBLIC_FEED_URL" > "$PUBLIC_FEED" 2>>"$PUBLIC_ERROR" &&
+            verify_appcast_item "$PUBLIC_FEED" 2>>"$PUBLIC_ERROR"; then
             PUBLIC_VERIFIED=true
             break
         fi
@@ -669,10 +720,12 @@ for ((attempt = 1; attempt <= PUBLIC_VERIFY_ATTEMPTS; attempt++)); do
     fi
 done
 
-[[ "$PUBLIC_VERIFIED" == "true" ]] || {
+if [[ "$PUBLIC_VERIFIED" != "true" ]]; then
     cat "$PUBLIC_ERROR" >&2
+    echo "Public verification: UNCONFIRMED (API verified; public download or update feed still does not match)." >&2
     die "Public DMG or appcast did not match the verified package after $PUBLIC_VERIFY_ATTEMPTS attempts."
-}
+fi
+echo "Public verification: PASS (public download and update feed match the verified package)."
 
 echo "Published $TAG from source $SOURCE_SHA with package SHA-256 $DMG_SHA256."
 echo "Signing: $SIGNING_KIND; notarization: $NOTARIZATION_STATUS."

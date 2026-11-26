@@ -1,3 +1,4 @@
+import AppKit
 import Combine
 import CoreAudio
 import XCTest
@@ -26,6 +27,31 @@ final class StatusPanelViewModelTests: XCTestCase {
         XCTAssertFalse(fixture.store.wifiNetworks.isActive)
 
         panel.stop()
+    }
+
+    /// @Published emits in willSet, so the style sink must apply the emitted
+    /// value. Re-reading the property there left the SwiftUI card surface on the
+    /// previous style until the panel was reopened.
+    func testPanelBackgroundStyleAppliesToCardSurfaceWithoutReopen() throws {
+        let reduce = NSWorkspace.shared.accessibilityDisplayShouldReduceTransparency
+        guard !reduce else { throw XCTSkip("Reduce Transparency forces solid") }
+
+        let fixture = PanelStoreFixture()
+        let panel = fixture.makePanel()
+        defer { panel.stop(); fixture.store.stop() }
+        panel.start()
+
+        fixture.settings.panelBackgroundStyle = .classicMaterial
+        XCTAssertEqual(
+            panel.effectivePanelBackgroundStyle,
+            PanelBackgroundStyle.renderStyle(for: .classicMaterial, reduceTransparency: false),
+            "material applies live")
+
+        fixture.settings.panelBackgroundStyle = .solid
+        XCTAssertEqual(
+            panel.effectivePanelBackgroundStyle,
+            PanelBackgroundStyle.renderStyle(for: .solid, reduceTransparency: false),
+            "switching to solid must update the card surface without reopening the panel")
     }
 
     func testIrrelevantSettingChangeDoesNotRemapThePanel() async throws {
@@ -928,6 +954,117 @@ final class StatusPanelViewModelTests: XCTestCase {
             await Task.yield()
         }
         return condition()
+    }
+
+    func testSliderColorOnlyChangeInvalidatesTheOpenPanel() {
+        let fixture = PanelStoreFixture()
+        let panel = fixture.makePanel()
+        panel.start()
+        defer { panel.stop(); fixture.store.stop() }
+
+        var panelChanges = 0
+        let observation = panel.objectWillChange.sink { panelChanges += 1 }
+        defer { observation.cancel() }
+        let custom = PanelLevelSliderColorSelection.custom(.white)
+
+        fixture.settings.panelLevelSliderColor = custom
+        XCTAssertEqual(panelChanges, 1, "a new slider color must update the panel immediately")
+
+        fixture.settings.panelLevelSliderColor = custom
+        XCTAssertEqual(panelChanges, 1, "an unchanged color must not invalidate the panel again")
+
+        fixture.settings.panelLevelSliderColor = .automatic
+        XCTAssertEqual(panelChanges, 2, "resetting the color must also update the panel immediately")
+    }
+
+    func testSliderThicknessSettingMirrorsIntoPanelModel() {
+        let fixture = PanelStoreFixture()
+        let panel = fixture.makePanel()
+        defer { panel.stop(); fixture.store.stop() }
+        panel.start()
+
+        XCTAssertFalse(panel.panelLevelSliderMatchesBrightnessThickness)
+        fixture.settings.panelLevelSliderMatchesBrightnessThickness = true
+        XCTAssertTrue(panel.panelLevelSliderMatchesBrightnessThickness)
+    }
+
+    /// The Settings switch drives the two weight tiers; the panel model must
+    /// mirror both so the environment values reach every panel view.
+    func testPanelTextWeightSettingsMirrorIntoPanelModel() throws {
+        let fixture = PanelStoreFixture()
+        let panel = fixture.makePanel()
+        defer { panel.stop(); fixture.store.stop() }
+        panel.start()
+
+        XCTAssertFalse(panel.statusPanelBoldTextEnabled)
+
+        fixture.settings.applyPanelBoldTextToggle(true)
+        XCTAssertTrue(panel.statusPanelBoldTextEnabled)
+        XCTAssertTrue(panel.statusPanelMediumTextEnabled)
+
+        fixture.settings.applyPanelBoldTextToggle(false)
+        XCTAssertFalse(panel.statusPanelBoldTextEnabled)
+        XCTAssertFalse(panel.statusPanelMediumTextEnabled)
+    }
+}
+
+/// Issue #369: clicking the *same* detail entry again closes that detail page
+/// (the side panel) while the main panel stays open; a different entry still
+/// switches pages.
+@MainActor
+struct DetailEntryToggleDismissTests {
+    @Test func clickingOpenHardwareEntryAgainClosesDetailToSummary() {
+        let fixture = PanelStoreFixture()
+        fixture.settings.setPopupSection(.hardwareMonitor, enabled: true)
+        let panel = fixture.makePanel()
+        defer { panel.stop(); fixture.store.stop() }
+
+        panel.showHardwareDetail(.cpu)
+        #expect(panel.route == .hardwareDetail(.cpu))
+
+        panel.showHardwareDetail(.cpu)
+        #expect(panel.route == .summary)
+
+        // After closing, a different hardware card still switches pages.
+        panel.showHardwareDetail(.memory)
+        #expect(panel.route == .hardwareDetail(.memory))
+    }
+
+    @Test func clickingOpenBatteryEntryAgainClosesDetailToSummary() {
+        let fixture = PanelStoreFixture()
+        let panel = fixture.makePanel()
+        defer { panel.stop(); fixture.store.stop() }
+
+        panel.showBatteryPage()
+        #expect(panel.route == .battery)
+        panel.showBatteryPage()
+        #expect(panel.route == .summary)
+    }
+
+    @Test func clickingOpenWiFiEntryAgainClosesDetailButWiredIsASwitch() {
+        let fixture = PanelStoreFixture()
+        let panel = fixture.makePanel()
+        defer { panel.stop(); fixture.store.stop() }
+
+        panel.showWiFiPage(showsDetailsInitially: true)
+        #expect(panel.route == .wifi)
+        panel.showWiFiPage(showsDetailsInitially: true)
+        #expect(panel.route == .summary)
+
+        panel.showWiredPage()
+        #expect(panel.route == .ethernet)
+    }
+
+    @Test func clickingOpenInputSourceEntryAgainClosesDetailToSummary() {
+        let fixture = PanelStoreFixture()
+        fixture.settings.setPopupSection(.inputSource, enabled: true)
+        let panel = fixture.makePanel()
+        defer { panel.stop(); fixture.store.stop() }
+
+        panel.showInputSourcePage()
+        #expect(panel.route == .inputSource)
+        panel.showInputSourcePage()
+        #expect(panel.route == .summary)
     }
 }
 

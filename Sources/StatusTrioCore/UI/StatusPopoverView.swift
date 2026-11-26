@@ -42,6 +42,18 @@ struct StatusPopoverView: View {
     var contentMeasurementID: UUID? = nil
     var host: Host = .primary
 
+    /// Fill colour of the panel's level sliders, from General settings (#359).
+    /// `.automatic` follows the label colour (white on a dark panel, black on a
+    /// light one) instead of pinning a fixed value.
+    private var levelSliderFillColor: Color {
+        switch panel.panelLevelSliderColor {
+        case .automatic:
+            return .primary
+        case let .custom(color):
+            return IconAppearanceColorConversion.color(from: color)
+        }
+    }
+
     var body: some View {
         // One scroll surface for every route (#237). The area measures the page
         // at its natural height and only scrolls once the screen budget cannot
@@ -160,10 +172,20 @@ struct StatusPopoverView: View {
                                    hardware: panel.hardwareMonitor,
                                    onBack: { panel.showSummaryPage() },
                                    metricColors: panel.hardwareMonitorMetricColors,
+                                   diskRingColor: panel.hardwareDiskRingColor,
                                    topApps: panel.showsHardwareTopApps ? panel.topApps : nil,
                                    downloadCapMbps: panel.settings.hardwareDownloadCapMbps,
                                    uploadCapMbps: panel.settings.hardwareUploadCapMbps,
-                                   networkChartFixedScale: panel.settings.hardwareNetworkChartFixedScale)
+                                   networkChartFixedScale: panel.settings.hardwareNetworkChartFixedScale,
+                                   historyWindowSeconds: panel.settings.hardwareHistoryWindowSeconds)
+                    // Key the detail page by its kind. The detail window is a
+                    // long-lived host that only swaps `kind` when the user picks
+                    // another metric card in alongside mode, so without a fresh
+                    // identity SwiftUI reuses the previous page's
+                    // `HardwareDetailHistoryStore` (its points, provider and
+                    // series count), painting the other metric's values onto the
+                    // new 0–100% axis. A distinct id forces a clean rebuild.
+                    .id(kind)
         }
     }
 
@@ -292,7 +314,6 @@ struct StatusPopoverView: View {
                 listOptions: panel.settings.bluetoothDeviceListOptions,
                 showsRadioPowerControl: panel.settings.showsBluetoothPowerControl,
                 showsBluetoothInStatusPanel: panel.settings.enabledPopupSections.contains(.bluetooth),
-                bluetoothIconColor: panel.settings.bluetoothIconColor,
                 listeningModePresentations: panel.settings.showsBluetoothListeningMode
                     ? panel.store.bluetoothListeningModes.huaweiBluetoothRowPresentations
                     : [:],
@@ -310,21 +331,26 @@ struct StatusPopoverView: View {
                 model: panel.volumeControl,
                 actions: panel.actions,
                 scrollTargets: scrollTargets,
-                onOpenSoundSettings: openSoundSettings
+                onOpenSoundSettings: openSoundSettings,
+                fillColor: levelSliderFillColor,
+                matchesBrightnessThickness: panel.panelLevelSliderMatchesBrightnessThickness
             )
         case .brightness:
             BrightnessControlsView(
                 state: panel.brightness,
                 actions: panel.actions,
                 scrollTargets: scrollTargets,
-                onOpenDisplaySettings: openDisplaySettings
+                onOpenDisplaySettings: openDisplaySettings,
+                fillColor: levelSliderFillColor
             )
         case .audioInput:
             AudioInputControlsView(
                 state: panel.audioInput,
                 actions: panel.actions,
                 scrollTargets: scrollTargets,
-                onOpenSoundSettings: openSoundInputSettings
+                onOpenSoundSettings: openSoundInputSettings,
+                fillColor: levelSliderFillColor,
+                matchesBrightnessThickness: panel.panelLevelSliderMatchesBrightnessThickness
             )
         case .inputSource:
             InputSourceStatusView(
@@ -338,12 +364,21 @@ struct StatusPopoverView: View {
             // the ring colours; the summary no longer depends on card metrics.
             HardwareMonitorSummaryView(model: panel.hardwareMonitor,
                                        metricColors: panel.hardwareMonitorMetricColors,
+                                       diskColor: panel.hardwareDiskRingColor,
                                        showsRings: panel.showsHardwareRings,
                                        showsSummaryRow: panel.showsHardwareSummaryRow,
                                        onOpenHardwareDetail: { panel.showHardwareDetail($0) },
                                        ringSlots: HardwareRingSlot.allCases.filter {
                                            panel.enabledHardwareRingSlots.contains($0)
                                        },
+                                       memoryRingDisplayMode: panel.memoryRingDisplayMode,
+                                       ssdRingDisplayMode: panel.ssdRingDisplayMode,
+                                       ssdIncludeExternalInPercent: panel.hardwareSSDIncludeExternalInPercent,
+                                       ssdSelectedExternalPaths: panel.hardwareSSDExternalVolumePaths,
+                                       cpuRingCenterContent: panel.cpuRingCenterContent,
+                                       gpuRingCenterContent: panel.gpuRingCenterContent,
+                                       hardwareTemperatureMonitoringEnabled: panel.hardwareTemperatureMonitoringEnabled,
+                                       hardwareRingSplitGapProgress: panel.hardwareRingSplitGapProgress,
                                        summaryMetrics: panel.enabledHardwareSummaryMetrics)
         }
     }

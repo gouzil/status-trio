@@ -23,13 +23,22 @@ final class HardwareRingConfigurationTests: XCTestCase {
 
     func testTopContentTaggedCoding() throws {
         let cases: [HardwareRingTopContent] = [
-            .automatic, .hidden, .symbol(.gpuUsage), .value(.fan)
+            .automatic, .hidden, .symbol(.gpuUsage), .value(.fan),
+            .batteryPercentage, .chargingIndicator
         ]
         for content in cases {
             let data = try JSONEncoder().encode(content)
             let decoded = try JSONDecoder().decode(HardwareRingTopContent.self, from: data)
             XCTAssertEqual(decoded, content)
         }
+    }
+
+    func testBatteryTopContentNeedsNoMetricButUsesBattery() {
+        XCTAssertNil(HardwareRingTopContent.batteryPercentage.referencedMetric)
+        XCTAssertNil(HardwareRingTopContent.chargingIndicator.referencedMetric)
+        XCTAssertTrue(HardwareRingTopContent.batteryPercentage.usesBatteryStatus)
+        XCTAssertTrue(HardwareRingTopContent.chargingIndicator.usesBatteryStatus)
+        XCTAssertFalse(HardwareRingTopContent.value(.cpuUsage).usesBatteryStatus)
     }
 
     func testMissingFieldsDecodeToDefaults() throws {
@@ -141,5 +150,70 @@ extension HardwareRingConfigurationTests {
 
         let value = HardwareRingConfiguration(layout: .single, topContent: .value(.cpuTemperature))
         XCTAssertEqual(value.migratingLegacyTopIcon().topContent, .value(.cpuTemperature))
+    }
+
+    func testTopMarkerOnlyMetricsAreNotCardMetricsAndRoundTrip() throws {
+        XCTAssertTrue(HardwareMonitorMetric.volume.usesStatusSnapshot)
+        XCTAssertTrue(HardwareMonitorMetric.wifiSignal.usesStatusSnapshot)
+        XCTAssertFalse(HardwareMonitorMetric.cpuUsage.usesStatusSnapshot)
+        XCTAssertFalse(HardwareMonitorMetric.defaultCardMetrics.contains(.volume))
+        XCTAssertFalse(HardwareMonitorMetric.defaultCardMetrics.contains(.wifiSignal))
+        XCTAssertEqual(HardwareMonitorMetric.volume.metricID, HardwareMetricID.volume)
+        XCTAssertEqual(HardwareMonitorMetric.wifiSignal.metricID, HardwareMetricID.wifiSignal)
+
+        for metric in [HardwareMonitorMetric.volume, .wifiSignal] {
+            let content = HardwareRingTopContent.value(metric)
+            let data = try JSONEncoder().encode(content)
+            XCTAssertEqual(try JSONDecoder().decode(HardwareRingTopContent.self, from: data), content)
+        }
+    }
+
+    func testBatteryLevelIsAPercentageArcMetric() {
+        XCTAssertTrue(HardwareMonitorMetric.batteryLevel.isPercentageMetric)
+        XCTAssertTrue(HardwareMonitorMetric.batteryLevel.usesStatusSnapshot)
+        XCTAssertEqual(HardwareMonitorMetric.batteryLevel.metricID, .batteryLevel)
+        let options = HardwareMetricRingOptions.default(for: .batteryLevel)
+            .normalized(for: .batteryLevel)
+        XCTAssertEqual(options.displayMinimum, 0)
+        XCTAssertEqual(options.displayMaximum, 100)
+    }
+
+    func testBatteryLevelIsOfferedInTheArcMenu() {
+        XCTAssertTrue(HardwareMonitorMetric.otherArcMetrics.contains(.batteryLevel))
+    }
+
+    func testBatteryLevelColorIsNotEditableInTheCustomRing() {
+        XCTAssertFalse(HardwareMonitorMetric.colorEditableArcMetrics.contains(.batteryLevel))
+        XCTAssertTrue(HardwareMonitorMetric.colorEditableArcMetrics.contains(.memoryUsage))
+    }
+
+    func testReplacingUnavailableTemperaturesFallsBackToUsageEverywhere() {
+        let configuration = HardwareRingConfiguration(
+            layout: .dual,
+            primaryMetric: .cpuTemperature,
+            secondaryMetric: .gpuTemperature,
+            topContent: .value(.gpuTemperature))
+        let replaced = configuration.replacingUnavailableTemperatures()
+        XCTAssertEqual(replaced.primaryMetric, .cpuUsage)
+        XCTAssertEqual(replaced.secondaryMetric, .gpuUsage)
+        XCTAssertEqual(replaced.topContent, .value(.gpuUsage))
+    }
+
+    func testReplacingUnavailableTemperaturesAvoidsDuplicatePrimaryMetric() {
+        let configuration = HardwareRingConfiguration(
+            layout: .dual,
+            primaryMetric: .cpuUsage,
+            secondaryMetric: .cpuTemperature,
+            topContent: .value(.cpuUsage))
+        let replaced = configuration.replacingUnavailableTemperatures()
+        XCTAssertEqual(replaced.primaryMetric, .cpuUsage)
+        XCTAssertEqual(replaced.secondaryMetric, .gpuUsage,
+                       "the duplicate CPU usage must normalize to a distinct metric")
+    }
+
+    func testReplacingUnavailableTemperaturesLeavesOtherMetricsAlone() {
+        let configuration = HardwareRingConfiguration(
+            layout: .single, primaryMetric: .memoryUsage, topContent: .symbol(.fan))
+        XCTAssertEqual(configuration.replacingUnavailableTemperatures(), configuration)
     }
 }

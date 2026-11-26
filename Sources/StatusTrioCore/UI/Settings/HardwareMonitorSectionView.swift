@@ -7,16 +7,78 @@ import SwiftUI
 struct HardwareMonitorSectionView: View {
     @ObservedObject var store: SettingsStore
     @EnvironmentObject private var localization: Localization
+    /// External volumes detected when the pane appears, for the SSD external
+    /// picker. Loaded once here rather than on every body evaluation.
+    @State private var externalVolumes: [DiskVolumeReading] = []
 
     var body: some View {
         SettingsPage {
             placementGroup
-            refreshGroup
+            samplingGroup
             networkCapGroup
+            temperatureMonitoringGroup
             ringGroup
+            if store.showsHardwareRings { ringValueGroup }
+            if store.showsHardwareRings { externalDiskGroup }
             bottomBarGroup
             colorGroup
+            advancedThresholdGroup
         }
+        .onAppear { externalVolumes = DiskCapacityReader.externalVolumes() }
+    }
+
+    /// SSD external-drive statistics: whether the ring percentage pools the
+    /// ticked external volumes, and which external volumes are ticked. Ticked
+    /// volumes feed the small external total under the SSD ring.
+    private var externalDiskGroup: some View {
+        SettingsGroup(
+            localization.string(.hardwareMonitorExternalDiskGroup),
+            footnote: localization.string(.hardwareMonitorExternalDiskListDescription)
+        ) {
+            SettingsToggleRow(
+                symbol: "externaldrive",
+                tint: .teal,
+                title: localization.string(.hardwareMonitorIncludeExternalInPercent),
+                subtitle: localization.string(.hardwareMonitorIncludeExternalInPercentDescription),
+                isOn: $store.hardwareSSDIncludeExternalInPercent
+            )
+            SettingsDivider()
+            if externalVolumes.isEmpty {
+                SettingsRow(title: localization.string(.hardwareMonitorExternalDiskEmpty)) {
+                    EmptyView()
+                }
+            } else {
+                ForEach(Array(externalVolumes.enumerated()), id: \.element.id) { index, volume in
+                    SettingsRow(
+                        "externaldrive",
+                        tint: .teal,
+                        title: volume.name,
+                        subtitle: localization.format(.hardwareDetailDiskAvailable,
+                                                      HardwareDetailFormat.bytes(volume.freeBytes),
+                                                      HardwareDetailFormat.bytes(volume.totalBytes))
+                    ) {
+                        Toggle("", isOn: Binding(
+                            get: { store.hardwareSSDExternalVolumePaths.contains(volume.mountPath) },
+                            set: { store.setHardwareSSDExternalVolume(path: volume.mountPath, included: $0) }
+                        ))
+                        .toggleStyle(.checkbox)
+                        .labelsHidden()
+                    }
+                    if index < externalVolumes.count - 1 { SettingsDivider() }
+                }
+            }
+        }
+    }
+
+    /// Advanced per-metric settings (warning/critical thresholds, display range,
+    /// speed cap) for every hardware metric, mirroring the ring's advanced group.
+    private var advancedThresholdGroup: some View {
+        HardwareMetricAdvancedGroup(
+            store: store,
+            metrics: HardwareMonitorMetric.allCases.filter { !$0.usesStatusSnapshot },
+            title: .settingsHardwareRingGroupAdvanced,
+            showsReset: true
+        )
     }
 
     private var placementGroup: some View {
@@ -37,21 +99,47 @@ struct HardwareMonitorSectionView: View {
         }
     }
 
-    private var refreshGroup: some View {
-        SettingsGroup {
+    /// Sampling cadence and how much history survives while the panel is
+    /// closed. Grouped together because they trade freshness against readings.
+    private var samplingGroup: some View {
+        SettingsGroup(
+            localization.string(.hardwareMonitorSettingsGroupSampling),
+            footnote: localization.string(.hardwareMonitorSettingsGroupSamplingFootnote)
+        ) {
+            ForEach(HardwareRefreshGroup.allCases, id: \.self) { group in
+                SettingsRow(
+                    "speedometer",
+                    tint: .blue,
+                    title: localization.string(group.titleKey),
+                    subtitle: nil
+                ) {
+                    Picker(localization.string(group.titleKey),
+                           selection: Binding(
+                            get: { store.hardwareRefreshSeconds(for: group) },
+                            set: { setHardwareRefresh(group, $0) })) {
+                        ForEach(group.options, id: \.self) { seconds in
+                            Text(localization.format(.hardwareMonitorBackgroundSeconds, seconds))
+                                .tag(seconds)
+                        }
+                    }
+                    .labelsHidden()
+                    .settingsMenuPickerWidth()
+                }
+                SettingsDivider()
+            }
             SettingsRow(
-                "speedometer",
-                tint: .blue,
-                title: localization.string(.hardwareMonitorSettingsPanelRefresh),
-                subtitle: localization.string(.hardwareMonitorSettingsPanelRefreshDescription)
+                "chart.line.uptrend.xyaxis",
+                tint: .teal,
+                title: localization.string(.hardwareMonitorSettingsHistoryWindow),
+                subtitle: localization.string(.hardwareMonitorSettingsHistoryWindowDescription)
             ) {
-                Picker(localization.string(.hardwareMonitorSettingsPanelRefresh),
+                Picker(localization.string(.hardwareMonitorSettingsHistoryWindow),
                        selection: Binding(
-                        get: { store.hardwarePanelRefreshSeconds },
-                        set: { store.hardwarePanelRefreshSeconds = $0 })) {
-                    ForEach(SettingsStore.hardwarePanelRefreshOptions, id: \.self) { seconds in
-                        Text(localization.format(.hardwareMonitorBackgroundSeconds, seconds))
-                            .tag(seconds)
+                        get: { store.hardwareHistoryWindowMinutes },
+                        set: { store.hardwareHistoryWindowMinutes = $0 })) {
+                    ForEach(SettingsStore.hardwareHistoryWindowOptions, id: \.self) { minutes in
+                        Text(localization.format(.hardwareMonitorHistoryWindowMinutes, minutes))
+                            .tag(minutes)
                     }
                 }
                 .labelsHidden()
@@ -79,6 +167,39 @@ struct HardwareMonitorSectionView: View {
                     set: { store.showsHardwareTopApps = $0 }
                 )
             )
+
+            SettingsDivider()
+            SettingsRow(
+                "timer",
+                tint: .orange,
+                title: localization.string(.hardwareMonitorSettingsRefreshTopApps),
+                subtitle: localization.string(.hardwareMonitorSettingsRefreshTopAppsDescription)
+            ) {
+                Picker(localization.string(.hardwareMonitorSettingsRefreshTopApps),
+                       selection: Binding(
+                        get: { store.hardwareTopAppsRefreshSeconds },
+                        set: { store.hardwareTopAppsRefreshSeconds = $0 })) {
+                    ForEach(SettingsStore.hardwareTopAppsRefreshOptions, id: \.self) { seconds in
+                        Text(localization.format(.hardwareMonitorBackgroundSeconds, seconds))
+                            .tag(seconds)
+                    }
+                }
+                .labelsHidden()
+                .settingsMenuPickerWidth()
+            }
+        }
+    }
+
+    /// Writes one group's cadence back through its published setter so the panel
+    /// and background providers pick the new value up.
+    private func setHardwareRefresh(_ group: HardwareRefreshGroup, _ seconds: Int) {
+        switch group {
+        case .cpuUsage: store.hardwareCPUUsageRefreshSeconds = seconds
+        case .gpuUsage: store.hardwareGPUUsageRefreshSeconds = seconds
+        case .memory: store.hardwareMemoryRefreshSeconds = seconds
+        case .network: store.hardwareNetworkRefreshSeconds = seconds
+        case .temperature: store.hardwareTemperatureRefreshSeconds = seconds
+        case .disk: store.hardwareDiskRefreshSeconds = seconds
         }
     }
 
@@ -91,7 +212,7 @@ struct HardwareMonitorSectionView: View {
                 "arrow.down",
                 tint: .blue,
                 title: localization.string(.hardwareDetailDownload),
-                subtitle: nil
+                subtitle: localization.string(.hardwareMonitorSpeedCapDescription)
             ) {
                 HardwareCapField(
                     value: Binding(
@@ -104,7 +225,7 @@ struct HardwareMonitorSectionView: View {
                 "arrow.up",
                 tint: .green,
                 title: localization.string(.hardwareDetailUpload),
-                subtitle: nil
+                subtitle: localization.string(.hardwareMonitorSpeedCapDescription)
             ) {
                 HardwareCapField(
                     value: Binding(
@@ -130,7 +251,7 @@ struct HardwareMonitorSectionView: View {
         SettingsGroup(localization.string(.hardwareMonitorSettingsColorTitle)) {
             SettingsCustomRow {
                 VStack(spacing: 0) {
-                    ForEach(Array(colorMetricGroups.enumerated()), id: \.offset) { groupIndex, group in
+                    ForEach(Array(colorGroups.enumerated()), id: \.offset) { groupIndex, group in
                         if groupIndex > 0 { SettingsDivider() }
                         Text(group.title)
                             .font(.system(size: 11, weight: .semibold))
@@ -138,19 +259,19 @@ struct HardwareMonitorSectionView: View {
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .padding(.top, 8)
                             .padding(.bottom, 2)
-                        ForEach(Array(group.options.enumerated()), id: \.element) { rowIndex, metric in
+                        ForEach(Array(group.options.enumerated()), id: \.element) { rowIndex, row in
                             if rowIndex > 0 { SettingsDivider() }
                             HStack(alignment: .center, spacing: 8) {
-                                HardwareMetricSymbolView(symbol: metric.systemImage, box: 20, glyph: 14)
-                                Text(localization.string(metric.titleKey))
+                                HardwareMetricSymbolView(symbol: row.symbol, box: 20, glyph: 14)
+                                Text(localization.string(row.titleKey))
                                     .font(.system(size: 13))
                                     .frame(maxWidth: .infinity, alignment: .leading)
                                 IconDesignerColorWell(
-                                    selection: colorBinding(for: metric),
+                                    selection: colorBinding(for: row),
                                     onEditingChanged: { _ in }
                                 )
                                 .frame(width: 40, height: 20)
-                                .accessibilityLabel(localization.string(metric.titleKey))
+                                .accessibilityLabel(localization.string(row.titleKey))
                             }
                             .padding(.vertical, 6)
                         }
@@ -162,8 +283,10 @@ struct HardwareMonitorSectionView: View {
             HStack {
                 Button(localization.string(.hardwareMonitorSettingsResetColors)) {
                     store.hardwareMonitorMetricColors = [:]
+                    store.hardwareDiskRingColor = HardwareRingColorConfiguration.solidStateDriveColor
                 }
-                .disabled(store.hardwareMonitorMetricColors.isEmpty)
+                .disabled(store.hardwareMonitorMetricColors.isEmpty
+                          && store.hardwareDiskRingColor == HardwareRingColorConfiguration.solidStateDriveColor)
                 Spacer()
             }
             .padding(.leading, SettingsMetrics.dividerInset)
@@ -172,21 +295,51 @@ struct HardwareMonitorSectionView: View {
         }
     }
 
-    private var colorMetricGroups: [(title: String, options: [HardwareMonitorMetric])] {
+    /// One colour row in the monitor colour group. SSD (disk capacity) is not a
+    /// sampled `HardwareMonitorMetric`, so it is a distinct case alongside the
+    /// metric-backed rows.
+    private enum ColorRow: Hashable {
+        case metric(HardwareMonitorMetric)
+        case disk
+
+        var symbol: String {
+            switch self {
+            case .metric(let metric): metric.systemImage
+            case .disk: "internaldrive"
+            }
+        }
+
+        var titleKey: LocalizationKey {
+            switch self {
+            case .metric(let metric): metric.titleKey
+            case .disk: .hardwareMonitorSettingsItemDiskCapacity
+            }
+        }
+    }
+
+    private var colorGroups: [(title: String, options: [ColorRow])] {
         [
-            ("CPU", [.cpuUsage, .cpuTemperature]),
-            ("GPU", [.gpuUsage, .gpuTemperature]),
+            ("CPU", [.metric(.cpuUsage), .metric(.cpuTemperature)]),
+            ("GPU", [.metric(.gpuUsage), .metric(.gpuTemperature)]),
             (localization.string(.settingsHardwareRingGroupOther),
-             [.memoryUsage, .batteryTemperature, .fan, .downloadSpeed, .uploadSpeed])
+             HardwareMonitorMetric.colorEditableArcMetrics.map { ColorRow.metric($0) } + [.disk])
         ]
     }
 
     /// The shared metric colour, editable here and in the ring's colour rows.
-    private func colorBinding(for metric: HardwareMonitorMetric) -> Binding<Color> {
-        Binding(
-            get: { IconAppearanceColorConversion.color(from: store.hardwareColor(for: metric)) },
-            set: { store.setHardwareColor(IconAppearanceColorConversion.iconRGBA(from: $0), for: metric) }
-        )
+    private func colorBinding(for row: ColorRow) -> Binding<Color> {
+        switch row {
+        case .metric(let metric):
+            return Binding(
+                get: { IconAppearanceColorConversion.color(from: store.hardwareColor(for: metric)) },
+                set: { store.setHardwareColor(IconAppearanceColorConversion.iconRGBA(from: $0), for: metric) }
+            )
+        case .disk:
+            return Binding(
+                get: { IconAppearanceColorConversion.color(from: store.hardwareDiskRingColor) },
+                set: { store.hardwareDiskRingColor = IconAppearanceColorConversion.iconRGBA(from: $0).normalized() }
+            )
+        }
     }
 
     private var ringGroup: some View {
@@ -213,7 +366,95 @@ struct HardwareMonitorSectionView: View {
                         )
                     }
                 }
+                SettingsDivider()
+                SettingsToggleRow(
+                    symbol: "circle.lefthalf.filled",
+                    tint: .blue,
+                    title: localization.string(.hardwareMonitorSettingsSplitGapProgress),
+                    subtitle: localization.string(.hardwareMonitorSettingsSplitGapProgressDescription),
+                    isOn: $store.hardwareRingSplitGapProgress
+                )
             }
+        }
+    }
+
+    /// RAM and SSD ring value semantics, independent because a user may want
+    /// remaining memory but consumed disk (or the reverse).
+    private var ringValueGroup: some View {
+        SettingsGroup(
+            localization.string(.hardwareMonitorRingValueGroup),
+            footnote: localization.string(.hardwareMonitorRingValueGroupDescription)
+        ) {
+            ringCenterRow(title: localization.string(.hardwareMonitorRingCenterCPU),
+                          symbol: "cpu", tint: .blue,
+                          selection: Binding(
+                            get: {
+                                store.hardwareTemperatureMonitoringEnabled
+                                    ? store.cpuRingCenterContent : .frequency
+                            },
+                            set: { store.cpuRingCenterContent = $0 }),
+                          options: store.hardwareTemperatureMonitoringEnabled
+                              ? HardwareRingCenterContent.allCases : [.frequency])
+            SettingsDivider()
+            ringCenterRow(title: localization.string(.hardwareMonitorRingCenterGPU),
+                          symbol: "cpu", tint: .purple,
+                          selection: Binding(get: { store.gpuRingCenterContent },
+                                             set: { store.gpuRingCenterContent = $0 }),
+                          options: [.temperature])
+            SettingsDivider()
+            ringValueRow(title: localization.string(.hardwareMonitorMemory),
+                         symbol: "memorychip", tint: .purple,
+                         selection: Binding(get: { store.memoryRingDisplayMode },
+                                            set: { store.memoryRingDisplayMode = $0 }))
+            SettingsDivider()
+            ringValueRow(title: localization.string(.hardwareMonitorRingValueSSD),
+                         symbol: "internaldrive", tint: .teal,
+                         selection: Binding(get: { store.ssdRingDisplayMode },
+                                            set: { store.ssdRingDisplayMode = $0 }))
+        }
+    }
+
+    private var temperatureMonitoringGroup: some View {
+        SettingsGroup(
+            footnote: localization.string(.hardwareMonitorSettingsTemperatureMonitoringDescription)
+        ) {
+            SettingsToggleRow(
+                symbol: "thermometer.medium",
+                tint: .orange,
+                title: localization.string(.hardwareMonitorSettingsTemperatureMonitoring),
+                subtitle: nil,
+                isOn: Binding(
+                    get: { store.hardwareTemperatureMonitoringEnabled },
+                    set: { store.hardwareTemperatureMonitoringEnabled = $0 }
+                )
+            )
+        }
+    }
+
+    private func ringCenterRow(title: String, symbol: String, tint: Color,
+                               selection: Binding<HardwareRingCenterContent>,
+                               options: [HardwareRingCenterContent]) -> some View {
+        SettingsRow(symbol, tint: tint, title: title, subtitle: nil) {
+            Picker(title, selection: selection) {
+                ForEach(options) { content in
+                    Text(localization.string(content.titleKey)).tag(content)
+                }
+            }
+            .labelsHidden()
+            .settingsMenuPickerWidth()
+        }
+    }
+
+    private func ringValueRow(title: String, symbol: String, tint: Color,
+                              selection: Binding<RingValueDisplayMode>) -> some View {
+        SettingsRow(symbol, tint: tint, title: title, subtitle: nil) {
+            Picker(title, selection: selection) {
+                ForEach(RingValueDisplayMode.allCases) { mode in
+                    Text(localization.string(mode.titleKey)).tag(mode)
+                }
+            }
+            .labelsHidden()
+            .settingsMenuPickerWidth()
         }
     }
 

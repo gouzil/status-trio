@@ -1,16 +1,25 @@
 import Foundation
 
-struct IconContentBinding: Equatable, Hashable, Sendable {
+struct IconContentBinding: Codable, Equatable, Hashable, Sendable {
     let pluginID: String
     let presentationID: String
+
+    /// External manifests reject the reserved `builtin.` prefix, so the ID is a
+    /// reliable owner marker.
+    var isBuiltinSource: Bool { pluginID.hasPrefix("builtin.") }
+    var isExternalSource: Bool { !isBuiltinSource }
 }
 
 struct IconContentPresentation: Equatable, Sendable {
     let id: String
     let slot: IconSlot
+    /// Localized fallback for compiled-in presentations.
     let title: LocalizationKey
     let isSelectable: Bool
     var summary: LocalizationKey? = nil
+    /// Manifest-provided title for an external presentation. `nil` keeps the
+    /// localized `title`.
+    var displayTitle: String? = nil
 }
 
 struct IconContentPluginDescriptor: Equatable, Sendable {
@@ -45,6 +54,9 @@ struct IconContentContext: Sendable {
     /// The host can ask for a warning representation even when the ordinary
     /// source is unavailable (for example Wi-Fi switched off).
     var isAlertOverride = false
+    /// Which hardware-monitor metric the `.metric` bottom source draws. Only the
+    /// footer hardware presentation reads it; other slots ignore it.
+    var bottomIndicatorMetric: BottomIndicatorMetric = .cpuUsage
 }
 
 /// Compiled-in content reads a supplied snapshot. The host owns persistence,

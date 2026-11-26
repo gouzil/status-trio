@@ -16,8 +16,15 @@ enum IconPaletteResolver {
                 alpha: color.alpha * IconColorRole.inactiveTrackOpacity
             ))
         case let .semanticOverrides(colors):
-            guard let semanticRole, let color = colors[semanticRole] else { return role }
-            return .custom(color.normalized())
+            guard let semanticRole else { return role }
+            if let color = colors[semanticRole] { return .custom(color.normalized()) }
+            // #389: `connected` now has its own semantic role. An older override
+            // that only coloured `powered` (before the split) keeps covering the
+            // connected state, so an existing configuration never changes look.
+            if semanticRole == .connected, let color = colors[.powered] {
+                return .custom(color.normalized())
+            }
+            return role
         }
     }
 
@@ -121,10 +128,12 @@ private extension IconColorRole {
     var semanticRole: IconSemanticColorRole? {
         switch self {
         case .primary: .primary
+        case .discharging: .primary
         case .inactive: .inactive
         case .critical: .critical
         case .lowPower: .lowPower
         case .powered: .powered
+        case .connected: .connected
         case .bluetooth: .bluetooth
         case .bluetoothIcon: .bluetooth
         case .highPower: .powered

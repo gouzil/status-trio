@@ -5,6 +5,7 @@ enum HardwareMetricID: Hashable, Sendable {
     case cpuUsage
     case gpuUsage
     case memoryUsage
+    case memoryPressure
     case cpuTemperature
     case gpuTemperature
     case batteryTemperature
@@ -17,6 +18,16 @@ enum HardwareMetricID: Hashable, Sendable {
     case diskRead
     /// Aggregate write throughput across physical storage devices (bytes/second).
     case diskWrite
+    /// Output volume percentage. Read from the audio snapshot, never sampled by
+    /// the hardware service; the identity keeps `HardwareMonitorMetric.metricID`
+    /// total without inventing a hardware family.
+    case volume
+    /// Wi-Fi signal strength percentage. Read from the network snapshot, never
+    /// sampled by the hardware service.
+    case wifiSignal
+    /// Mac battery level percentage. Read from the battery snapshot, never
+    /// sampled by the hardware service.
+    case batteryLevel
 }
 
 /// How a metric sample may be presented. Distinct from a mere missing value so
@@ -48,6 +59,8 @@ enum HardwareMetricUnit: Equatable, Sendable {
 enum HardwareMetricSource: Equatable, Sendable {
     case mach
     case smc
+    /// Apple HID event-system temperature fallback (base Apple M1 only).
+    case hid
     case ioAccelerator
     case powerIO
     case network
@@ -155,16 +168,30 @@ struct CPUDetailReading: Equatable, Sendable {
     var coreCount: Int { perCoreUsage.count }
 }
 
+struct MemoryPressureReading: Equatable, Sendable {
+    let level: MemoryPressureLevel
+    let sampledAt: Date
+
+    func isFresh(at now: Date) -> Bool {
+        HardwareMetricSample.freshRange.contains(now.timeIntervalSince(sampledAt))
+    }
+}
+
 /// One refresh's aggregate snapshot. UI layers observe this, never a broad
 /// panel snapshot, so a metric tick cannot re-render unrelated sections.
 struct HardwareMetricsSnapshot: Equatable, Sendable {
     var samples: [HardwareMetricID: HardwareMetricSample] = [:]
     /// Fan controller count when known; `nil` until read, `0` on fanless Macs.
     var fanCount: Int?
+    /// Estimated CPU cluster frequency, sampled only while a ring or the CPU
+    /// detail page needs it. Carried beside the samples so the panel ring can
+    /// show it without opening the detail page.
+    var cpuFrequency: CPUFrequencyReading?
     /// Structured per-page detail, populated only while that detail page is open.
     var cpuDetail: CPUDetailReading?
     var gpuDetail: GPUDetailReading?
     var memoryDetail: MemoryDetailReading?
+    var memoryPressure: MemoryPressureReading?
     var networkDetail: NetworkDetailReading?
     var diskDetail: DiskDetailReading?
 
@@ -294,15 +321,26 @@ struct HardwareMetricsSnapshot: Equatable, Sendable {
             let expired = sample.expiring(at: now)
             if expired != sample { copy.samples[id] = expired }
         }
+        if let memoryPressure, !memoryPressure.isFresh(at: now) {
+            copy.memoryPressure = nil
+        }
+        if let frequency = cpuFrequency {
+            let age = now.timeIntervalSince(frequency.sampledAt)
+            if age < -HardwareMetricSample.freshRange.upperBound || age > HardwareMetricSample.freshRange.upperBound {
+                copy.cpuFrequency = nil
+            }
+        }
         return copy
     }
 
     static func unit(for id: HardwareMetricID) -> HardwareMetricUnit {
         switch id {
         case .cpuUsage, .gpuUsage, .memoryUsage: .percent
+        case .memoryPressure: .none
         case .cpuTemperature, .gpuTemperature, .batteryTemperature: .celsius
         case .fanRPM: .rpm
         case .networkDownload, .networkUpload, .diskRead, .diskWrite: .bytesPerSecond
+        case .volume, .wifiSignal, .batteryLevel: .percent
         }
     }
 }
@@ -320,11 +358,12 @@ enum HardwareMetricFamily: Hashable, Sendable, CaseIterable {
         var result: Set<HardwareMetricFamily> = []
         for id in ids {
             switch id {
-            case .cpuUsage, .gpuUsage, .memoryUsage: result.insert(.usage)
+            case .cpuUsage, .gpuUsage, .memoryUsage, .memoryPressure: result.insert(.usage)
             case .cpuTemperature, .gpuTemperature, .batteryTemperature: result.insert(.temperature)
             case .fanRPM: result.insert(.fan)
             case .networkDownload, .networkUpload: result.insert(.network)
             case .diskRead, .diskWrite: result.insert(.disk)
+            case .volume, .wifiSignal, .batteryLevel: break
             }
         }
         return result

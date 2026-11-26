@@ -4,18 +4,39 @@ import XCTest
 
 @MainActor
 final class SettingsPreferenceCatalogTests: XCTestCase {
+    func testSlotBindingsRoundTripIncludingAnUnknownExternalID() {
+        withStore { source, _ in
+            source.setIconSlotBinding(
+                primary: .init(pluginID: "com.example.latency", presentationID: "value"),
+                fallback: .init(pluginID: "builtin.network", presentationID: "center"),
+                for: .center)
+            let snapshot = SettingsPreferenceCatalog.snapshot(source)
+            withStore { target, _ in
+                SettingsPreferenceCatalog.apply(snapshot, to: target)
+                XCTAssertEqual(target.iconSlotBindings.center.primary?.pluginID, "com.example.latency")
+                XCTAssertEqual(target.iconSlotBindings.center.fallback?.pluginID, "builtin.network")
+                XCTAssertEqual(
+                    SettingsPreferenceCatalog.snapshot(target)["iconSlotBindings"],
+                    snapshot["iconSlotBindings"])
+            }
+        }
+    }
+
     func testSnapshotUsesAnExplicitPortableAllowlist() {
         withStore { store, defaults in
             defaults.set("private-value", forKey: "unrecognizedFutureSetting")
             let snapshot = SettingsPreferenceCatalog.snapshot(store)
             let expected: Set<String> = [
                 "appIconPlacement", "dockIconBackgroundPreference", "panelBackgroundStyle",
+                "panelLevelSliderColor", "panelLevelSliderMatchesBrightnessThickness",
                 "menuBarRightClickAction", "iconSize", "batteryOnBatteryMarker",
                 "batteryChargingMarker", "batteryConnectedMarker", "batteryNoBatteryMarker",
                 "showsBatteryPowerFlow", "showsBatteryPowerInfoBar", "showsHighEnergyApps",
                 "showsPanelDetailsAlongside", "showsPanelOnHover",
                 "highEnergyAppsRefreshIntervalSeconds", "showsChargeToFullNowButton",
                 "showsMenuBarChargingEffect", "showsDockChargingEffect", "showsChargingBoltHeartbeat",
+                "iconSlotBindings", "bottomIndicatorMetric", "wifiBottomIndicatorStyle",
+                "batteryBottomIndicatorStyle", "metricBottomIndicatorStyle",
                 "batterySplitGapProgress", "usesBatteryStatusColors", "monochromeChargingRing",
                 "batteryStatusColors", "batterySymbolScale", "batteryCriticalThreshold",
                 "autoLowPowerThreshold", "batteryFullThreshold",
@@ -23,12 +44,12 @@ final class SettingsPreferenceCatalogTests: XCTestCase {
                 "showsWiFiIconForTemporaryConnection", "showsWiFiIconForInternetSharing",
                 "showsLocalIPAddress", "showsSpatialAudioControls", "showsConversationAwarenessControls",
                 "connectionCenterSource", "inputSourceMarkerStyle", "prioritizesNetworkErrors",
-                "bluetoothIconColor", "usesBluetoothAudioVolumeColor", "showsBluetoothBatteryLevels",
+                "bluetoothIconColor", "usesBluetoothAudioVolumeColor", "bluetoothVolumeColor", "showsBluetoothBatteryLevels",
                 "showsWiFiPowerControl", "confirmsWiFiPowerOff", "showsBluetoothPowerControl",
                 "autoEnablesLowPowerMode", "showsAppleDevicesAndBattery",
                 "refreshesAppleBatteriesInBackground", "appleBatteryRefreshIntervalMinutes",
                 "showsBluetoothListeningMode", "bluetoothAudioIconChoiceRawValue", "wifiSymbolScale",
-                "volumeDisplayStyle", "ringStrokeStyle", "hardwareBackgroundHistoryEnabled", "hardwarePanelRefreshSeconds", "hardwareDownloadCapMbps", "hardwareUploadCapMbps", "hardwareNetworkChartFixedScale", "showsHardwareRings", "showsHardwareSummaryRow", "showsHardwareTopApps", "enabledHardwareRingSlots", "enabledHardwareSummaryMetrics", "refreshIntervalOnBatterySeconds",
+                "volumeDisplayStyle", "ringStrokeStyle", "hardwareBackgroundHistoryEnabled", "hardwareCPUUsageRefreshSeconds", "hardwareGPUUsageRefreshSeconds", "hardwareMemoryRefreshSeconds", "hardwareNetworkRefreshSeconds", "hardwareTemperatureRefreshSeconds", "hardwareDiskRefreshSeconds", "hardwareTopAppsRefreshSeconds", "hardwareHistoryWindowMinutes", "hardwareDownloadCapMbps", "hardwareUploadCapMbps", "hardwareNetworkChartFixedScale", "showsHardwareRings", "showsHardwareSummaryRow", "showsHardwareTopApps", "enabledHardwareRingSlots", "enabledHardwareSummaryMetrics", "memoryRingDisplayMode", "ssdRingDisplayMode", "hardwareRingSplitGapProgress", "hardwareTemperatureMonitoringEnabled", "cpuRingCenterContent", "gpuRingCenterContent", "refreshIntervalOnBatterySeconds",
                 "refreshIntervalOnPowerSeconds", "maxVisibleOutputDevices", "alwaysShowsAllOutputDevices",
                 "maxVisibleInputDevices", "alwaysShowsAllInputDevices", "showsBluetoothDeviceList",
                 "maxVisibleBluetoothDevices", "hidesGhostBluetoothDevices", "popupSectionOrder",
@@ -48,8 +69,11 @@ final class SettingsPreferenceCatalogTests: XCTestCase {
             source.monochromeChargingRing = false
             source.popupScrollWheelStepPercent = 2.5
             source.popupVolumeScrollFeedbackOverride = true
+            source.batteryStatusColors.discharging = .preset(.amber)
             source.batteryStatusColors.charging = .custom(.init(hue: 0.2, saturation: 0.6, brightness: 0.8))
             source.bluetoothIconColor = .custom(.init(hue: 0.1, saturation: 0.4, brightness: 0.9))
+            source.panelLevelSliderColor = .custom(IconRGBA(red: 0.2, green: 0.45, blue: 0.8, alpha: 1))
+            source.panelLevelSliderMatchesBrightnessThickness = true
             source.bluetoothAudioIconChoice = .airpods
             source.setPopupSection(.brightness, enabled: true)
             source.movePopupSections(fromOffsets: IndexSet(integer: 7), toOffset: 0)
@@ -90,32 +114,89 @@ final class SettingsPreferenceCatalogTests: XCTestCase {
 
 
 
-    func testHardwarePanelRefreshValidatesOptionsAndRoundTrips() {
-        withStore { store, defaults in
-            XCTAssertEqual(store.hardwarePanelRefreshSeconds, 1)
-            for value in [2, 3, 4, 5, 6, 7, 8] {
-                store.hardwarePanelRefreshSeconds = value
-                XCTAssertEqual(SettingsStore(defaults: defaults).hardwarePanelRefreshSeconds, value)
+    func testPanelLevelSliderColorRejectsInvalidValues() {
+        withStore { _, _ in
+            let invalid: [SettingsTransferValue] = [
+                .string("custom:2,0.5,0.5,1"),
+                .string("custom:0.5,0.5,0.5"),
+                .string("white"),
+                .number(1)
+            ]
+            for value in invalid {
+                let prepared = SettingsPreferenceCatalog.prepare(["panelLevelSliderColor": value])
+                XCTAssertEqual(prepared.values["panelLevelSliderColor"], .string("automatic"))
+                XCTAssertFalse(prepared.warnings.isEmpty)
             }
-            for invalid in [0, 9, 11, -1] {
-                store.hardwarePanelRefreshSeconds = invalid
-                XCTAssertEqual(store.hardwarePanelRefreshSeconds, 1, "only shipped options are accepted")
-            }
-            store.hardwarePanelRefreshSeconds = 5
-            XCTAssertEqual(SettingsPreferenceCatalog.snapshot(store)["hardwarePanelRefreshSeconds"], .number(5))
         }
     }
 
-    func testHardwareBackgroundHistoryDefaultsOnAndRoundTrips() {
+    func testHardwarePerGroupRefreshValidatesOptionsAndRoundTrips() {
         withStore { store, defaults in
-            XCTAssertTrue(store.hardwareBackgroundHistoryEnabled, "background history is on by default")
-            store.hardwareBackgroundHistoryEnabled = false
-            XCTAssertFalse(SettingsStore(defaults: defaults).hardwareBackgroundHistoryEnabled)
+            XCTAssertEqual(store.hardwareCPUUsageRefreshSeconds, 2)
+            for value in [3, 4, 5, 6, 7, 8] {
+                store.hardwareCPUUsageRefreshSeconds = value
+                XCTAssertEqual(SettingsStore(defaults: defaults).hardwareCPUUsageRefreshSeconds, value)
+            }
+            for invalid in [0, 1, 9, 11, -1] {
+                store.hardwareCPUUsageRefreshSeconds = invalid
+                XCTAssertEqual(store.hardwareCPUUsageRefreshSeconds, 2, "only shipped options are accepted")
+            }
+            store.hardwareCPUUsageRefreshSeconds = 5
+            XCTAssertEqual(SettingsPreferenceCatalog.snapshot(store)["hardwareCPUUsageRefreshSeconds"], .number(5))
+
+            XCTAssertEqual(store.hardwareTopAppsRefreshSeconds, 4)
+            store.hardwareTopAppsRefreshSeconds = 30
+            XCTAssertEqual(SettingsStore(defaults: defaults).hardwareTopAppsRefreshSeconds, 30)
+            store.hardwareTopAppsRefreshSeconds = 0
+            XCTAssertEqual(store.hardwareTopAppsRefreshSeconds, 4)
+            store.hardwareTopAppsRefreshSeconds = 9
+            XCTAssertEqual(SettingsPreferenceCatalog.snapshot(store)["hardwareTopAppsRefreshSeconds"], .number(9))
+        }
+    }
+
+    func testHardwareBackgroundHistoryDefaultsOffAndRoundTrips() {
+        withStore { store, defaults in
+            XCTAssertFalse(store.hardwareBackgroundHistoryEnabled, "background history is off by default")
+            store.hardwareBackgroundHistoryEnabled = true
+            XCTAssertTrue(SettingsStore(defaults: defaults).hardwareBackgroundHistoryEnabled)
             let snapshot = SettingsPreferenceCatalog.snapshot(store)
-            XCTAssertEqual(snapshot["hardwareBackgroundHistoryEnabled"], .bool(false))
+            XCTAssertEqual(snapshot["hardwareBackgroundHistoryEnabled"], .bool(true))
             XCTAssertNil(snapshot["hardwareBackgroundRefreshSeconds"], "the old seconds key is retired")
             let reloaded = SettingsStore(defaults: defaults, systemChargeLimit: { nil })
-            XCTAssertFalse(reloaded.hardwareBackgroundHistoryEnabled)
+            XCTAssertTrue(reloaded.hardwareBackgroundHistoryEnabled)
+        }
+    }
+
+    func testHardwareHistoryWindowDefaultsToThreeMinutesAndRoundTrips() {
+        withStore { store, defaults in
+            XCTAssertEqual(store.hardwareHistoryWindowMinutes, 3)
+            for value in [1, 2, 4, 5] {
+                store.hardwareHistoryWindowMinutes = value
+                XCTAssertEqual(SettingsStore(defaults: defaults).hardwareHistoryWindowMinutes, value)
+            }
+            for invalid in [0, 6, -1] {
+                store.hardwareHistoryWindowMinutes = invalid
+                XCTAssertEqual(store.hardwareHistoryWindowMinutes, 3, "only 1–5 minutes are accepted")
+                XCTAssertEqual(defaults.integer(forKey: SettingsStore.hardwareHistoryWindowMinutesDefaultsKey), 3)
+            }
+            store.hardwareHistoryWindowMinutes = 5
+            XCTAssertEqual(SettingsPreferenceCatalog.snapshot(store)["hardwareHistoryWindowMinutes"], .number(5))
+        }
+    }
+
+    func testRingDisplayModesDefaultUsedAndRoundTrip() {
+        withStore { store, defaults in
+            XCTAssertEqual(store.memoryRingDisplayMode, .used)
+            XCTAssertEqual(store.ssdRingDisplayMode, .used)
+            store.memoryRingDisplayMode = .remaining
+            let reloaded = SettingsStore(defaults: defaults, systemChargeLimit: { nil })
+            XCTAssertEqual(reloaded.memoryRingDisplayMode, .remaining)
+            XCTAssertEqual(reloaded.ssdRingDisplayMode, .used)
+            let snapshot = SettingsPreferenceCatalog.snapshot(store)
+            XCTAssertEqual(snapshot["memoryRingDisplayMode"], .string("remaining"))
+            XCTAssertEqual(snapshot["ssdRingDisplayMode"], .string("used"))
+            SettingsPreferenceCatalog.apply(["ssdRingDisplayMode": .string("remaining")], to: store)
+            XCTAssertEqual(store.ssdRingDisplayMode, .remaining)
         }
     }
 
@@ -305,8 +386,11 @@ final class SettingsPreferenceCatalogTests: XCTestCase {
             XCTAssertEqual(prepared.warnings.count, 1)
             XCTAssertEqual(prepared.values["batteryStatusColors"], .object(["charging": .string("preset:amber")]))
             SettingsPreferenceCatalog.apply(prepared.values, to: store)
+            // #389: an object without a connected role inherits the imported
+            // charging colour, so an old export keeps the merged look.
             XCTAssertEqual(store.batteryStatusColors, BatteryStatusColors(
-                charging: .preset(.amber), lowPower: .preset(.mint), highPower: .preset(.sky), critical: .preset(.rose)
+                charging: .preset(.amber), connected: .preset(.amber),
+                lowPower: .preset(.mint), highPower: .preset(.sky), critical: .preset(.rose)
             ))
             let invalid = SettingsPreferenceCatalog.prepare(["batteryStatusColors": .object(["charging": .bool(true)])])
             XCTAssertEqual(invalid.warnings.count, 1)
@@ -335,6 +419,7 @@ final class SettingsPreferenceCatalogTests: XCTestCase {
         XCTAssertEqual(SettingsPreferenceCatalog.prepare(valid).values, valid)
         XCTAssertTrue(SettingsPreferenceCatalog.prepare(valid).warnings.isEmpty)
         let malformed: SettingsTransferValue = .object([
+            "discharging": .string("system"), "connected": .string("system"),
             "charging": .string("custom:0.2,0.3,2"), "lowPower": .string("system"),
             "highPower": .string("system"), "critical": .string("system")
         ])
@@ -435,6 +520,65 @@ final class SettingsPreferenceCatalogTests: XCTestCase {
 
         XCTAssertEqual(result.values["showsPanelDetailsAlongside"], .bool(false))
         XCTAssertEqual(result.warnings.count, 1)
+    }
+
+    func testHardwareRingSplitGapProgressDefaultsOffAndRoundTrips() {
+        withStore { source, _ in
+            XCTAssertFalse(source.hardwareRingSplitGapProgress)
+            source.hardwareRingSplitGapProgress = true
+            let snapshot = SettingsPreferenceCatalog.snapshot(source)
+            XCTAssertEqual(snapshot["hardwareRingSplitGapProgress"], .bool(true))
+            withStore { target, _ in
+                XCTAssertFalse(target.hardwareRingSplitGapProgress)
+                SettingsPreferenceCatalog.apply(snapshot, to: target)
+                XCTAssertTrue(target.hardwareRingSplitGapProgress)
+            }
+        }
+    }
+
+    func testLegacyPanelRefreshImportsIntoPerGroupCadences() {
+        withStore { target, _ in
+            let prepared = SettingsPreferenceCatalog.prepare([
+                "hardwarePanelRefreshSeconds": .number(5),
+            ])
+            XCTAssertTrue(prepared.warnings.isEmpty)
+            // 5 s is above every group's floor, so each group adopts it.
+            for key in [
+                "hardwareCPUUsageRefreshSeconds", "hardwareGPUUsageRefreshSeconds",
+                "hardwareMemoryRefreshSeconds", "hardwareNetworkRefreshSeconds",
+                "hardwareTemperatureRefreshSeconds", "hardwareDiskRefreshSeconds",
+            ] {
+                XCTAssertEqual(prepared.values[key], .number(5), key)
+            }
+
+            SettingsPreferenceCatalog.apply(prepared.values, to: target)
+            XCTAssertEqual(target.hardwareCPUUsageRefreshSeconds, 5)
+            XCTAssertEqual(target.hardwareGPUUsageRefreshSeconds, 5)
+            XCTAssertEqual(target.hardwareMemoryRefreshSeconds, 5)
+            XCTAssertEqual(target.hardwareNetworkRefreshSeconds, 5)
+            XCTAssertEqual(target.hardwareTemperatureRefreshSeconds, 5)
+            XCTAssertEqual(target.hardwareDiskRefreshSeconds, 5)
+        }
+    }
+
+    func testLegacyPanelRefreshRespectsExplicitNewKeysAndGroupFloors() {
+        let prepared = SettingsPreferenceCatalog.prepare([
+            "hardwarePanelRefreshSeconds": .number(1),
+            "hardwareCPUUsageRefreshSeconds": .number(3),
+        ])
+        // Explicit new value wins over the legacy seed.
+        XCTAssertEqual(prepared.values["hardwareCPUUsageRefreshSeconds"], .number(3))
+        // A legacy 1 s cannot go below a group's floor (CPU 2 s, temperature 4 s).
+        XCTAssertEqual(prepared.values["hardwareGPUUsageRefreshSeconds"], .number(2))
+        XCTAssertEqual(prepared.values["hardwareTemperatureRefreshSeconds"], .number(4))
+    }
+
+    func testLegacyPanelRefreshOutsideRangeWarnsAndDoesNotMutate() {
+        let prepared = SettingsPreferenceCatalog.prepare([
+            "hardwarePanelRefreshSeconds": .number(0),
+        ])
+        XCTAssertEqual(prepared.warnings.count, 1)
+        XCTAssertNil(prepared.values["hardwareCPUUsageRefreshSeconds"])
     }
 
     private func withStore(_ body: (SettingsStore, UserDefaults) -> Void) {

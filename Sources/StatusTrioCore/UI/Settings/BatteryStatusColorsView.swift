@@ -168,7 +168,9 @@ private struct BatteryStatusColorRow: View {
 
     private var title: String {
         let key: LocalizationKey = switch role {
+        case .discharging: .settingsBatteryColorsDischarging
         case .charging: .settingsBatteryColorsCharging
+        case .connected: .settingsBatteryColorsConnected
         case .lowPower: .settingsBatteryColorsLowPower
         case .highPower: .settingsBatteryColorsHighPower
         case .critical: .settingsBatteryColorsCritical
@@ -178,7 +180,9 @@ private struct BatteryStatusColorRow: View {
 
     private var symbol: String {
         switch role {
+        case .discharging: return "battery.75percent"
         case .charging: return "bolt.fill"
+        case .connected: return "powerplug.fill"
         case .lowPower: return "leaf.fill"
         case .highPower: return "bolt.batteryblock.fill"
         case .critical: return "exclamationmark.triangle.fill"

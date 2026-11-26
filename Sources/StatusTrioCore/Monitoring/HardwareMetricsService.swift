@@ -1,9 +1,12 @@
 import Combine
 import Foundation
 
+
+
 /// One panel-session sample row used to prefill detail charts. Primary metrics
 /// are sampled on the summary already, so recording them here adds no sampling
-/// cost; rows are bounded to the last 60 s and dropped when the panel closes.
+/// cost; rows are capped at the largest selectable detail window and dropped when
+/// the panel closes.
 struct HardwareHistoryRow: Equatable, Sendable {
     let date: Date
     let values: [HardwareMetricID: Double]
@@ -21,18 +24,40 @@ final class HardwareMonitorObservable: ObservableObject {
     /// Last measured (valued) sample per metric, retained across close/stale so
     /// the panel can show the previous reading instead of flashing an em dash.
     private var lastKnown: [HardwareMetricID: HardwareMetricSample] = [:]
+    /// Panel-facing throttle state. The physical sampler stays live (`stored`) so
+    /// icons keep their fast cadence; the panel reads a copy that only adopts a
+    /// group's latest values once that group's cadence has elapsed ("到点取最近
+    /// 样本"). Disabled (all zero) means the panel copy tracks live.
+    private var panelStored: HardwareMetricsSnapshot
+    private var panelLastEmit: [HardwareRefreshGroup: Date] = [:]
+    /// Cadence the panel view should adopt each group at, in seconds. Zero
+    /// disables throttling for that group. Set from settings by the view model.
+    var panelDisplayCadence: @MainActor (HardwareRefreshGroup) -> TimeInterval = { _ in 0 }
     private let snapshotSubject = PassthroughSubject<HardwareMetricsSnapshot, Never>()
-    /// Panel-session history of the primary hardware metrics (last 60 s).
+    /// Panel-session history of the primary hardware metrics, kept to the
+    /// largest selectable detail window (5 minutes). The detail page trims its
+    /// own buffer to the user's 1–5 minute setting when seeding.
     private var historyRows: [HardwareHistoryRow] = []
-    static let historyWindow: TimeInterval = 60
-    static let historyMetricIDs: [HardwareMetricID] = [
+    static let historyWindow: TimeInterval = 300
+    nonisolated static let historyMetricIDs: [HardwareMetricID] = [
         .cpuUsage, .gpuUsage, .memoryUsage,
         .networkDownload, .networkUpload, .diskRead, .diskWrite
     ]
 
-    init(snapshot: HardwareMetricsSnapshot = .empty) { self.stored = snapshot }
+    init(snapshot: HardwareMetricsSnapshot = .empty) {
+        self.stored = snapshot
+        self.panelStored = snapshot
+    }
 
     var snapshot: HardwareMetricsSnapshot { stored }
+
+    /// Panel-facing snapshot: the live samples filtered down to each group's
+    /// configured cadence. Icons keep reading `snapshot` at full speed.
+    var panelSnapshot: HardwareMetricsSnapshot { panelStored }
+
+    /// Summary variant of `panelSnapshot`, filling missing summary values from
+    /// the retained last reading exactly like `summarySnapshot`.
+    var panelSummarySnapshot: HardwareMetricsSnapshot { summarySnapshot(filling: panelStored, at: Date()) }
 
     /// Snapshot for the status-panel summary: fills any missing/valued-less
     /// summary metric from the retained last reading (marked stale/dimmed), so a
@@ -43,7 +68,13 @@ final class HardwareMonitorObservable: ObservableObject {
     /// while that reading is within `cacheLifetime`; older caches are dropped so
     /// a long-closed panel does not show an ancient number as if current.
     func summarySnapshot(at now: Date) -> HardwareMetricsSnapshot {
-        var copy = stored
+        summarySnapshot(filling: stored, at: now)
+    }
+
+    /// Same fill logic applied to an arbitrary base snapshot, so the panel's
+    /// throttled copy gets the identical stale-value fallback.
+    func summarySnapshot(filling base: HardwareMetricsSnapshot, at now: Date) -> HardwareMetricsSnapshot {
+        var copy = base
         for id in HardwareMetricsService.hardwareSummaryMetricIDs {
             if copy.samples[id]?.value == nil, let known = lastKnown[id] {
                 let age = now.timeIntervalSince(known.sampledAt)
@@ -66,11 +97,63 @@ final class HardwareMonitorObservable: ObservableObject {
         for (id, sample) in next.samples where sample.availability == .measured {
             if let value = sample.value, value.isFinite { lastKnown[id] = sample }
         }
-        guard next != stored else { return }
-        objectWillChange.send()
-        stored = next
-        snapshotSubject.send(next)
-        recordHistory(from: next)
+        if next != stored {
+            stored = next
+            snapshotSubject.send(next)
+            recordHistory(from: next)
+        }
+        // Panel-facing copy: adopt each group's latest values only when that
+        // group's cadence has elapsed, so a slow panel does not redraw on every
+        // fast icon sample. Icons read `stored`/`snapshotPublisher` above and are
+        // never delayed by this.
+        let panelNext = throttledPanelSnapshot(from: next, now: now)
+        if panelNext != panelStored {
+            objectWillChange.send()
+            panelStored = panelNext
+        }
+    }
+
+    /// Applies the per-group display cadence, returning the panel copy with due
+    /// groups refreshed from `live` ("到点取最近样本") and others carried over.
+    private func throttledPanelSnapshot(from live: HardwareMetricsSnapshot,
+                                        now: Date) -> HardwareMetricsSnapshot {
+        var merged = panelStored
+        for group in HardwareRefreshGroup.allCases {
+            let cadence = panelDisplayCadence(group)
+            if cadence > 0, let last = panelLastEmit[group],
+               now.timeIntervalSince(last) < cadence {
+                continue
+            }
+            panelLastEmit[group] = now
+            Self.merge(group: group, from: live, into: &merged)
+        }
+        return merged
+    }
+
+    /// Copies one group's sampled values and its structured detail fields from a
+    /// live snapshot into a target snapshot.
+    private static func merge(group: HardwareRefreshGroup,
+                              from live: HardwareMetricsSnapshot,
+                              into target: inout HardwareMetricsSnapshot) {
+        for (id, sample) in live.samples where HardwareRefreshGroup.group(for: id) == group {
+            target.samples[id] = sample
+        }
+        switch group {
+        case .cpuUsage:
+            target.cpuDetail = live.cpuDetail
+            target.cpuFrequency = live.cpuFrequency
+        case .gpuUsage:
+            target.gpuDetail = live.gpuDetail
+        case .memory:
+            target.memoryDetail = live.memoryDetail
+            target.memoryPressure = live.memoryPressure
+        case .network:
+            target.networkDetail = live.networkDetail
+        case .disk:
+            target.diskDetail = live.diskDetail
+        case .temperature:
+            target.fanCount = live.fanCount
+        }
     }
 
     /// Records measured primary samples once per timestamp. Shared by every
@@ -117,29 +200,94 @@ final class HardwareMonitorObservable: ObservableObject {
         guard next != stored else { return }
         objectWillChange.send()
         stored = next
+        panelStored = panelStored.expiring(at: now)
         snapshotSubject.send(next)
     }
 
     func clear() {
         historyRows.removeAll()
+        panelStored = .empty
+        panelLastEmit.removeAll()
         guard stored != .empty else { return }
         objectWillChange.send()
         stored = .empty
         snapshotSubject.send(stored)
     }
 
-    /// Drops every detail payload that does not belong to the page now on screen,
-    /// so switching pages cannot show another page's stale per-core/breakdown data.
-    func clearDetailPayloads(except kind: HardwareDetailKind?) {
+    /// Drops stored and cached readings for metrics that are no longer allowed to
+    /// be sampled at all (temperature monitoring off), so neither the live view
+    /// nor the last-known cache can show a stale value.
+    func dropMetrics(_ ids: Set<HardwareMetricID>, now: Date) {
         var changed = false
-        if kind != .cpu, stored.cpuDetail != nil { stored.cpuDetail = nil; changed = true }
-        if kind != .gpu, stored.gpuDetail != nil { stored.gpuDetail = nil; changed = true }
-        if kind != .memory, stored.memoryDetail != nil { stored.memoryDetail = nil; changed = true }
-        if kind != .network, stored.networkDetail != nil { stored.networkDetail = nil; changed = true }
-        if kind != .disk, stored.diskDetail != nil { stored.diskDetail = nil; changed = true }
+        for id in ids {
+            if stored.samples.removeValue(forKey: id) != nil { changed = true }
+            panelStored.samples.removeValue(forKey: id)
+            if lastKnown.removeValue(forKey: id) != nil { changed = true }
+        }
         guard changed else { return }
         objectWillChange.send()
         snapshotSubject.send(stored)
+    }
+
+    /// Drops the live CPU frequency when a ring stops needing it.
+    func clearCPUFrequency(now: Date) {
+        guard stored.cpuFrequency != nil else { return }
+        stored.cpuFrequency = nil
+        panelStored.cpuFrequency = nil
+        objectWillChange.send()
+        snapshotSubject.send(stored)
+    }
+
+    /// Removes the live snapshot for metrics that just lost their last consumer,
+    /// so a hidden card cannot keep displaying a value the data source no longer
+    /// refreshes. The last good reading is retained in `lastKnown` but marked
+    /// stale, so a later reopen dims it instead of presenting it as live.
+    func pruneInactive(_ ids: Set<HardwareMetricID>, now: Date) {
+        var changed = false
+        if ids.contains(.memoryPressure), stored.memoryPressure != nil {
+            stored.memoryPressure = nil
+            panelStored.memoryPressure = nil
+            changed = true
+        }
+        for id in ids {
+            if stored.samples.removeValue(forKey: id) != nil { changed = true }
+            panelStored.samples.removeValue(forKey: id)
+        }
+        for id in ids {
+            guard var known = lastKnown[id] else { continue }
+            known.availability = .stale
+            lastKnown[id] = known
+        }
+        guard changed else { return }
+        objectWillChange.send()
+        snapshotSubject.send(stored)
+    }
+
+    /// Drops every detail payload that does not belong to the page now on screen,
+    /// so switching pages cannot show another page's stale per-core/breakdown data.
+    /// Both snapshots are cleared: the panel renders `panelStored`, so clearing
+    /// only the live copy would leave a previous page's payload to be shown as
+    /// cached data (it has no freshness expiry of its own) until the next merge.
+    func clearDetailPayloads(except kind: HardwareDetailKind?) {
+        func clear(in snapshot: inout HardwareMetricsSnapshot) -> Bool {
+            var didChange = false
+            func drop<Value>(_ keyPath: WritableKeyPath<HardwareMetricsSnapshot, Value?>) {
+                guard snapshot[keyPath: keyPath] != nil else { return }
+                snapshot[keyPath: keyPath] = nil
+                didChange = true
+            }
+            if kind != .cpu { drop(\.cpuDetail) }
+            if kind != .gpu { drop(\.gpuDetail) }
+            if kind != .memory { drop(\.memoryDetail) }
+            if kind != .network { drop(\.networkDetail) }
+            if kind != .disk { drop(\.diskDetail) }
+            return didChange
+        }
+        let liveChanged = clear(in: &stored)
+        let panelChanged = clear(in: &panelStored)
+        guard liveChanged || panelChanged else { return }
+        objectWillChange.send()
+        if liveChanged { snapshotSubject.send(stored) }
     }
 }
 
@@ -154,14 +302,50 @@ final class HardwareMetricsService: ObservableObject {
         case background
     }
 
-    /// Background cadence in seconds (0 = disabled). Only consulted when the
-    /// background demand is the sole consumer, so an open panel still refreshes
-    /// at the fast metric cadence. Set by the panel view model from settings.
-    var backgroundIntervalSeconds: TimeInterval = 0
-    /// Panel-open cadence in seconds (0 = metric default). Applied only when the
-    /// panel is the sole non-background consumer, so icon/dock consumers keep
-    /// their own fast needs.
-    var panelIntervalSeconds: TimeInterval = 0
+    /// Background cadence per group (0 = metric default). Only consulted when
+    /// the background demand is a consumer, so an open panel or a fast icon
+    /// still refreshes at the fastest effective cadence. Set from settings.
+    var backgroundCadenceProvider: @MainActor (HardwareRefreshGroup) -> TimeInterval = { _ in 0 }
+    /// Panel-open cadence per group (0 = metric default). Applied only when the
+    /// panel is a consumer, so icon/dock consumers keep their own fast needs; a
+    /// metric's effective interval is the fastest of all active consumers.
+    var panelCadenceProvider: @MainActor (HardwareRefreshGroup) -> TimeInterval = { _ in 0 }
+
+    /// Master switch for CPU/GPU temperature sampling. When false, temperature
+    /// IDs are removed from every demand set so no SMC or HID temperature read
+    /// happens anywhere (panel, icon, detail, background).
+    var temperatureMonitoringEnabled = true {
+        didSet {
+            guard oldValue != temperatureMonitoringEnabled else { return }
+            generation &+= 1
+            if !temperatureMonitoringEnabled {
+                observable.dropMetrics([.cpuTemperature, .gpuTemperature], now: now())
+            }
+            let rawIDs = demands.values.reduce(into: Set<HardwareMetricID>()) { $0.formUnion($1) }
+            sampler.updateTemperatureDemand(
+                hasCPU: temperatureMonitoringEnabled && rawIDs.contains(.cpuTemperature),
+                hasGPU: temperatureMonitoringEnabled && rawIDs.contains(.gpuTemperature))
+            forcedIDs.formIntersection(requestedIDs)
+            if temperatureMonitoringEnabled {
+                forcedIDs.formUnion(requestedIDs)
+            }
+            pruneSnapshot()
+            if isRunning, !isAsleep { refreshIfNeeded(forceFamilies: []) }
+        }
+    }
+
+    /// True while the status-panel CPU ring shows an IOReport frequency estimate.
+    /// The CPU detail page always samples frequency on its own.
+    var wantsRingCPUFrequency = false {
+        didSet {
+            guard oldValue != wantsRingCPUFrequency else { return }
+            forcedIDs.formUnion(requestedIDs)
+            if !wantsRingCPUFrequency, detailKind != .cpu {
+                observable.clearCPUFrequency(now: now())
+            }
+            if isRunning, !isAsleep { refreshIfNeeded(forceFamilies: []) }
+        }
+    }
 
     static let defaultMetricIDs: Set<HardwareMetricID> = [
         .cpuUsage, .gpuUsage, .memoryUsage, .cpuTemperature, .batteryTemperature, .fanRPM(index: 0)
@@ -181,14 +365,7 @@ final class HardwareMetricsService: ObservableObject {
     /// The metrics each detail page needs. GPU/memory/network/disk request only
     /// what that page shows; CPU also enables the separately-throttled frequency.
     static func detailMetricIDs(for kind: HardwareDetailKind) -> Set<HardwareMetricID> {
-        switch kind {
-        case .cpu: return [.cpuUsage, .cpuTemperature]
-        case .gpu: return [.gpuUsage, .gpuTemperature]
-        case .memory: return [.memoryUsage]
-        case .network: return [.networkDownload, .networkUpload]
-        case .disk: return [.diskRead, .diskWrite]
-        case .fan: return [.fanRPM(index: 0), .cpuTemperature, .gpuTemperature, .batteryTemperature]
-        }
+        HardwareMetricDemandResolver.detailMetrics(for: kind)
     }
     typealias Reader = @Sendable (Set<HardwareMetricID>, Date) async -> HardwareMetricsSnapshot
 
@@ -202,6 +379,9 @@ final class HardwareMetricsService: ObservableObject {
     var currentTickIntervalForTesting: TimeInterval { tickInterval }
     /// Effective cadence for one metric after mixing every active consumer.
     func intervalForTesting(_ id: HardwareMetricID) -> TimeInterval { interval(for: id) }
+    /// The delay the scheduler would use next — used to prove a slow read parks
+    /// the loop instead of spinning at the 50 ms floor.
+    var currentWakeDelayForTesting: TimeInterval { nextWakeDelay() }
 
     private let reader: Reader?
     private let now: () -> Date
@@ -230,7 +410,21 @@ final class HardwareMetricsService: ObservableObject {
     deinit { loopTask?.cancel() }
 
     private var requestedIDs: Set<HardwareMetricID> {
-        demands.values.reduce(into: []) { $0.formUnion($1) }
+        var ids = demands.values.reduce(into: Set<HardwareMetricID>()) { $0.formUnion($1) }
+        if !temperatureMonitoringEnabled {
+            ids.remove(.cpuTemperature)
+            ids.remove(.gpuTemperature)
+        }
+        return ids
+    }
+
+    /// Keeps the sampler's temperature fallback state aligned with the metrics
+    /// that still have a consumer. When both temperature metrics disappear the
+    /// HID client and service cache are released.
+    private func syncTemperatureDemand() {
+        let ids = requestedIDs
+        sampler.updateTemperatureDemand(hasCPU: ids.contains(.cpuTemperature),
+                                        hasGPU: ids.contains(.gpuTemperature))
     }
 
     /// Sets which detail payload the sampler should build. Clears the other
@@ -239,9 +433,15 @@ final class HardwareMetricsService: ObservableObject {
         guard kind != detailKind else { return }
         let previous = detailKind
         detailKind = kind
+        // A read already in flight captured the previous page. Invalidate its
+        // token so it cannot merge that page's payload back after the clear.
+        generation &+= 1
         if previous == .cpu, kind != .cpu { sampler.releaseFrequencyReader() }
         if previous == .network, kind != .network { sampler.resetNetworkSession() }
         observable.clearDetailPayloads(except: kind)
+        if kind != nil, isRunning, !isAsleep {
+            forcedIDs.formUnion(requestedIDs)
+        }
     }
 
     /// Forces the next tick to read every currently demanded ID (used when a
@@ -258,6 +458,11 @@ final class HardwareMetricsService: ObservableObject {
         let previous = requestedIDs
         demands[demand] = metrics
         generation &+= 1
+        syncTemperatureDemand()
+        let removed = previous.subtracting(requestedIDs)
+        if !removed.isEmpty {
+            observable.pruneInactive(removed, now: now())
+        }
         if !isRunning {
             isRunning = true
             // Keep the CPU tick baseline across a close/reopen so the first
@@ -277,6 +482,7 @@ final class HardwareMetricsService: ObservableObject {
     func end(_ demand: Demand) {
         guard demands.removeValue(forKey: demand) != nil else { return }
         generation &+= 1
+        syncTemperatureDemand()
         if demands.isEmpty {
             stopLoop()
         } else {
@@ -289,6 +495,7 @@ final class HardwareMetricsService: ObservableObject {
     func stopAll() {
         demands.removeAll()
         generation &+= 1
+        syncTemperatureDemand()
         stopLoop()
     }
 
@@ -301,10 +508,12 @@ final class HardwareMetricsService: ObservableObject {
         needReaderReset = true
         lastRead.removeAll()
         forcedIDs = requestedIDs
+        observable.pruneInactive([.memoryPressure], now: now())
         observable.markStale(now: now())
         observable.clearDetailPayloads(except: nil)
         sampler.releaseFrequencyReader()
         sampler.resetNetworkSession()
+        sampler.releaseTemperatureFallback()
     }
 
     func wake() {
@@ -324,6 +533,7 @@ final class HardwareMetricsService: ObservableObject {
         loopTask = nil
         lastRead.removeAll()
         forcedIDs.removeAll()
+        observable.pruneInactive([.memoryPressure], now: now())
         observable.markStale(now: now())
         observable.clearDetailPayloads(except: nil)
         // History is deliberately NOT cleared here: a background sample collected
@@ -349,6 +559,17 @@ final class HardwareMetricsService: ObservableObject {
     /// tick. A pending read (inFlight) parks the loop until it finishes, which
     /// then re-enters through the completion path.
     private func nextWakeDelay() -> TimeInterval {
+        // A pending read is bounded by its own timeout; waking every 50 ms while
+        // its metric is overdue only spins the main actor. Completion restarts
+        // the loop at the freshly computed cadence.
+        if inFlight {
+            if let pressure = observable.snapshot.memoryPressure, pressure.level != .unknown {
+                // Clear a previously coloured footer even if the sampler queue stalls.
+                let expiration = pressure.sampledAt.addingTimeInterval(HardwareMetricSample.freshnessInterval)
+                return min(max(expiration.timeIntervalSince(now()), 0.05), 30)
+            }
+            return 30
+        }
         let ids = requestedIDs
         guard !ids.isEmpty else { return 2 }
         let current = now()
@@ -382,6 +603,9 @@ final class HardwareMetricsService: ObservableObject {
         needReaderReset = false
         let sampler = self.sampler
         let includeDetail = detailKind
+        // A closed detail page can still need CPU frequency when the panel ring
+        // shows it; the icon-only demand never does.
+        let wantsRingFrequency = wantsRingCPUFrequency && (demands[.panel]?.contains(.cpuUsage) == true)
         let injected = reader
         Task { [weak self] in
             // A surface can close before this task reaches its first suspension.
@@ -398,7 +622,7 @@ final class HardwareMetricsService: ObservableObject {
             if let injected { snapshot = await injected(due, date) }
             else {
                 snapshot = await sampler.read(ids: due, at: date,
-                                              includeCPUFrequency: includeDetail == .cpu,
+                                              includeCPUFrequency: includeDetail == .cpu || wantsRingFrequency,
                                               details: includeDetail.map { [$0] } ?? [])
             }
             guard let self else { return }
@@ -409,6 +633,7 @@ final class HardwareMetricsService: ObservableObject {
                 if self.isRunning, !self.isAsleep {
                     self.forcedIDs.formUnion(self.requestedIDs)
                     self.refreshIfNeeded(forceFamilies: [])
+                    self.restartLoopAfterRead()
                 }
                 return
             }
@@ -446,13 +671,18 @@ final class HardwareMetricsService: ObservableObject {
                     return true
                 }
             }
+            if let frequency = snapshot.cpuFrequency { merged.cpuFrequency = frequency }
             if let detail = snapshot.cpuDetail { merged.cpuDetail = detail }
             if let detail = snapshot.gpuDetail { merged.gpuDetail = detail }
             if let detail = snapshot.memoryDetail { merged.memoryDetail = detail }
+            if due.contains(.memoryPressure), self.isRequested(.memoryPressure) {
+                merged.memoryPressure = snapshot.memoryPressure
+            }
             if let detail = snapshot.networkDetail { merged.networkDetail = detail }
             if let detail = snapshot.diskDetail { merged.diskDetail = detail }
             self.observable.update(merged, now: self.now())
             self.refreshIfNeeded(forceFamilies: [])
+            self.restartLoopAfterRead()
         }
     }
 
@@ -465,7 +695,17 @@ final class HardwareMetricsService: ObservableObject {
         if isRunning, !isAsleep {
             forcedIDs.formUnion(requestedIDs)
             refreshIfNeeded(forceFamilies: [])
+            restartLoopAfterRead()
         }
+    }
+
+    /// Cancel the sleeping scheduler and let it recompute from the completion
+    /// path. Without this a read that finished early would wait out the parked
+    /// 30 s delay before the next sample.
+    private func restartLoopAfterRead() {
+        loopTask?.cancel()
+        loopTask = nil
+        startLoopIfNeeded()
     }
 
     private var tickInterval: TimeInterval {
@@ -479,6 +719,7 @@ final class HardwareMetricsService: ObservableObject {
     /// fast icon never speeds up a metric only the slow panel asked for.
     private func interval(for id: HardwareMetricID) -> TimeInterval {
         let base = defaultMetricInterval(for: id)
+        guard let group = HardwareRefreshGroup.group(for: id) else { return base }
         var result: TimeInterval?
         for (demand, metrics) in demands {
             let owns = metrics.contains(id)
@@ -486,8 +727,8 @@ final class HardwareMetricsService: ObservableObject {
             guard owns else { continue }
             let cadence: TimeInterval
             switch demand {
-            case .panel: cadence = panelIntervalSeconds
-            case .background: cadence = backgroundIntervalSeconds
+            case .panel: cadence = panelCadenceProvider(group)
+            case .background: cadence = backgroundCadenceProvider(group)
             default: cadence = 0
             }
             // A consumer's cadence can slow a metric down but never speed it
@@ -505,10 +746,11 @@ final class HardwareMetricsService: ObservableObject {
 
     private func defaultMetricInterval(for id: HardwareMetricID) -> TimeInterval {
         switch id {
-        case .cpuUsage, .gpuUsage, .memoryUsage: 2
+        case .cpuUsage, .gpuUsage, .memoryUsage, .memoryPressure: 2
         case .cpuTemperature, .gpuTemperature, .batteryTemperature, .fanRPM: 4
         case .networkDownload, .networkUpload: 1
         case .diskRead, .diskWrite: 1
+        case .volume, .wifiSignal, .batteryLevel: 2
         }
     }
 
@@ -522,6 +764,9 @@ final class HardwareMetricsService: ObservableObject {
     private func pruneSnapshot() {
         var next = observable.snapshot
         next.samples = next.samples.filter { isRequested($0.key) }
+        if !isRequested(.memoryPressure) {
+            next.memoryPressure = nil
+        }
         if !requestedIDs.contains(where: { if case .fanRPM = $0 { return true }; return false }) {
             next.fanCount = nil
         }

@@ -114,6 +114,42 @@ final class HardwareMetricsServiceTests: XCTestCase {
         service.stopAll()
     }
 
+    func testRingFrequencyDoesNotStarveTemperatureDemand() async {
+        let clock = Clock()
+        let recorder = Recorder()
+        let service = HardwareMetricsService(automaticScheduling: false, now: { clock.date },
+                                             reader: recorder.countingReader(usage: 20))
+        service.wantsRingCPUFrequency = true
+        service.begin(.menuBarArc, metrics: [.cpuUsage, .cpuTemperature])
+        service.begin(.panel, metrics: [.cpuUsage, .cpuTemperature])
+        await awaitSettled(service, recorderCalls: { recorder.calls.count }, expected: 1)
+        XCTAssertTrue(recorder.calls.contains { $0.contains(.cpuTemperature) },
+                      "a menu-bar temperature arc must keep requesting the temperature")
+        service.stopAll()
+    }
+
+    func testTemperatureMonitoringOffRemovesTemperatureFromReads() async {
+        let clock = Clock()
+        let recorder = Recorder()
+        let service = HardwareMetricsService(automaticScheduling: false, now: { clock.date },
+                                             reader: recorder.countingReader(usage: 10))
+        service.temperatureMonitoringEnabled = false
+        service.begin(.panel, metrics: [.cpuUsage, .cpuTemperature, .gpuTemperature])
+        await awaitSettled(service, recorderCalls: { recorder.calls.count }, expected: 1)
+        let first = recorder.calls.first ?? []
+        XCTAssertTrue(first.contains(.cpuUsage))
+        XCTAssertFalse(first.contains(.cpuTemperature))
+        XCTAssertFalse(first.contains(.gpuTemperature))
+
+        service.temperatureMonitoringEnabled = true
+        service.forceRefresh()
+        await awaitSettled(service, recorderCalls: { recorder.calls.count }, expected: 2)
+        let second = recorder.calls.last ?? []
+        XCTAssertTrue(second.contains(.cpuTemperature))
+        XCTAssertTrue(second.contains(.gpuTemperature))
+        service.stopAll()
+    }
+
     func testTickIntervalFollowsFastestDemandedMetric() async {
         let clock = Clock()
         let service = HardwareMetricsService(automaticScheduling: false,
@@ -544,7 +580,7 @@ final class HardwareMetricsServiceTests: XCTestCase {
     func testPanelDemandUsesConfiguredCadence() async {
         let clock = Clock()
         let service = HardwareMetricsService(automaticScheduling: false, now: { clock.date }, reader: { _, _ in .empty })
-        service.panelIntervalSeconds = 5
+        service.panelCadenceProvider = { _ in 5 }
         service.begin(.panel, metrics: [.networkDownload])
         XCTAssertEqual(service.currentTickIntervalForTesting, 5, "panel-open cadence is configurable")
         service.begin(.menuBarArc, metrics: [.networkDownload])
@@ -557,7 +593,7 @@ final class HardwareMetricsServiceTests: XCTestCase {
     func testBackgroundDemandUsesConfiguredCadence() async {
         let clock = Clock()
         let service = HardwareMetricsService(automaticScheduling: false, now: { clock.date }, reader: { _, _ in .empty })
-        service.backgroundIntervalSeconds = 30
+        service.backgroundCadenceProvider = { _ in 30 }
         service.begin(.background, metrics: [.networkDownload])
         XCTAssertEqual(service.currentTickIntervalForTesting, 30)
         service.begin(.panel, metrics: [.networkDownload])
@@ -582,6 +618,37 @@ final class HardwareMetricsServiceTests: XCTestCase {
         observable.markStale(now: t0.addingTimeInterval(400))
         XCTAssertNil(observable.snapshot.samples[.networkDownload]?.value)
         XCTAssertNil(observable.summarySnapshot(at: t0.addingTimeInterval(400)).networkDownload.value)
+    }
+
+    func testPressureSamplesImmediatelyAtTwoSecondCadenceAndClearsOnLastEnd() async {
+        let clock = Clock()
+        let recorder = Recorder()
+        let service = HardwareMetricsService(automaticScheduling: false,
+                                             now: { clock.date }, reader: recorder.waitingReader())
+        service.begin(.menuBarArc, metrics: [.memoryPressure])
+        XCTAssertEqual(service.currentTickIntervalForTesting, 2)
+        await awaitReadingStarted(recorder)
+        XCTAssertEqual(recorder.calls, [[.memoryPressure]])
+        guard let first = recorder.continuations.first else { return XCTFail("first sample missing") }
+        first.resume(returning: .init(memoryPressure: .init(level: .normal, sampledAt: clock.date)))
+        await awaitSettled(service, recorder)
+        XCTAssertEqual(service.observable.snapshot.memoryPressure?.level, .normal)
+
+        clock.advance(1)
+        service.refreshIfNeeded(forceFamilies: [])
+        XCTAssertFalse(service.isAwaitingReadForTesting)
+        clock.advance(1)
+        service.refreshIfNeeded(forceFamilies: [])
+        await awaitReadingStarted(recorder, count: 2)
+        XCTAssertEqual(recorder.calls, [[.memoryPressure], [.memoryPressure]])
+        guard recorder.continuations.count == 2 else { return XCTFail("second sample missing") }
+
+        service.end(.menuBarArc)
+        XCTAssertNil(service.observable.snapshot.memoryPressure)
+        recorder.continuations[1].resume(returning: .init(memoryPressure: .init(level: .critical, sampledAt: clock.date)))
+        await awaitSettled(service, recorder)
+        XCTAssertFalse(service.isRunning)
+        XCTAssertNil(service.observable.snapshot.memoryPressure)
     }
 
     func testDiskDemandUsesOneSecondCadenceAndStopsOnEnd() async {
@@ -612,7 +679,7 @@ final class HardwareMetricsServiceTests: XCTestCase {
         let recorder = Recorder()
         let service = HardwareMetricsService(automaticScheduling: false, now: { clock.date },
                                              reader: recorder.countingReader(usage: 10))
-        service.panelIntervalSeconds = 5
+        service.panelCadenceProvider = { _ in 5 }
         service.begin(.menuBarArc, metrics: [.cpuUsage])
         service.begin(.dock, metrics: [.cpuUsage])
         service.begin(.panel, metrics: [.cpuUsage, .diskRead, .diskWrite])
@@ -626,12 +693,83 @@ final class HardwareMetricsServiceTests: XCTestCase {
 
         // A slow panel sensor that no icon needs stays at the panel cadence even
         // while an unrelated fast metric is also demanded.
-        service.panelIntervalSeconds = 3
+        service.panelCadenceProvider = { _ in 3 }
         service.begin(.panel, metrics: [.cpuTemperature])
         service.begin(.menuBarCenter, metrics: [.networkDownload])
         XCTAssertEqual(service.intervalForTesting(.cpuTemperature), 4,
                        "a 3 s panel cannot push a 4 s sensor faster")
         XCTAssertEqual(service.intervalForTesting(.networkDownload), 1)
+        service.stopAll()
+    }
+
+    func testSwitchingDetailDropsLatePayloadFromPreviousPage() async {
+        let clock = Clock()
+        let recorder = Recorder()
+        let service = HardwareMetricsService(automaticScheduling: false, now: { clock.date },
+                                             reader: recorder.waitingReader())
+        service.begin(.panel, metrics: [.gpuUsage, .memoryUsage])
+        await awaitReadingStarted(recorder)
+
+        service.setDetailDemand(.gpu)
+        service.setDetailDemand(.memory)
+        var late = HardwareMetricsSnapshot.empty
+        late.gpuDetail = GPUDetailReading(deviceName: "Apple M3 Max", usage: 37,
+                                          rendererUtilization: 42, tilerUtilization: 35,
+                                          inUseSystemMemoryBytes: 4_200_000_000, sampledAt: clock.date)
+        recorder.continuations[0].resume(returning: late)
+        await drain(80)
+
+        XCTAssertNil(service.observable.snapshot.gpuDetail,
+                     "a read started for the previous detail must not restore its payload")
+        XCTAssertNil(service.observable.snapshot.memoryDetail)
+        if recorder.calls.count > 1, recorder.continuations.count > 1 {
+            recorder.continuations[1].resume(returning: .empty)
+            await drain()
+        }
+        service.stopAll()
+    }
+
+    func testSlowReadParksTheLoopInsteadOfPollingEvery50ms() async {
+        let clock = Clock()
+        let recorder = Recorder()
+        let service = HardwareMetricsService(automaticScheduling: false, now: { clock.date },
+                                             reader: recorder.waitingReader())
+        service.begin(.panel, metrics: [.cpuUsage])
+        await awaitReadingStarted(recorder)
+        clock.advance(3)
+
+        XCTAssertEqual(service.currentWakeDelayForTesting, 30,
+                       "an overdue metric must not spin the main actor while the read is outstanding")
+        recorder.continuations[0].resume(returning: .empty)
+        await drain()
+        service.stopAll()
+    }
+
+    func testShrinkingDemandPrunesAndStopsReadingTheRemovedMetric() async {
+        let clock = Clock()
+        let recorder = Recorder()
+        let service = HardwareMetricsService(automaticScheduling: false, now: { clock.date },
+                                             reader: recorder.waitingReader())
+        service.begin(.panel, metrics: [.cpuUsage, .gpuUsage])
+        await awaitReadingStarted(recorder)
+        XCTAssertEqual(recorder.calls[0], Set([.cpuUsage, .gpuUsage]))
+        recorder.continuations[0].resume(returning: .empty)
+        await drain()
+
+        // Shrink the demand: GPU loses its last consumer.
+        service.begin(.panel, metrics: [.cpuUsage])
+        XCTAssertNil(service.observable.snapshot.samples[.gpuUsage],
+                     "a metric with no consumer must be removed from the live snapshot")
+        service.forceRefresh()
+        await awaitReadingStarted(recorder, count: 2)
+        XCTAssertEqual(recorder.calls[1], Set([.cpuUsage]),
+                       "the removed metric must never be requested again")
+        recorder.continuations[1].resume(returning: .empty)
+        await drain()
+
+        service.end(.panel)
+        XCTAssertFalse(service.isRunning)
+        XCTAssertTrue(service.demands.isEmpty)
         service.stopAll()
     }
 }

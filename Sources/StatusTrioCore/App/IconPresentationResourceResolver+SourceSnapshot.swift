@@ -14,6 +14,7 @@ extension IconPresentationResourceResolver {
         selectedAirPodsAddress: String? = nil,
         selectedConnectedDeviceAddress: String? = nil,
         bluetoothAvailability: BluetoothAvailability? = nil,
+        holdsAirPodsBattery: Bool = false,
         now: Date = .now
     ) -> IconSourceSnapshot {
         let networkAvailability: IconSourceAvailability
@@ -36,6 +37,10 @@ extension IconPresentationResourceResolver {
         let volumeAvailability: IconSourceAvailability = snapshot.volume.scalar != nil
             ? .available
             : .unavailable(.unknown)
+        // The numeric battery sources (centre percentage, footer) are hidden
+        // without a battery, but the ring is not: #310 draws a battery-less Mac
+        // as a full decorative ring, so its source stays available and the
+        // mapper paints the 100% / full ring instead of falling back to nothing.
         let batteryAvailability: IconSourceAvailability = snapshot.battery.isPresent
             ? .available
             : .unavailable(.disconnected)
@@ -52,8 +57,14 @@ extension IconPresentationResourceResolver {
         case let .selected(value):
             let age = now.timeIntervalSince(value.observedAt)
             let isFresh = (0...AirPodsBatteryIconSnapshot.freshnessInterval).contains(age)
-            airPodsBattery = isFresh ? value : nil
-            airPodsAvailability = isFresh ? .available : .unavailable(.temporarilyStale)
+            // While the icon holds the AirPods battery (it is the ring source),
+            // keep the last reading on screen past the freshness window instead
+            // of dropping to the fallback ring. The background claim keeps the
+            // reading current; the hold only stops a quiet interval from
+            // flickering the level away.
+            let isUsable = isFresh || holdsAirPodsBattery
+            airPodsBattery = isUsable ? value : nil
+            airPodsAvailability = isUsable ? .available : .unavailable(.temporarilyStale)
         case .needsSelection:
             airPodsBattery = nil
             airPodsAvailability = .unavailable(.unknown)
@@ -100,10 +111,11 @@ extension IconPresentationResourceResolver {
             CenterSource.bluetoothAudioOutput.rawValue: currentAudioOutputAvailability,
             CenterSource.systemBatteryPercentage.rawValue: batteryAvailability,
             CenterSource.connectedBluetoothDevice.rawValue: connectedDeviceAvailability,
-            RingSource.systemBattery.rawValue: batteryAvailability,
+            RingSource.systemBattery.rawValue: .available,
             RingSource.airPodsBattery.rawValue: airPodsAvailability,
             FooterSource.systemVolume.rawValue: volumeAvailability
         ], airPodsBattery: airPodsBattery, connectedBluetoothDeviceSymbol: connectedDeviceSymbol,
-           connectedBluetoothDeviceIsAudio: connectedDeviceIsAudio)
+           connectedBluetoothDeviceIsAudio: connectedDeviceIsAudio,
+           holdingSourceIDs: holdsAirPodsBattery ? [RingSource.airPodsBattery.rawValue] : [])
     }
 }

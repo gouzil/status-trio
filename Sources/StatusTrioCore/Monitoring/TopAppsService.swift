@@ -7,10 +7,27 @@ import Foundation
 @MainActor
 final class TopAppsObservable: ObservableObject {
     @Published private(set) var state: TopAppsState = .idle
+    /// When the next sample is expected, so the card can show a countdown. Nil
+    /// while idle/asleep or between a sample finishing and the next schedule.
+    @Published private(set) var nextRefreshAt: Date?
 
     func update(_ state: TopAppsState) {
         guard self.state != state else { return }
         self.state = state
+    }
+
+    func updateNextRefresh(_ date: Date?) {
+        guard nextRefreshAt != date else { return }
+        nextRefreshAt = date
+    }
+
+    /// A force-quit just removed a row; ask the service to drop it from the
+    /// ranking immediately instead of waiting for it to age out at zero.
+    private let rowRemovalSubject = PassthroughSubject<TopAppIdentity, Never>()
+    var rowRemovalRequests: AnyPublisher<TopAppIdentity, Never> { rowRemovalSubject.eraseToAnyPublisher() }
+
+    func requestRowRemoval(_ id: TopAppIdentity) {
+        rowRemovalSubject.send(id)
     }
 }
 
@@ -34,15 +51,55 @@ final class TopAppsService {
     private(set) var sessionGeneration: UInt64 = 0
     private var loopTask: Task<Void, Never>?
     private var inFlight = false
-    /// Keeps the list height stable: a row that drops to zero stays until a new
-    /// application replaces it.
+    /// Set when a session ends while a cumulative read may still be running.
+    /// The reset is deferred until that read returns and runs before any new
+    /// read, so a late sample cannot overwrite the fresh baseline.
+    private var needsTrackerReset = false
+    /// Current ranked rows: a row that drops to zero still stays at the bottom
+    /// until a live application replaces it. Always re-sorted by value.
     private var retainedRows: [TopAppRow] = []
-    private var retainedMetric: TopAppMetric?
+    /// Last published rows per metric, kept across detail-page sessions so
+    /// reopening a page can replay the previous ranking instead of a blank card.
+    private var lastRowsByMetric: [TopAppMetric: [TopAppRow]] = [:]
+    /// True when the last read only established a cumulative baseline; the next
+    /// turn retries quickly instead of waiting a full interval.
+    private var lastSampleWasCollecting = false
 
-    /// Per-metric default cadence for the top-app list.
+    /// Rows the user force-quit: dropped from the ranking at once and kept out
+    /// until a fresh sample no longer reports them (so a stale in-flight read
+    /// cannot resurrect the row).
+    private var suppressedIDs: Set<TopAppIdentity> = []
+    private var rowRemovalCancellable: AnyCancellable?
+
+    /// After a cumulative metric only establishes its baseline, retry once
+    /// quickly so the first frame appears in about half a second instead of a
+    /// full refresh interval.
+    static let collectingRetryInterval: Double = 0.5
+
+    /// Lower bound, in seconds, on the list cadence, driven by the hardware
+    /// data refresh interval setting. The list never refreshes faster than
+    /// this, so raising the setting slows the list with it instead of letting
+    /// the fixed fast cadence outrun the panel. `0` disables the bound and
+    /// keeps the per-metric defaults.
+    var minimumIntervalSeconds: Double = 0 {
+        didSet {
+            guard minimumIntervalSeconds != oldValue else { return }
+            // Re-schedule immediately instead of waiting out the current sleep,
+            // so changing the setting on an open page takes effect now.
+            guard demand != nil, !inFlight, !isAsleep, !isStopped else { return }
+            loopTask?.cancel()
+            loopTask = nil
+            startLoopIfNeeded()
+        }
+    }
+
+    /// Per-metric default cadence for the top-app list. GPU is cheap to read
+    /// through IOKit and drives the high-usage ranking, so it refreshes at 1 s;
+    /// the syscall and top readers stay slower to keep the page low-power.
     nonisolated static func defaultInterval(for metric: TopAppMetric) -> Double {
         switch metric {
-        case .cpu, .gpu, .network: return 2
+        case .gpu: return 1
+        case .cpu, .network: return 2
         case .memory: return 6
         }
     }
@@ -59,6 +116,9 @@ final class TopAppsService {
         self.sleepFor = sleepFor
         self.clock = clock
         self.intervalSeconds = intervalSeconds
+        rowRemovalCancellable = observable.rowRemovalRequests.sink { [weak self] id in
+            self?.forgetRow(id)
+        }
     }
 
     deinit { loopTask?.cancel() }
@@ -84,17 +144,24 @@ final class TopAppsService {
         guard metric != demand else { return }
 
         demand = metric
-        if metric != retainedMetric {
-            retainedRows = []
-            retainedMetric = metric
-        }
+        // Seed from the last ranking for this metric so reopening the page
+        // replays it immediately; a cold first open still shows the collecting
+        // placeholder until the first frame arrives.
+        retainedRows = metric.flatMap { lastRowsByMetric[$0] } ?? []
         sessionGeneration &+= 1
         loopTask?.cancel()
         loopTask = nil
+        needsTrackerReset = true
         if let metric {
-            observable.update(.collecting(metric))
+            if retainedRows.isEmpty {
+                observable.update(.collecting(metric))
+            } else {
+                observable.update(.measured(metric, retainedRows))
+            }
         } else {
             observable.update(.idle)
+            observable.updateNextRefresh(nil)
+            resetTrackersWhenIdle()
         }
         startLoopIfNeeded()
     }
@@ -110,7 +177,9 @@ final class TopAppsService {
         } else {
             observable.update(.idle)
         }
-        requestTrackerReset()
+        observable.updateNextRefresh(nil)
+        needsTrackerReset = true
+        resetTrackersWhenIdle()
     }
 
     func wake() {
@@ -127,12 +196,16 @@ final class TopAppsService {
         isStopped = true
         demand = nil
         retainedRows = []
-        retainedMetric = nil
+        lastRowsByMetric.removeAll()
+        suppressedIDs.removeAll()
+        lastSampleWasCollecting = false
         sessionGeneration &+= 1
         loopTask?.cancel()
         loopTask = nil
         observable.update(.idle)
-        requestTrackerReset()
+        observable.updateNextRefresh(nil)
+        needsTrackerReset = true
+        resetTrackersWhenIdle()
     }
 
     /// Drives one turn without waiting for the timer; tests use this to
@@ -158,8 +231,19 @@ final class TopAppsService {
                 guard !Task.isCancelled else { return }
                 let now = self.clock()
                 let elapsed = now >= started ? now - started : 0
-                let interval = max(0.1, self.intervalSeconds(metric))
-                let remaining = interval - Double(elapsed) / 1_000_000_000
+                // Follow the hardware data refresh interval: a slow panel must
+                // not be outrun by the list's fixed fast cadence. The floor only
+                // slows the list; it never speeds it past its own metric floor
+                // (memory stays at its costlier 6 s when that is slower).
+                let base = self.intervalSeconds(metric)
+                let interval = max(0.1, max(base, self.minimumIntervalSeconds))
+                // A baseline-only frame retries quickly so the ranking appears
+                // in about half a second; steady-state keeps the metric cadence.
+                let target = self.lastSampleWasCollecting
+                    ? min(Self.collectingRetryInterval, interval)
+                    : interval
+                let remaining = target - Double(elapsed) / 1_000_000_000
+                self.observable.updateNextRefresh(Date().addingTimeInterval(max(0, remaining)))
                 if remaining > 0 {
                     try? await self.sleepFor(.seconds(remaining))
                 } else {
@@ -172,9 +256,26 @@ final class TopAppsService {
     private func sampleOnce() async {
         guard let metric = demand, !inFlight, !isAsleep, !isStopped else { return }
         inFlight = true
+        lastSampleWasCollecting = false
         let session = sessionGeneration
+
+        await resetTrackerIfNeeded()
+
+        guard session == sessionGeneration,
+              demand == metric,
+              !isAsleep,
+              !isStopped else {
+            inFlight = false
+            startLoopIfNeeded()
+            return
+        }
+
         let applicationSnapshot = applications()
         let result = await sampler.read(metric, applications: applicationSnapshot)
+
+        // The physical read has returned. If the session ended while it was
+        // running, reset the trackers before another read can start.
+        await resetTrackerIfNeeded()
         inFlight = false
 
         guard session == sessionGeneration,
@@ -189,10 +290,23 @@ final class TopAppsService {
 
         switch result {
         case .collecting:
-            observable.update(.collecting(metric))
+            lastSampleWasCollecting = true
+            if retainedRows.isEmpty {
+                observable.update(.collecting(metric))
+            } else {
+                // Keep the previous ranking visible while the new frame is
+                // collected, so reopening the page never flashes an empty card.
+                observable.update(.measured(metric, retainedRows))
+            }
         case .measured(let rows):
-            retainedRows = Self.mergedRows(previous: retainedRows, incoming: rows,
-                                           limit: Self.maximumRows)
+            // Keep a just-quit row out until a fresh sample no longer lists it,
+            // so a close does not leave it lingering at zero in the list.
+            suppressedIDs = suppressedIDs.filter { id in rows.contains { $0.id == id } }
+            let incoming = rows.filter { !suppressedIDs.contains($0.id) }
+            retainedRows = Self.mergedRows(previous: retainedRows.filter { !suppressedIDs.contains($0.id) },
+                                           incoming: incoming,
+                                           metric: metric, limit: Self.maximumRows)
+            lastRowsByMetric[metric] = retainedRows
             observable.update(.measured(metric, retainedRows))
         case .unsupported:
             observable.update(.unsupported(metric))
@@ -203,11 +317,24 @@ final class TopAppsService {
 
     static let maximumRows = 8
 
-    /// Stable merge: previous order first (updated values, or zeroed when the app
-    /// stopped using the resource), then newly seen apps. A new app displaces a
-    /// zero row instead of growing the list.
+    /// Removes a just-quit row from the published ranking right away.
+    private func forgetRow(_ id: TopAppIdentity) {
+        suppressedIDs.insert(id)
+        retainedRows.removeAll { $0.id == id }
+        guard let metric = demand else { return }
+        lastRowsByMetric[metric] = retainedRows
+        if case let .measured(stateMetric, _) = observable.state, stateMetric == metric {
+            observable.update(.measured(metric, retainedRows))
+        }
+    }
+
+    /// Merge then rank. Previous apps keep a slot with refreshed values (or zero
+    /// when the app stopped using the resource) and newly seen apps are added;
+    /// the result is always re-sorted by the current value so a busy app moves up
+    /// and a new high-usage app lands in the right place. A zero row naturally
+    /// settles at the bottom and is the first to be dropped past the limit.
     static func mergedRows(previous: [TopAppRow], incoming: [TopAppRow],
-                           limit: Int) -> [TopAppRow] {
+                           metric: TopAppMetric, limit: Int) -> [TopAppRow] {
         guard limit > 0 else { return [] }
         var byID = Dictionary(uniqueKeysWithValues: incoming.map { ($0.id, $0) })
         var result: [TopAppRow] = []
@@ -224,6 +351,7 @@ final class TopAppsService {
             result.append(row)
             byID.removeValue(forKey: row.id)
         }
+        result = TopAppRanking.sorted(result, metric: metric)
         while result.count > limit {
             if let zeroIndex = result.lastIndex(where: {
                 $0.value == 0 && ($0.upload ?? 0) == 0
@@ -236,9 +364,27 @@ final class TopAppsService {
         return result
     }
 
-    private func requestTrackerReset() {
-        let sampler = self.sampler
-        Task { await sampler.reset() }
+    /// Runs only from `sampleOnce`, while `inFlight` still excludes another
+    /// read. A reset requested during this await is covered by this reset:
+    /// trackers are empty and no read can sample them until it finishes.
+    /// When there is no active read to clear the baseline on its way out, take
+    /// the same in-flight slot so a reopening page waits for this reset.
+    private func resetTrackersWhenIdle() {
+        guard !inFlight else { return }
+        inFlight = true
+        Task { [weak self] in
+            guard let self else { return }
+            await self.resetTrackerIfNeeded()
+            self.inFlight = false
+            self.startLoopIfNeeded()
+        }
+    }
+
+    private func resetTrackerIfNeeded() async {
+        guard needsTrackerReset else { return }
+        needsTrackerReset = false
+        await sampler.reset()
+        needsTrackerReset = false
     }
 }
 

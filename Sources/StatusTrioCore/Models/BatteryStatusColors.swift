@@ -7,7 +7,15 @@ import Foundation
 /// and `.bluetooth`, which are not customisable), while this type is the
 /// settings-facing identity of a customisable battery state.
 enum BatteryStatusColorRole: String, CaseIterable, Hashable, Sendable {
+    /// The plain "on battery, not connected to power" state (#357). Defaults to
+    /// the system foreground colour so an existing install gains the state
+    /// without changing its saved palette.
+    case discharging
+    /// Actively charging (the battery is gaining charge).
     case charging
+    /// Connected to power without charging. Split from `charging` so the two
+    /// states can carry independent colours (#389).
+    case connected
     case lowPower
     /// High Power Mode's ring colour (#235). Defaults to the system blue so an
     /// existing install gains the state without changing its saved palette.
@@ -73,18 +81,24 @@ struct BatteryStatusColorComponents: Equatable, Hashable, Sendable {
 /// and from there into the scene and the render environment, so the menu bar,
 /// the Dock, the popover and every settings preview resolve one shared answer.
 struct BatteryStatusColors: Equatable, Hashable, Sendable {
+    var discharging: BatteryStatusColorSelection
     var charging: BatteryStatusColorSelection
+    var connected: BatteryStatusColorSelection
     var lowPower: BatteryStatusColorSelection
     var highPower: BatteryStatusColorSelection
     var critical: BatteryStatusColorSelection
 
     init(
+        discharging: BatteryStatusColorSelection = .system,
         charging: BatteryStatusColorSelection = .system,
+        connected: BatteryStatusColorSelection = .system,
         lowPower: BatteryStatusColorSelection = .system,
         highPower: BatteryStatusColorSelection = .system,
         critical: BatteryStatusColorSelection = .system
     ) {
+        self.discharging = discharging
         self.charging = charging
+        self.connected = connected
         self.lowPower = lowPower
         self.highPower = highPower
         self.critical = critical
@@ -95,13 +109,15 @@ struct BatteryStatusColors: Equatable, Hashable, Sendable {
     /// Whether any role overrides the system colour. Used by the settings page
     /// to decide if the "follow system" reset is worth offering.
     var hasOverrides: Bool {
-        !charging.isSystem || !lowPower.isSystem || !highPower.isSystem
-            || !critical.isSystem
+        !discharging.isSystem || !charging.isSystem || !connected.isSystem
+            || !lowPower.isSystem || !highPower.isSystem || !critical.isSystem
     }
 
     func selection(for role: BatteryStatusColorRole) -> BatteryStatusColorSelection {
         switch role {
+        case .discharging: discharging
         case .charging: charging
+        case .connected: connected
         case .lowPower: lowPower
         case .highPower: highPower
         case .critical: critical
@@ -110,7 +126,9 @@ struct BatteryStatusColors: Equatable, Hashable, Sendable {
 
     mutating func setSelection(_ selection: BatteryStatusColorSelection, for role: BatteryStatusColorRole) {
         switch role {
+        case .discharging: discharging = selection
         case .charging: charging = selection
+        case .connected: connected = selection
         case .lowPower: lowPower = selection
         case .highPower: highPower = selection
         case .critical: critical = selection

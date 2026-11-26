@@ -359,6 +359,40 @@ enum StatusIconRenderer {
         return CGFloat(glyphHeight) * StatusIconGeometry.batteryChargingBoltCalibration
     }
 
+    /// Glyph-path ink width of a top-gap value string at its configured scale,
+    /// measured the same way `drawSceneAccessoryText` centres it. Feeds the
+    /// ring's top-gap width so three-digit values clear the arc ends.
+    private static func accessoryTextInkWidth(_ text: IconTextState) -> CGFloat {
+        // A trailing degree glyph rides toward the gap edge by design — the
+        // numeric part is what stays centred — so only measure the number.
+        let measured = text.text.count > 1 && text.text.hasSuffix("°")
+            ? String(text.text.dropLast())
+            : text.text
+        let line = sceneTextLine(
+            measured,
+            color: CGColor(gray: 1, alpha: 1),
+            fontSize: batteryValueFontSize(scale: text.scale)
+        )
+        return CTLineGetBoundsWithOptions(line, [.useGlyphPathBounds]).width
+    }
+
+    /// Top-gap arc length for a ring. Value text widens the gap to clear its own
+    /// glyph ink (a three-digit "100" used to touch the arcs); fixed-width
+    /// symbols (bolt, plug) keep the symbolic gap.
+    static func ringTopGapWidth(gap: RingGapStyle, accessory: RingAccessoryState?) -> CGFloat {
+        switch gap {
+        case .indicator:
+            return StatusIconGeometry.batteryChargingBoltTopGapWidth
+        case .value, .closed:
+            if case let .text(text)? = accessory {
+                return StatusIconGeometry.batteryValueGapWidth(
+                    clearingInkWidth: accessoryTextInkWidth(text)
+                )
+            }
+            return StatusIconGeometry.batteryValueTopGapWidth
+        }
+    }
+
     /// Glyph height per point of symbol size, measured once. SF Symbols report
     /// sizes rounded to whole points, so this reference size stays large enough
     /// for the rounding to be negligible. This calibration asks only for the
@@ -1147,7 +1181,7 @@ extension StatusIconRenderer {
     ) {
         let sharedTopGapWidth: CGFloat? = ring.accessory == nil
             ? nil
-            : StatusIconGeometry.batteryValueTopGapWidth
+            : ringTopGapWidth(gap: .value, accessory: ring.accessory)
         let lineWidth = min(12, 8 * CGFloat(ring.strokeScale))
         if regions.contains(.ringTrack) {
             context.setLineWidth(lineWidth)
@@ -1201,27 +1235,52 @@ extension StatusIconRenderer {
         statusPalette: BatteryStatusColorPalette,
         in context: CGContext
     ) {
-        guard case let .symbol(name, variableValue, fallback) = symbol.source else { return }
-        let resolvedName = resolvedCenterSymbolName(name: name, fallback: fallback, color: symbol.color)
-        let usesFallback = !availableSymbol(name)
-        let indicatorTextScale = symbol.scale
-        let center = StatusIconGeometry.batteryTopIndicatorCenter(
-            boltScale: batteryChargingBoltScale(textScale: indicatorTextScale)
-        )
-        let calibratedHeight = batteryTopIndicatorHeight(textScale: indicatorTextScale)
-        let availableHeight = max(1, center.y * 2 - 2)
-        let pointSize = airPodsTopSymbolPointSize(
-            name: resolvedName,
-            targetHeight: min(calibratedHeight, availableHeight)
-        )
-        drawOfficialSymbol(
-            name: resolvedName,
-            variableValue: usesFallback ? 1 : (variableValue ?? 1),
-            pointSize: pointSize,
-            center: center,
-            foreground: sceneColor(for: symbol.color, foreground: foreground, statusPalette: statusPalette),
-            in: context
-        )
+        switch symbol.source {
+        case let .symbol(name, variableValue, fallback):
+            let resolvedName = resolvedCenterSymbolName(name: name, fallback: fallback, color: symbol.color)
+            let usesFallback = !availableSymbol(name)
+            let indicatorTextScale = symbol.scale
+            let center = StatusIconGeometry.batteryTopIndicatorCenter(
+                boltScale: batteryChargingBoltScale(textScale: indicatorTextScale)
+            )
+            let calibratedHeight = batteryTopIndicatorHeight(textScale: indicatorTextScale)
+            let availableHeight = max(1, center.y * 2 - 2)
+            let pointSize = airPodsTopSymbolPointSize(
+                name: resolvedName,
+                targetHeight: min(calibratedHeight, availableHeight)
+            )
+            drawOfficialSymbol(
+                name: resolvedName,
+                variableValue: usesFallback ? 1 : (variableValue ?? 1),
+                pointSize: pointSize,
+                center: center,
+                foreground: sceneColor(for: symbol.color, foreground: foreground, statusPalette: statusPalette),
+                in: context
+            )
+        case .primitive(.bolt):
+            // #361: the dual (left/right) ring's top marker can be a hardware
+            // ring's charging bolt, which is a primitive rather than a symbol —
+            // draw it with the same battery geometry the single ring uses.
+            let indicatorScale = batteryChargingBoltScale(textScale: symbol.scale)
+            let bolt = StatusIconGeometry.batteryChargingBolt(scale: indicatorScale)
+            context.setFillColor(
+                sceneColor(for: symbol.color, foreground: foreground, statusPalette: statusPalette)
+            )
+            context.addPath(bolt)
+            context.fillPath()
+        case .primitive(.plug):
+            drawBatteryPlug(
+                boltScale: batteryChargingBoltScale(textScale: symbol.scale),
+                foreground: sceneColor(for: symbol.color, foreground: foreground, statusPalette: statusPalette),
+                in: context
+            )
+        case .primitive:
+            // The other primitives (wired port, screen/arrow wedges) are centre
+            // artwork, not top markers; nothing to draw in the accessory slot.
+            return
+        case .image:
+            return
+        }
     }
 
     private static func drawSceneRing(
@@ -1265,9 +1324,7 @@ extension StatusIconRenderer {
 
         guard let segment = ring.segments.first else { return }
         let hasTopGap = ring.gap != .closed
-        let topGapWidth = ring.gap == .indicator
-            ? StatusIconGeometry.batteryChargingBoltTopGapWidth
-            : StatusIconGeometry.batteryValueTopGapWidth
+        let topGapWidth = ringTopGapWidth(gap: ring.gap, accessory: ring.accessory)
         let lineWidth = 8 * CGFloat(ring.strokeScale)
 
         // In `.split` mode the top gap carries no progress, so the arc and its
@@ -1627,6 +1684,8 @@ extension StatusIconRenderer {
         switch role {
         case .primary:
             foreground
+        case .discharging:
+            statusPalette.dischargingIsSystem ? foreground : statusPalette.discharging
         case .inactive:
             foreground.copy(alpha: inactiveTrackAlpha) ?? foreground
         case .critical:
@@ -1637,6 +1696,8 @@ extension StatusIconRenderer {
             statusPalette.highPower
         case .powered:
             statusPalette.charging
+        case .connected:
+            statusPalette.connected
         case .bluetooth:
             bluetoothColor(foreground: foreground)
         case .bluetoothIcon:

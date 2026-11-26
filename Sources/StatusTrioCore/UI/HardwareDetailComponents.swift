@@ -56,6 +56,37 @@ enum HardwareDetailFormat {
         return String(format: "%.0f MB", max(0, mb))
     }
 
+    /// Memory sizes are binary (GiB), matching how installed RAM is sold: a
+    /// 128 GiB machine reads 128 GB, not 137 GB. Disk capacity keeps the decimal
+    /// `bytes` formatter above because drive vendors and System Settings use it.
+    static func memoryBytes(_ value: UInt64?) -> String {
+        guard let value else { return dash }
+        return memoryBytes(Double(value))
+    }
+
+    static func memoryBytes(_ value: Double) -> String {
+        guard value.isFinite, value >= 0 else { return dash }
+        let gib = value / 1_073_741_824
+        if gib >= 1024 { return String(format: "%.2f TB", gib / 1024) }
+        if gib >= 1 { return String(format: "%.1f GB", gib) }
+        let mib = value / 1_048_576
+        return String(format: "%.0f MB", max(0, mib))
+    }
+
+    /// Compact single-number form for the ring centre, binary for memory.
+    static func compactMemory(_ bytes: Double) -> String {
+        let gb = bytes / 1_073_741_824
+        if gb >= 10 { return String(format: "%dGB", Int(gb.rounded())) }
+        return String(format: "%.1fGB", gb)
+    }
+
+    /// Compact single-number form for the ring centre, decimal for disk.
+    static func compactDisk(_ bytes: Double) -> String {
+        let gb = bytes / 1_000_000_000
+        if gb >= 10 { return String(format: "%dGB", Int(gb.rounded())) }
+        return String(format: "%.1fGB", gb)
+    }
+
     /// Bytes-per-second rate, picking a readable unit.
     static func rate(_ value: Double?) -> String {
         guard let value, value.isFinite, value >= 0 else { return dash }
@@ -80,7 +111,7 @@ struct HardwareDetailCard<Content: View>: View {
         content()
             .padding(10)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .panelCardSurface(.silver(.connected), tint: .clear, cornerRadius: 13)
+            .hardwareMonitorCardSurface(.silver(.connected), cornerRadius: 13)
     }
 }
 
@@ -126,10 +157,13 @@ struct HardwareDetailProgressBar: View {
     let fraction: Double
     var tint: Color = .accentColor
 
+    @Environment(\.panelCardSurfaceStyle) private var cardStyle
+    @Environment(\.colorScheme) private var scheme
+
     var body: some View {
         GeometryReader { geometry in
             ZStack(alignment: .leading) {
-                Capsule().fill(Color.primary.opacity(0.10))
+                Capsule().fill(HardwareMonitorCardSurface.progressTrackColor(cardStyle: cardStyle, scheme: scheme))
                 Capsule()
                     .fill(tint.opacity(0.85))
                     .frame(width: max(0, min(1, fraction)) * geometry.size.width)

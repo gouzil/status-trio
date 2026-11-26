@@ -1,4 +1,10 @@
 import Foundation
+import OSLog
+
+private let temperatureLogger = Logger(
+    subsystem: "com.lingsmbp.StatusTrio",
+    category: "hardware-temperature"
+)
 
 /// One serial utility queue owns all Reader state and keeps IOKit off the main
 /// actor. Each result explicitly answers the requested IDs, including failures.
@@ -10,17 +16,34 @@ final class HardwareSampler: @unchecked Sendable {
     private let sensorReader = SensorSMCReader()
     private let networkReader = NetworkThroughputReader()
     private let diskReader = DiskThroughputReader()
+    private let diskVolumeReader = DiskVolumeThroughputReader()
     private let cpuFrequencyReader = CPUFrequencyReader()
     private var hasAttemptedCPURead = false
+
+    /// CPU/GPU temperature fallback. All state is touched only on `queue`.
+    private let temperatureCoordinator: TemperatureFallbackCoordinator
+    private let hidTransportFactory: () -> HIDTemperatureTransport
+    private var hidReader: SensorHIDReader?
+    private var loggedHIDMetrics: Set<TemperatureMetric> = []
+
+    init(platform: SensorPlatform = .current(),
+         hidTransportFactory: @escaping () -> HIDTemperatureTransport = { LiveHIDTemperatureTransport() }) {
+        temperatureCoordinator = TemperatureFallbackCoordinator.production(platform: platform)
+        self.hidTransportFactory = hidTransportFactory
+    }
 
     func reset() async {
         await withCheckedContinuation { continuation in
             queue.async {
                 self.cpuReader.reset()
                 self.cpuFrequencyReader.reset()
+                self.sensorReader.resetCapabilities()
                 self.networkReader.resetSession()
                 self.diskReader.reset()
                 self.hasAttemptedCPURead = false
+                self.temperatureCoordinator.reset()
+                self.releaseHIDReader()
+                self.loggedHIDMetrics = []
                 continuation.resume()
             }
         }
@@ -37,6 +60,64 @@ final class HardwareSampler: @unchecked Sendable {
         queue.async { self.networkReader.resetSession() }
     }
 
+    /// Mirrors which temperature metrics still have a consumer. Metrics that
+    /// lost demand drop their fallback state; if neither metric needs HID any
+    /// more, the client and service cache are released.
+    func updateTemperatureDemand(hasCPU: Bool, hasGPU: Bool) {
+        queue.async {
+            var demanded: Set<TemperatureMetric> = []
+            if hasCPU { demanded.insert(.cpu) }
+            if hasGPU { demanded.insert(.gpu) }
+            self.temperatureCoordinator.setDemandedMetrics(demanded)
+            if self.temperatureCoordinator.activeHIDMetrics.isEmpty {
+                self.releaseHIDReader()
+                self.loggedHIDMetrics = []
+            }
+        }
+    }
+
+    /// Drops all fallback state and HID resources (sleep, shutdown, reset).
+    func releaseTemperatureFallback() {
+        queue.async {
+            self.temperatureCoordinator.reset()
+            self.releaseHIDReader()
+            self.loggedHIDMetrics = []
+        }
+    }
+
+    private func ensureHIDReader() -> SensorHIDReader {
+        if let hidReader { return hidReader }
+        let reader = SensorHIDReader(transport: hidTransportFactory())
+        hidReader = reader
+        return reader
+    }
+
+    private func releaseHIDReader() {
+        hidReader?.release()
+        hidReader = nil
+    }
+
+    /// Detail payloads are only built for families that are actually due this
+    /// tick. Building a page from a tick that did not read its metric would
+    /// overwrite the last good payload with nil (or perturb GPU interval math).
+    static func detailKindsToBuild(_ requested: Set<HardwareDetailKind>,
+                                  ids: Set<HardwareMetricID>) -> Set<HardwareDetailKind> {
+        requested.filter { kind in
+            switch kind {
+            case .cpu: return ids.contains(.cpuUsage)
+            case .gpu: return ids.contains(.gpuUsage)
+            case .memory: return ids.contains(.memoryUsage)
+            case .network: return true
+            case .disk: return ids.contains(.diskRead) || ids.contains(.diskWrite)
+            case .fan:
+                return ids.contains { id in
+                    if case .fanRPM = id { return true }
+                    return false
+                }
+            }
+        }
+    }
+
     /// `details` selects which structured detail payloads to build this tick; the
     /// plain metric samples still follow `ids`, so summary consumers are unaffected.
     func read(ids: Set<HardwareMetricID>, at date: Date,
@@ -46,11 +127,15 @@ final class HardwareSampler: @unchecked Sendable {
             queue.async {
                 let first = !self.hasAttemptedCPURead
                 let wantsFrequency = includeCPUFrequency && ids.contains(.cpuUsage)
+                let detailKinds = Self.detailKindsToBuild(details, ids: ids)
                 // GPU utilisation counts render work over the interval since the
                 // last query; querying IOAccelerator twice in a row makes the
                 // second read see an empty interval and report 0%. Read once and
                 // derive both the plain sample and the detail from it.
-                let wantsGPUDetail = details.contains(.gpu)
+                let wantsCPUDetail = detailKinds.contains(.cpu)
+                let wantsGPUDetail = detailKinds.contains(.gpu)
+                let memorySnapshot = detailKinds.contains(.memory) && ids.contains(.memoryUsage)
+                    ? self.memoryReader.readWithDetail(at: date) : nil
                 let gpuDetail: GPUDetailReading? = wantsGPUDetail
                     ? self.gpuReader.readDetail(at: date) : nil
                 let gpuReading: GPUReading? = gpuDetail.flatMap { detail in
@@ -63,34 +148,43 @@ final class HardwareSampler: @unchecked Sendable {
                     wantsGPUDetail ? gpuReading : self.gpuReader.read(at: sampleDate)
                 }
                 var snapshot = Self.collect(ids: ids, isFirstCPURead: first, at: date,
-                                            cpuProvider: { self.cpuReader.read(at: $0) },
+                                            cpuProvider: { self.cpuReader.read(at: $0, includeDetail: wantsCPUDetail) },
                                             frequencyProvider: { wantsFrequency ? self.cpuFrequencyReader.read(at: $0) : nil },
                                             includeCPUFrequency: wantsFrequency,
+                                            includeCPUDetail: wantsCPUDetail,
                                             gpuProvider: gpuProvider,
-                                            memoryProvider: { self.memoryReader.read(at: $0) },
+                                            memoryProvider: { sampleDate in
+                                                memorySnapshot?.reading ?? self.memoryReader.read(at: sampleDate)
+                                            },
+                                            pressureProvider: {
+                                                memorySnapshot?.detail.pressure ?? MemoryReader.pressureLevel()
+                                            },
                                             sensorProvider: { temperature, gpuTemperature, batteryTemperature, fans, date in
-                    self.sensorReader.read(includeTemperature: temperature,
-                                           includeGPUTemperature: gpuTemperature,
-                                           includeBatteryTemperature: batteryTemperature,
-                                           includeFans: fans, at: date)
+                    self.readSensors(includeCPU: temperature,
+                                     includeGPU: gpuTemperature,
+                                     includeBattery: batteryTemperature,
+                                     includeFans: fans, at: date)
                 },
                                             networkProvider: { self.networkReader.read(at: $0) },
                                             diskProvider: { self.diskReader.read(at: $0) })
                 if let gpuDetail {
                     snapshot.gpuDetail = gpuDetail
                 }
-                if details.contains(.memory) {
-                    snapshot.memoryDetail = self.memoryReader.readDetail(at: date)
+                if let memorySnapshot {
+                    snapshot.memoryDetail = memorySnapshot.detail
                 }
-                if details.contains(.network) {
+                if detailKinds.contains(.network) {
                     snapshot.networkDetail = self.networkReader.detailReading(from: nil, at: date)
                 }
-                if details.contains(.disk) {
+                if detailKinds.contains(.disk) {
                     let capacity = DiskCapacityReader.read(at: date)
+                    let volumes = DiskCapacityReader.readVolumes()
                     snapshot.diskDetail = DiskDetailReading(
                         capacity: capacity,
                         readBytesPerSecond: snapshot.samples[.diskRead]?.value,
                         writeBytesPerSecond: snapshot.samples[.diskWrite]?.value,
+                        volumes: volumes,
+                        volumeSpeeds: self.diskVolumeReader.read(at: date, volumes: volumes),
                         sampledAt: date)
                 }
                 if ids.contains(.cpuUsage) { self.hasAttemptedCPURead = true }
@@ -99,14 +193,114 @@ final class HardwareSampler: @unchecked Sendable {
         }
     }
 
+    /// Unified SMC/HID temperature read for one tick. SMC stays the default; the
+    /// coordinator only asks for HID after a metric has failed twice on an
+    /// eligible chip. Battery and fan reads ride the same SMC connection.
+    private func readSensors(includeCPU: Bool, includeGPU: Bool,
+                             includeBattery: Bool, includeFans: Bool,
+                             at date: Date) -> SensorReading {
+        var demanded: Set<TemperatureMetric> = []
+        if includeCPU { demanded.insert(.cpu) }
+        if includeGPU { demanded.insert(.gpu) }
+
+        guard !demanded.isEmpty else {
+            return sensorReader.read(includeTemperature: false, includeGPUTemperature: false,
+                                     includeBatteryTemperature: includeBattery,
+                                     includeFans: includeFans, at: date)
+        }
+
+        var smcReading: SensorReading?
+        let decisions = temperatureCoordinator.resolve(
+            demanded: demanded,
+            at: date,
+            smc: { metrics, sampleDate in
+                if metrics.isEmpty, !includeBattery, !includeFans { return [:] }
+                let reading = self.sensorReader.read(
+                    includeTemperature: metrics.contains(.cpu),
+                    includeGPUTemperature: metrics.contains(.gpu),
+                    includeBatteryTemperature: includeBattery,
+                    includeFans: includeFans,
+                    at: sampleDate)
+                smcReading = reading
+                var values: [TemperatureMetric: Double?] = [:]
+                if metrics.contains(.cpu) { values[.cpu] = reading.cpuTemperature }
+                if metrics.contains(.gpu) { values[.gpu] = reading.gpuTemperature }
+                return values
+            },
+            hid: { metrics, sampleDate in
+                let reader = self.ensureHIDReader()
+                return reader.read(targets: metrics, at: sampleDate)
+            })
+
+        if temperatureCoordinator.activeHIDMetrics.isEmpty {
+            releaseHIDReader()
+        }
+        logFallbackTransitions(decisions: decisions)
+        return mergedSensorReading(smcReading, decisions: decisions, demanded: demanded, at: date)
+    }
+
+    private func mergedSensorReading(_ smcReading: SensorReading?,
+                                     decisions: [TemperatureMetric: TemperatureDecision],
+                                     demanded: Set<TemperatureMetric>,
+                                     at date: Date) -> SensorReading {
+        var result = smcReading ?? SensorReading(cpuTemperature: nil, cpuTemperatureSource: nil,
+                                                 gpuTemperature: nil, fans: [], fanCount: nil,
+                                                 sampledAt: date)
+        for metric in demanded {
+            switch (metric, decisions[metric] ?? .unavailable) {
+            case (.cpu, .smc):
+                result.cpuTemperatureOrigin = .smc
+            case (.cpu, .hid(let measurement)):
+                result.cpuTemperature = measurement.value
+                result.cpuTemperatureSource = measurement.count == 1 ? .single : .average(measurement.count)
+                result.cpuTemperatureOrigin = .hid
+            case (.cpu, .unavailable):
+                result.cpuTemperature = nil
+                result.cpuTemperatureSource = nil
+                result.cpuTemperatureOrigin = .smc
+            case (.gpu, .smc):
+                result.gpuTemperatureOrigin = .smc
+            case (.gpu, .hid(let measurement)):
+                result.gpuTemperature = measurement.value
+                result.gpuTemperatureOrigin = .hid
+            case (.gpu, .unavailable):
+                result.gpuTemperature = nil
+                result.gpuTemperatureOrigin = .smc
+            }
+        }
+        return result
+    }
+
+    private func logFallbackTransitions(decisions: [TemperatureMetric: TemperatureDecision]) {
+        #if DEBUG
+        let active = temperatureCoordinator.activeHIDMetrics
+        for metric in active.subtracting(loggedHIDMetrics) {
+            temperatureLogger.debug("HID fallback activated: \(metric.rawValue)")
+            if case .hid(let measurement) = decisions[metric] {
+                temperatureLogger.debug("HID sensor count \(metric.rawValue)=\(measurement.count)")
+            }
+        }
+        for metric in loggedHIDMetrics.subtracting(active) {
+            if decisions[metric] == .smc {
+                temperatureLogger.debug("SMC recovered: \(metric.rawValue)")
+            } else {
+                temperatureLogger.debug("HID fallback released: \(metric.rawValue)")
+            }
+        }
+        loggedHIDMetrics = active
+        #endif
+    }
+
     /// Synchronous injection seam. Demand checks here are also the production
     /// path: temperature never triggers GPU usage, and CPU-only never opens SMC.
     static func collect(ids: Set<HardwareMetricID>, isFirstCPURead: Bool, at date: Date,
                         cpuProvider: (Date) -> CPUReading?,
                         frequencyProvider: (Date) -> CPUFrequencyReading? = { _ in nil },
                         includeCPUFrequency: Bool = false,
+                        includeCPUDetail: Bool = false,
                         gpuProvider: (Date) -> GPUReading?,
                         memoryProvider: (Date) -> MemoryReader.Reading?,
+                        pressureProvider: () -> MemoryPressureLevel = { .unknown },
                         sensorProvider: (Bool, Bool, Bool, Bool, Date) -> SensorReading,
                         networkProvider: (Date) -> NetworkThroughputReading? = { _ in nil },
                         diskProvider: (Date) -> DiskThroughputReading? = { _ in nil }) -> HardwareMetricsSnapshot {
@@ -124,8 +318,13 @@ final class HardwareSampler: @unchecked Sendable {
         let network = needsNetwork ? networkProvider(date) : nil
         let needsDisk = ids.contains(.diskRead) || ids.contains(.diskWrite)
         let disk = needsDisk ? diskProvider(date) : nil
-        return map(ids: ids, cpu: cpu, gpu: gpu, memory: memory, sensors: sensors, network: network,
-                   disk: disk, cpuFrequency: frequency, isFirstCPURead: isFirstCPURead, at: date)
+        var snapshot = map(ids: ids, cpu: cpu, gpu: gpu, memory: memory, sensors: sensors, network: network,
+                           disk: disk, cpuFrequency: frequency, includeCPUDetail: includeCPUDetail,
+                           isFirstCPURead: isFirstCPURead, at: date)
+        if ids.contains(.memoryPressure) {
+            snapshot.memoryPressure = MemoryPressureReading(level: pressureProvider(), sampledAt: date)
+        }
+        return snapshot
     }
 
     /// Pure mapping of one read attempt. Reader nil alone cannot establish lack
@@ -137,6 +336,7 @@ final class HardwareSampler: @unchecked Sendable {
                     network: NetworkThroughputReading? = nil,
                     disk: DiskThroughputReading? = nil,
                     cpuFrequency: CPUFrequencyReading? = nil,
+                    includeCPUDetail: Bool = true,
                     isFirstCPURead: Bool, at date: Date) -> HardwareMetricsSnapshot {
         var snapshot = HardwareMetricsSnapshot.empty
         for id in ids {
@@ -164,11 +364,17 @@ final class HardwareSampler: @unchecked Sendable {
                 case .gpuTemperature: value = finite(sensors?.gpuTemperature, in: 0...150)
                 default: value = finite(sensors?.batteryTemperature, in: -20...90)
                 }
+                let source: HardwareMetricSource
+                switch id {
+                case .cpuTemperature: source = sensors?.cpuTemperatureOrigin ?? .smc
+                case .gpuTemperature: source = sensors?.gpuTemperatureOrigin ?? .smc
+                default: source = .smc
+                }
                 snapshot.samples[id] = HardwareMetricSample(
-                    value: value, unit: .celsius, sampledAt: sensors?.sampledAt ?? date, source: .smc,
+                    value: value, unit: .celsius, sampledAt: sensors?.sampledAt ?? date, source: source,
                     availability: value != nil ? .measured : .temporarilyUnavailable,
                     sensorLabel: id == .cpuTemperature ? sensors?.cpuTemperatureLabel
-                        : (id == .gpuTemperature ? "GPU area" : "Battery"),
+                        : (id == .gpuTemperature ? (sensors?.gpuTemperatureLabel ?? "GPU area") : "Battery"),
                     metadata: HardwareMetricMetadata(sourceCount: id == .cpuTemperature ? sensors?.cpuTemperatureCount : nil))
             case .fanRPM:
                 // Fill requested slots even when FNum or a fan read failed.
@@ -193,9 +399,17 @@ final class HardwareSampler: @unchecked Sendable {
                 snapshot.samples[id] = HardwareMetricSample(
                     value: value, unit: .bytesPerSecond, sampledAt: disk?.sampledAt ?? date,
                     source: .ioStorage, availability: value != nil ? .measured : .collecting)
+            case .memoryPressure:
+                // The discrete reading is attached by collect(), outside numeric samples.
+                break
+            case .volume, .wifiSignal, .batteryLevel:
+                // Status-snapshot readings come from the general snapshot, not the
+                // hardware sampler; leave the slot untouched if ever requested.
+                break
             }
         }
-        if let cpu {
+        snapshot.cpuFrequency = cpuFrequency
+        if let cpu, includeCPUDetail {
             snapshot.cpuDetail = CPUDetailReading(
                 usage: cpu.usage,
                 breakdown: cpu.breakdown,

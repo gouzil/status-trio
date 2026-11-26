@@ -3,9 +3,11 @@ import Foundation
 enum IconPresentationMapper {
     static func resolve(
         inputs: IconResolutionInputs,
-        configuration: IconConfigurationV1
+        configuration: IconConfigurationV1,
+        bindings: IconSlotBindingsV1? = nil
     ) -> IconResolutionOutput {
-        IconCompositionResolver.resolve(inputs: inputs, configuration: configuration)
+        IconCompositionResolver.resolve(
+            inputs: inputs, configuration: configuration, bindings: bindings)
     }
 
     static func scene(
@@ -97,28 +99,9 @@ enum IconPresentationMapper {
         // top gap closes and its own accessory (percentage/bolt/plug) is not
         // drawn — otherwise the same value would appear twice.
         let gap: RingGapStyle = closesRing ? .closed : gapStyle
-        let accessory: RingAccessoryState?
-        if closesRing {
-            accessory = nil
-        } else {
-            accessory = switch gapContent {
-            case .empty: nil
-            case .percentage:
-                .text(IconTextState(text: "\(battery.percentage)", color: .primary, scale: options.textScale))
-            case .bolt:
-                .symbol(IconSymbolState(
-                    source: .primitive(.bolt),
-                    color: .primary,
-                    scale: options.textScale
-                ))
-            case .plug:
-                .symbol(IconSymbolState(
-                    source: .primitive(.plug),
-                    color: .primary,
-                    scale: options.textScale
-                ))
-            }
-        }
+        let accessory: RingAccessoryState? = closesRing
+            ? nil
+            : gapContent.ringAccessory(battery: battery, scale: options.textScale)
         let effect: RingEffectState? = options.showsChargingEffect
                 && battery.isPresent
                 && battery.isCharging
@@ -404,13 +387,28 @@ enum IconPresentationMapper {
                 color: color,
                 options: options
             )
+        case .metric:
+            // The live path renders this through the hardware-monitor footer
+            // plugin; this branch keeps the legacy mapper (previews, guide art)
+            // consistent when it is handed real hardware samples.
+            return HardwareRingMapper.footerState(
+                metric: inputs.bottomIndicatorMetric,
+                snapshot: inputs.sources.hardwareMetrics,
+                configuration: .default,
+                levels: inputs.sources.hardwareRingLevels,
+                metricColors: inputs.sources.hardwareMetricColors,
+                speedCapsMbps: inputs.sources.hardwareSpeedCapsMbps,
+                now: .now,
+                style: options.displayStyle,
+                strokeScale: options.ringStrokeScale
+            )
         }
     }
 
     /// Resolves the top ring's battery status role and its icon colour. The
     /// bottom battery footer calls this too, so both always draw the same status
     /// colour from the same settings.
-    private static func batteryColorRole(
+    static func batteryColorRole(
         _ battery: BatteryStatus,
         isHighPowerMode: Bool,
         options: BatteryIconOptions
@@ -428,11 +426,13 @@ enum IconPresentationMapper {
             )
             : .foreground
         let color: IconColorRole = switch role {
+        case .discharging: .discharging
         case .foreground: .primary
         case .critical: .critical
         case .lowPower: .lowPower
         case .highPower: .highPower
         case .charging: .powered
+        case .connected: .connected
         }
         return (role, color)
     }
@@ -443,17 +443,24 @@ enum IconPresentationMapper {
         bluetoothOptions: BluetoothAudioIconOptions
     ) -> FooterState {
         let finiteScalar = volume.scalar.flatMap { $0.isFinite ? $0 : nil }
-        let mayUseBluetoothColor = bluetoothOptions.usesVolumeColor && volume.currentDevice?.isBluetoothAudio == true
+        // The custom Bluetooth audio colour applies only while a Bluetooth output
+        // is current. `nil` role keeps the normal primary colour.
+        let bluetoothColor: IconColorRole? = volume.currentDevice?.isBluetoothAudio == true
+            ? (bluetoothOptions.volumeColorRole
+                ?? (bluetoothOptions.usesVolumeColor ? .bluetooth : nil))
+            : nil
 
         switch options.displayStyle {
         case .dots:
             let steps = StatusMappings.volumeSteps(scalar: finiteScalar, isMuted: volume.isMuted) ?? 0
-            let color: IconColorRole = mayUseBluetoothColor && steps > 0 ? .bluetooth : .primary
+            let color: IconColorRole = (bluetoothColor != nil && steps > 0)
+                ? bluetoothColor! : .primary
             return .dots(DotsState(count: 4, activeCount: steps, color: color,
                                    strokeScale: options.ringStrokeScale))
         case .arc:
             let effectiveProgress = volume.isMuted ? 0 : (finiteScalar ?? 0)
-            let color: IconColorRole = mayUseBluetoothColor && effectiveProgress > 0 ? .bluetooth : .primary
+            let color: IconColorRole = (bluetoothColor != nil && effectiveProgress > 0)
+                ? bluetoothColor! : .primary
             return .arc(ArcState(progress: effectiveProgress, color: color,
                                  strokeScale: options.ringStrokeScale))
         }

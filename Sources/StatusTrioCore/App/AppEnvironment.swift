@@ -7,6 +7,7 @@ final class AppEnvironment {
     let settings: SettingsStore
     let localization: Localization
     let iconPresentation: IconPresentationViewModel
+    let localIconPluginRuntime: LocalIconPluginRuntime
     let statusBarController: StatusBarController
     let settingsWindowController: SettingsWindowController
     let sailingMode: SailingModeController?
@@ -34,7 +35,16 @@ final class AppEnvironment {
     private var chargingEffectCancellables = Set<AnyCancellable>()
     private var sailingModeCancellables = Set<AnyCancellable>()
     private var inputSourceLifecycleCancellables = Set<AnyCancellable>()
-    private var hardwareRingDemandCancellable: AnyCancellable?
+    private var hardwareRingDemandWiring: IconHardwareDemandWiring?
+    private var airPodsDemandWiring: IconAirPodsDemandWiring?
+    private var hardwareSamplingSettingsCancellables = Set<AnyCancellable>()
+    private var localIconDemandWiring: IconLiveDemandWiring?
+    private var localIconPluginCancellables = Set<AnyCancellable>()
+    private let localIconRefreshCoalescer = IconLiveResolutionCoalescer(
+        minimumInterval: 0.25,
+        timing: .live()
+    )
+    private let hardwareBackgroundDemandController: HardwareBackgroundDemandController
     private var previewResourceLifecycleCancellables = Set<AnyCancellable>()
     private var hasSubscribedToChargingEffectInputs = false
     private var isPreviewResourceLifecycleStarted = false
@@ -67,7 +77,8 @@ final class AppEnvironment {
         memoryPressureMonitor: MemoryPressureMonitor? = nil,
         bluetoothProfilerCache: BluetoothProfilerReportCache = .shared,
         previewResourceLifecycle: PreviewResourceLifecycle? = nil,
-        backgroundUITesting: BackgroundUITestingConfiguration = .disabled
+        backgroundUITesting: BackgroundUITestingConfiguration = .disabled,
+        localIconPluginRuntime: LocalIconPluginRuntime = LocalIconPluginRuntime(directories: { [] })
     ) {
         self.store = store
         self.settings = settings
@@ -93,8 +104,10 @@ final class AppEnvironment {
         self.bluetoothProfilerCache = bluetoothProfilerCache
         self.previewResourceLifecycle = previewResourceLifecycle ?? PreviewResourceLifecycle()
         self.backgroundUITesting = backgroundUITesting
+        self.localIconPluginRuntime = localIconPluginRuntime
         self.menuBarChargingEffectEnabled = settings.showsMenuBarChargingEffect
         self.dockChargingEffectEnabled = settings.showsDockChargingEffect
+        self.hardwareBackgroundDemandController = HardwareBackgroundDemandController(store: store, settings: settings)
     }
 
     func start() {
@@ -105,6 +118,10 @@ final class AppEnvironment {
         memoryPressureMonitor.start()
         iconPresentation.start()
         startHardwareRingDemand()
+        startAirPodsDemand()
+        startHardwareSamplingSettings()
+        startLocalIconPluginRuntime()
+        hardwareBackgroundDemandController.start()
         startInputSourceMonitoringIfNeeded()
         // A panel test must not be blocked by first-run onboarding. The
         // Settings background route keeps its existing onboarding policy.
@@ -214,9 +231,18 @@ final class AppEnvironment {
         inputSourceController.stop()
         appIconController.stop()
         mainMenuController.stop()
+        airPodsDemandWiring?.stop()
+        airPodsDemandWiring = nil
         store.stop()
-        hardwareRingDemandCancellable?.cancel()
-        hardwareRingDemandCancellable = nil
+        hardwareBackgroundDemandController.stop()
+        hardwareRingDemandWiring?.stop()
+        hardwareRingDemandWiring = nil
+        hardwareSamplingSettingsCancellables.removeAll()
+        localIconDemandWiring?.stop()
+        localIconDemandWiring = nil
+        localIconPluginRuntime.stop()
+        localIconPluginCancellables.removeAll()
+        localIconRefreshCoalescer.cancel()
         store.hardwareMetrics.end(.menuBarArc)
         store.hardwareMetrics.end(.dock)
         // Both profiler consumers belong to the stopped store. A pressure
@@ -226,31 +252,125 @@ final class AppEnvironment {
         releaseRebuildableResources()
     }
 
+    /// Starts the local package runtime and keeps it in step with the resolved
+    /// icon demand and the enabled directory list. A package update only
+    /// re-resolves the scene; it never rewrites the saved slot bindings.
+    private func startLocalIconPluginRuntime() {
+        guard settings.isLocalIconPluginEntryAvailable else { return }
+        localIconPluginCancellables.removeAll()
+        localIconDemandWiring?.stop()
+        localIconDemandWiring = nil
+        localIconPluginRuntime.start()
+        localIconPluginRuntime.changes
+            .sink { [weak self] in
+                guard let self else { return }
+                // External readings can arrive in bursts; keep the first value
+                // immediate and coalesce the rest to at most four parses/second.
+                self.localIconRefreshCoalescer.request { [weak self] in
+                    self?.iconPresentation.refresh()
+                }
+            }
+            .store(in: &localIconPluginCancellables)
+        let demandWiring = IconLiveDemandWiring(
+            demand: iconPresentation.demand,
+            placement: settings.appIconPlacement,
+            apply: { [weak self] bindings in
+                self?.localIconPluginRuntime.updateDemand(bindings)
+            }
+        )
+        localIconDemandWiring = demandWiring
+        demandWiring.start(
+            demands: iconPresentation.$demand.eraseToAnyPublisher(),
+            placements: settings.$appIconPlacement.eraseToAnyPublisher()
+        )
+        settings.$localIconPluginDirectories
+            .dropFirst()
+            .removeDuplicates()
+            .sink { [weak self] _ in
+                guard let self else { return }
+                Task { await self.localIconPluginRuntime.reloadCatalog() }
+            }
+            .store(in: &localIconPluginCancellables)
+    }
+
     /// Demand the hardware metrics only while the System Monitoring ring is the
     /// selected outer-ring source. This keeps the low-power contract: battery /
     /// AirPods users never start the metric sampling loop.
     private func startHardwareRingDemand() {
-        hardwareRingDemandCancellable = Publishers.CombineLatest(
-            settings.iconPresentationPublisher.map(\.iconConfiguration),
-            settings.$appIconPlacement
+        let wiring = IconHardwareDemandWiring(
+            demand: iconPresentation.demand,
+            placement: settings.appIconPlacement,
+            apply: { [weak self] demands in
+                guard let self else { return }
+                if let menuBar = demands.menuBar {
+                    self.store.hardwareMetrics.begin(.menuBarArc, metrics: menuBar)
+                } else {
+                    self.store.hardwareMetrics.end(.menuBarArc)
+                }
+                if let dock = demands.dock {
+                    self.store.hardwareMetrics.begin(.dock, metrics: dock)
+                } else {
+                    self.store.hardwareMetrics.end(.dock)
+                }
+            }
         )
-        .removeDuplicates { $0.0 == $1.0 && $0.1 == $1.1 }
-        .sink { [weak self] configuration, placement in
-            self?.reconcileHardwareRingDemand(configuration, placement: placement)
-        }
+        hardwareRingDemandWiring = wiring
+        wiring.start(
+            demands: iconPresentation.$demand.eraseToAnyPublisher(),
+            placements: settings.$appIconPlacement.eraseToAnyPublisher()
+        )
     }
 
-    /// Demand the hardware metrics only on the surfaces that actually show the
-    /// System Monitoring ring, and only while that source is selected (or is the
-    /// fallback so a switch does not start from cold). Panel demand stays owned by
-    /// the panel view model.
-    private func reconcileHardwareRingDemand(_ configuration: IconConfigurationV1,
-                                             placement: AppIconPlacement) {
-        let demands = IconSourceDemandPolicy.hardwareRingDemands(configuration: configuration, placement: placement)
-        if let menuBar = demands.menuBar { store.hardwareMetrics.begin(.menuBarArc, metrics: menuBar) }
-        else { store.hardwareMetrics.end(.menuBarArc) }
-        if let dock = demands.dock { store.hardwareMetrics.begin(.dock, metrics: dock) }
-        else { store.hardwareMetrics.end(.dock) }
+    /// Keeps the AirPods battery ring fed while it is the outer-ring source.
+    /// The claim is driven by the live icon configuration, and every battery
+    /// update triggers a repaint so the menu bar and Dock show the new level.
+    private func startAirPodsDemand() {
+        let wiring = IconAirPodsDemandWiring(
+            settings: settings,
+            bluetooth: store.bluetoothDevices,
+            onBluetoothDemandChange: { [weak self] active in
+                self?.store.setIconBluetoothDemand(active)
+            },
+            onRefresh: { [weak self] in
+                self?.iconPresentation.refresh()
+            }
+        )
+        airPodsDemandWiring = wiring
+        wiring.start()
+    }
+
+    /// Applies the temperature-monitoring switch to the shared sampler. Keeping
+    /// it here covers the background and menu-bar demands even while the panel is
+    /// closed; the panel view model only mirrors the setting for rendering.
+    private func startHardwareSamplingSettings() {
+        applyHardwareSamplingSettings(
+            temperatureEnabled: settings.hardwareTemperatureMonitoringEnabled,
+            cpuRingCenterContent: settings.cpuRingCenterContent)
+        // Published emits in willSet, so the sink must use the delivered values;
+        // reading the stored properties here would apply the previous toggle
+        // (off-to-on would leave sampling disabled).
+        Publishers.CombineLatest(
+            settings.$hardwareTemperatureMonitoringEnabled,
+            settings.$cpuRingCenterContent
+        )
+        .removeDuplicates { lhs, rhs in
+            lhs.0 == rhs.0 && lhs.1 == rhs.1
+        }
+        .sink { [weak self] enabled, content in
+            self?.applyHardwareSamplingSettings(
+                temperatureEnabled: enabled,
+                cpuRingCenterContent: content)
+        }
+        .store(in: &hardwareSamplingSettingsCancellables)
+    }
+
+    private func applyHardwareSamplingSettings(
+        temperatureEnabled: Bool,
+        cpuRingCenterContent: HardwareRingCenterContent
+    ) {
+        store.hardwareMetrics.temperatureMonitoringEnabled = temperatureEnabled
+        store.hardwareMetrics.wantsRingCPUFrequency =
+            !temperatureEnabled || cpuRingCenterContent == .frequency
     }
 
     private func startPreviewResourceLifecycleIfNeeded() {
@@ -506,10 +626,12 @@ final class AppEnvironment {
             refreshInterval: refreshInterval,
             bluetoothDevices: BluetoothDeviceController(
                 // The accessory power sources are the second battery source, read
-                // only for the devices the paired-device report carries no level
-                // for; accessory notifications are what make a level refresh
-                // between the safety-net polls.
-                accessoryBatteryReader: PmsetAccessoryBatteryWorker(),
+                // only for a level the paired-device report cannot supply and for
+                // the charging state the summary rows draw. IOKit is the cheap
+                // path; `pmset` stays as the fallback when the private symbol or
+                // its coverage is not there. Accessory notifications are what
+                // make a refresh happen between the safety-net polls.
+                accessoryBatteryReader: SystemAccessoryBatteryWorker(),
                 connectionEvents: IOBluetoothConnectionEventMonitor(),
                 accessoryBatteryEvents: AccessoryPowerNotifyEventMonitor(),
                 // Constructing the adapter is inert; its CBCentralManager is
@@ -523,11 +645,23 @@ final class AppEnvironment {
     static func live(
         backgroundUITesting: BackgroundUITestingConfiguration = .disabled
     ) -> AppEnvironment {
-        let settings = SettingsStore()
+        let settings = SettingsStore(
+            backgroundUITestingForcesHardwareMonitor:
+                backgroundUITesting.isEnabled && backgroundUITesting.opensHardwareDetailRaw != nil
+        )
         // A measurement launch can force the synthetic charging input so the
         // animation can be compared on and off on a machine that is not charging.
         if ChargingEffectTestMode.shouldForceChargingInput() {
             settings.setChargingEffectTestInputEnabled(true)
+        }
+        // Apply a per-worktree development test profile after settings migration
+        // and before controllers/monitoring start, so a dev build boots already in
+        // the state the task needs. Release/App Store builds never load one.
+        if DevelopmentProfileLoader.isDevelopmentBuild() {
+            let appVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
+            let profileService = SettingsServiceFactory.make(for: settings, appVersion: appVersion)
+            let run = DevelopmentProfileBootstrap.runAtLaunch(service: profileService)
+            NSLog("StatusTrio development profile: %@", run.log.joined(separator: " | "))
         }
         let store = makeStore(
             batteryMonitor: BatteryMonitor(),
@@ -553,6 +687,11 @@ final class AppEnvironment {
         let noBatteryPreview = settings.isNoBatterySimulationActive
         let isDevelopmentBuild = settings.isDevelopmentBuild
         let hardwareRingTracker = HardwareRingStatusTracker()
+        let localIconPluginRuntime = LocalIconPluginRuntime(
+            directories: { [weak settings] in
+                settings?.resolvedLocalIconPluginDirectories() ?? []
+            }
+        )
         let iconPresentation = IconPresentationViewModel(
             snapshot: noBatteryPreview
                 ? store.snapshot.replacingBattery(
@@ -601,7 +740,8 @@ final class AppEnvironment {
                     batteryLevels: store.bluetoothDevices.batteryLevels,
                     batteryLevelsUpdatedAt: store.bluetoothDevices.batteryLevelsUpdatedAt,
                     selectedAirPodsAddress: settings.airPodsIconDeviceAddress,
-                    selectedConnectedDeviceAddress: settings.bluetoothNetworkIconDeviceAddress
+                    selectedConnectedDeviceAddress: settings.bluetoothNetworkIconDeviceAddress,
+                    holdsAirPodsBattery: settings.outerRingContent == .airPodsBattery
                 )
                 let hardwareSnapshot = store.hardwareMetrics.observable.snapshot
                 inputs.sources.hardwareMetrics = hardwareSnapshot
@@ -617,11 +757,14 @@ final class AppEnvironment {
                 )
                 return inputs
             },
-            mapScene: { inputs, _, iconConfiguration in
-                IconCompositionResolver.resolve(
+            mapScene: { inputs, _, iconConfiguration, slotBindings in
+                let resolution = IconCompositionResolver.resolve(
                     inputs: IconResolutionInputs(system: inputs, sources: inputs.sources),
-                    configuration: iconConfiguration
-                ).scene
+                    configuration: iconConfiguration,
+                    bindings: slotBindings,
+                    registry: localIconPluginRuntime.registry
+                )
+                return IconSceneMapping(scene: resolution.scene, demand: resolution.demand)
             }
         )
         let chargingEffectClock = ChargingEffectClock()
@@ -770,7 +913,8 @@ final class AppEnvironment {
             dockChargingAnimationPresenter: dockChargingAnimationPresenter,
             dockVisibilityMonitor: dockVisibilityMonitor,
             telemetryReporter: telemetryReporter,
-            backgroundUITesting: backgroundUITesting
+            backgroundUITesting: backgroundUITesting,
+            localIconPluginRuntime: localIconPluginRuntime
         )
     }
 

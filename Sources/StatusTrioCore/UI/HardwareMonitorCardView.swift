@@ -27,7 +27,7 @@ struct HardwareMonitorCardView: View {
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
 
     var body: some View {
-        let tiles = HardwareMetricTilePresentation.tiles(metrics: metrics, snapshot: model.snapshot,
+        let tiles = HardwareMetricTilePresentation.tiles(metrics: metrics, snapshot: model.panelSnapshot,
                                                           localization: localization, colors: metricColors,
                                                           speedCapsMbps: speedCapsMbps)
         VStack(spacing: 12) {
@@ -115,7 +115,7 @@ struct HardwareMetricTilePresentation: Equatable {
                       localization: Localization,
                       colors: [HardwareMonitorMetric: IconRGBA] = [:],
                       speedCapsMbps: [HardwareMonitorMetric: Double] = [:]) -> [Self] {
-        metrics.map { metric in
+        metrics.compactMap { metric -> Self? in
             let tint = colors[metric] ?? HardwareRingColorConfiguration.recommendedBaseColor(for: metric)
             switch metric {
             case .cpuUsage:
@@ -139,6 +139,9 @@ struct HardwareMetricTilePresentation: Equatable {
             case .uploadSpeed:
                 return make(metric: .upload, sample: snapshot.networkUpload, localization: localization,
                             tint: tint, capMbps: speedCapsMbps[.uploadSpeed])
+            case .volume, .wifiSignal, .batteryLevel:
+                // Status-snapshot readings are never card tiles.
+                return nil
             }
         }
     }

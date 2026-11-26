@@ -4,8 +4,22 @@ import Foundation
 typealias IconSceneMapper = @MainActor (
     IconPresentationInputs,
     IconPresentationConfiguration,
-    IconConfigurationV1
-) -> IconSceneState
+    IconConfigurationV1,
+    IconSlotBindingsV1?
+) -> IconSceneMapping
+
+/// Scene plus the source demand that produced it. The demand travels with the
+/// scene so the host never re-derives it from pixels or from a possibly stale
+/// persisted configuration.
+struct IconSceneMapping: Equatable, Sendable {
+    var scene: IconSceneState
+    var demand: IconPresentationDemand = .none
+
+    init(scene: IconSceneState, demand: IconPresentationDemand = .none) {
+        self.scene = scene
+        self.demand = demand
+    }
+}
 
 @MainActor
 protocol IconPresentationScheduling: AnyObject {
@@ -54,6 +68,9 @@ struct IconPresentationSettings: Equatable, Sendable {
     /// `resolveInputs`) avoids the `@Published` willSet race that made a live
     /// change publish the *previous* value one step late.
     var runtimeOptions: IconPresentationRuntimeOptions? = nil
+    /// The versioned plugin bindings the scene renders from. `nil` keeps older
+    /// call sites and previews on the one-time migration from `iconConfiguration`.
+    var slotBindings: IconSlotBindingsV1? = nil
     /// Delivered with the settings snapshot so colour/cap edits are read from the
     /// value that produced this publication, not from the live store during
     /// `@Published` willSet (which lags one edit).
@@ -66,6 +83,15 @@ struct IconPresentationOutput: Equatable, Sendable {
     let scene: IconSceneState
     var menuBarTestScene: IconSceneState? = nil
     let menuBarSize: Double
+    var demand: IconPresentationDemand = .none
+
+    /// Demand is published separately (even when the pixels are unchanged), so
+    /// equality for repaint deduplication deliberately ignores it.
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.scene == rhs.scene
+            && lhs.menuBarTestScene == rhs.menuBarTestScene
+            && lhs.menuBarSize == rhs.menuBarSize
+    }
 }
 
 @MainActor
@@ -73,6 +99,10 @@ final class IconPresentationViewModel: ObservableObject {
     static let snapshotDebounceInterval: Duration = .milliseconds(500)
 
     @Published private(set) var output: IconPresentationOutput
+    /// Live-source demand from the most recent resolution. Published even when
+    /// the scene is pixel-identical, because a different binding can need a
+    /// different watch or metric sample.
+    @Published private(set) var demand: IconPresentationDemand
 
     private let snapshots: AnyPublisher<StatusSnapshot, Never>
     private let preferences: AnyPublisher<IconPresentationSettings, Never>
@@ -111,8 +141,9 @@ final class IconPresentationViewModel: ObservableObject {
         highPowerModes: AnyPublisher<Bool, Never> = Empty<Bool, Never>().eraseToAnyPublisher(),
         hardwareMetrics: AnyPublisher<HardwareMetricsSnapshot, Never> = Empty<HardwareMetricsSnapshot, Never>().eraseToAnyPublisher(),
         resolveInputs: @escaping @MainActor (StatusSnapshot) -> IconPresentationInputs,
-        mapScene: @escaping IconSceneMapper = { inputs, configuration, _ in
-            IconPresentationMapper.scene(inputs: inputs, configuration: configuration)
+        mapScene: @escaping IconSceneMapper = { inputs, configuration, _, _ in
+            IconSceneMapping(
+                scene: IconPresentationMapper.scene(inputs: inputs, configuration: configuration))
         },
         snapshotScheduler: any IconPresentationScheduling = TaskIconPresentationScheduler()
     ) {
@@ -127,7 +158,7 @@ final class IconPresentationViewModel: ObservableObject {
         self.snapshotScheduler = snapshotScheduler
         self.latestSnapshot = snapshot
         self.latestSettings = settings
-        self.output = Self.output(
+        let initialOutput = Self.output(
             snapshot: snapshot,
             settings: settings,
             inputSource: nil,
@@ -136,6 +167,8 @@ final class IconPresentationViewModel: ObservableObject {
             resolveInputs: resolveInputs,
             mapScene: mapScene
         )
+        self.output = initialOutput
+        self.demand = initialOutput.demand
     }
 
     func start() {
@@ -175,6 +208,15 @@ final class IconPresentationViewModel: ObservableObject {
                 self?.receive(hardwareMetrics: snapshot)
             }
         }
+    }
+
+    /// Re-resolves the current snapshot without waiting for a settings or
+    /// snapshot publisher. Used when an external live package updates its
+    /// reading or the plugin registry changes.
+    func refresh() {
+        guard synchronizedStart else { return }
+        snapshotScheduler.cancel()
+        publishLatestOutput()
     }
 
     func stop() {
@@ -266,19 +308,33 @@ final class IconPresentationViewModel: ObservableObject {
         publishLatestOutput()
     }
 
-    /// A hardware-metric tick only affects the icon while a hardware ring is on
-    /// screen; when it is not, the resolved scene is unchanged and `output`
-    /// equality short-circuits the publish, so this is cheap for battery/AirPods
-    /// users. Sampling itself is demand-driven elsewhere.
+    /// A hardware-metric tick re-resolves the icon whenever the current scene
+    /// actually demands hardware metrics — the hardware ring **or** a hardware
+    /// metric in the bottom indicator / another slot. Re-resolving only for the
+    /// ring made a metric bottom source wait for the next status-snapshot tick
+    /// (seconds) before it appeared. When nothing demands hardware metrics the
+    /// resolved scene is unchanged and `output` equality short-circuits anyway.
     private func receive(hardwareMetrics: HardwareMetricsSnapshot) {
         guard synchronizedStart else { return }
-        // Only re-resolve when the hardware ring is actually selected (primary or
-        // fallback). Panel/card hardware ticks must not re-parse an icon that is
-        // drawing the Mac battery, AirPods or another source.
-        let composition = latestSettings.iconConfiguration.composition.outerRing
-        guard composition.primary == .hardwareMonitor || composition.fallback == .hardwareMonitor else {
-            return
+        // Re-resolve when the hardware ring is selected (primary or fallback) or a
+        // hardware metric drives the bottom indicator. Panel/card ticks never
+        // re-parse an icon that draws the Mac battery / AirPods / other source.
+        let usesHardwareRing: Bool
+        let usesHardwareFooter: Bool
+        if let bindings = latestSettings.slotBindings {
+            let ring = bindings.selection(for: .outerRing)
+            usesHardwareRing = ring.primary?.pluginID == "builtin.hardware-monitor"
+                || ring.fallback?.pluginID == "builtin.hardware-monitor"
+            let footer = bindings.selection(for: .footer)
+            usesHardwareFooter = footer.primary?.pluginID == "builtin.hardware-monitor"
+                || footer.fallback?.pluginID == "builtin.hardware-monitor"
+        } else {
+            let composition = latestSettings.iconConfiguration.composition.outerRing
+            usesHardwareRing = composition.primary == .hardwareMonitor
+                || composition.fallback == .hardwareMonitor
+            usesHardwareFooter = latestSettings.runtimeOptions?.bottomIndicatorSource == .metric
         }
+        guard usesHardwareRing || usesHardwareFooter else { return }
         snapshotScheduler.cancel()
         publishLatestOutput()
     }
@@ -300,6 +356,7 @@ final class IconPresentationViewModel: ObservableObject {
             resolveInputs: resolveInputs,
             mapScene: mapScene
         )
+        if next.demand != demand { demand = next.demand }
         guard output != next else { return }
         output = next
     }
@@ -313,7 +370,7 @@ final class IconPresentationViewModel: ObservableObject {
         resolveInputs: @MainActor (StatusSnapshot) -> IconPresentationInputs,
         mapScene: IconSceneMapper
     ) -> IconPresentationOutput {
-        let scene = mapScene(
+        let mapping = mapScene(
             resolvedInputs(
                 snapshot: snapshot,
                 inputSource: inputSource,
@@ -326,8 +383,10 @@ final class IconPresentationViewModel: ObservableObject {
                 resolveInputs: resolveInputs
             ),
             settings.configuration,
-            settings.iconConfiguration
+            settings.iconConfiguration,
+            settings.slotBindings
         )
+        let scene = mapping.scene
         let menuBarTestScene: IconSceneState?
         if settings.testsChargingEffect {
             let projected = ChargingEffectTestMode.snapshot(snapshot, enabled: true)
@@ -344,15 +403,17 @@ final class IconPresentationViewModel: ObservableObject {
                     resolveInputs: resolveInputs
                 ),
                 settings.configuration,
-                settings.iconConfiguration
-            )
+                settings.iconConfiguration,
+                settings.slotBindings
+            ).scene
         } else {
             menuBarTestScene = nil
         }
         return IconPresentationOutput(
             scene: scene,
             menuBarTestScene: menuBarTestScene,
-            menuBarSize: settings.menuBarSize
+            menuBarSize: settings.menuBarSize,
+            demand: mapping.demand
         )
     }
 
@@ -362,7 +423,7 @@ final class IconPresentationViewModel: ObservableObject {
     /// the closure only ever sees a status snapshot: a missing icon file has to
     /// degrade to the source's short label on the live icon exactly as it does
     /// in the settings previews.
-    private static func resolvedInputs(
+    static func resolvedInputs(
         snapshot: StatusSnapshot,
         inputSource: InputSourceDescriptor?,
         systemPower: SystemPowerSample?,
@@ -392,7 +453,14 @@ final class IconPresentationViewModel: ObservableObject {
             isHighPowerMode: isHighPowerMode,
             sources: inputs.sources,
             bottomIndicatorSource: settingsRuntimeOptions?.bottomIndicatorSource
-                ?? inputs.bottomIndicatorSource
+                ?? inputs.bottomIndicatorSource,
+            // The metric source's metric and dot/arc style are runtime-only too;
+            // dropping them here made the live icon fall back to CPU usage + dots
+            // even after the settings page switched to arc.
+            bottomIndicatorMetric: settingsRuntimeOptions?.bottomIndicatorMetric
+                ?? inputs.bottomIndicatorMetric,
+            bottomIndicatorStyle: settingsRuntimeOptions?.bottomIndicatorStyle
+                ?? inputs.bottomIndicatorStyle
         )
     }
 }

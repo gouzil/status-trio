@@ -7,6 +7,8 @@ import SwiftUI
 struct HardwareMonitorSummaryView: View {
     @ObservedObject var model: HardwareMonitorObservable
     var metricColors: [HardwareMonitorMetric: IconRGBA] = [:]
+    /// Colour of the SSD ring arc (not a sampled metric; see HardwareRingStrip).
+    var diskColor: IconRGBA = HardwareRingColorConfiguration.solidStateDriveColor
     var showsRings: Bool = true
     var showsSummaryRow: Bool = true
     /// Routes a ring card or info-bar cell to its detail page. Nil disables taps
@@ -14,6 +16,19 @@ struct HardwareMonitorSummaryView: View {
     var onOpenHardwareDetail: ((HardwareDetailKind) -> Void)? = nil
     /// Ring cards the user kept enabled, in their canonical order.
     var ringSlots: [HardwareRingSlot] = HardwareRingSlot.allCases
+    /// Whether the RAM / SSD rings read as consumed or remaining.
+    var memoryRingDisplayMode: RingValueDisplayMode = .used
+    var ssdRingDisplayMode: RingValueDisplayMode = .used
+    /// Whether the SSD ring's percentage pools selected external volumes and
+    /// whether the card shows the external total footer.
+    var ssdIncludeExternalInPercent: Bool = false
+    var ssdSelectedExternalPaths: Set<String> = []
+    var cpuRingCenterContent: HardwareRingCenterContent = .temperature
+    var gpuRingCenterContent: HardwareRingCenterContent = .temperature
+    var hardwareTemperatureMonitoringEnabled: Bool = true
+    /// Split each ring's progress across the top gap (left half 0–50%, right
+    /// half 50–100%) so the percentage in the gap never hides progress (#375).
+    var hardwareRingSplitGapProgress: Bool = false
     /// Bottom info-bar metrics the user kept enabled.
     var summaryMetrics: Set<HardwareSummaryMetric> = Set(HardwareSummaryMetric.allCases)
 
@@ -34,17 +49,25 @@ struct HardwareMonitorSummaryView: View {
 
     private var visibleItems: [HardwareSummaryMetricPresentation] {
         HardwareMonitorSummaryPresentation.items(
-            snapshot: model.summarySnapshot, localization: localization
+            snapshot: model.panelSummarySnapshot, localization: localization
         ).filter { summaryMetrics.contains($0.metric) }
     }
 
     private var content: some View {
         VStack(spacing: 6) {
             if showsRings, !ringSlots.isEmpty {
-                HardwareRingStrip(hardware: model, colors: metricColors, carded: true,
+                HardwareRingStrip(hardware: model, colors: metricColors, diskColor: diskColor, carded: true,
                                   onSelectSlot: onOpenHardwareDetail,
                                   visibleSlots: ringSlots,
-                                  animatesProgress: false)
+                                  animatesProgress: false,
+                                  memoryDisplayMode: memoryRingDisplayMode,
+                                  ssdDisplayMode: ssdRingDisplayMode,
+                                  cpuCenterContent: cpuRingCenterContent,
+                                  gpuCenterContent: gpuRingCenterContent,
+                                  temperatureMonitoringEnabled: hardwareTemperatureMonitoringEnabled,
+                                  splitGapProgress: hardwareRingSplitGapProgress,
+                                  ssdIncludeExternalInPercent: ssdIncludeExternalInPercent,
+                                  ssdSelectedExternalPaths: ssdSelectedExternalPaths)
             }
             if showsSummaryRow, !visibleItems.isEmpty {
                 CompactSummaryInfoBar(items: visibleItems) { metric in
@@ -68,6 +91,7 @@ struct CompactSummaryInfoBar: View {
     var onSelect: ((HardwareSummaryMetric) -> Void)? = nil
 
     @State private var hoveredMetric: HardwareSummaryMetric?
+    @Environment(\.panelCardSurfaceStyle) private var panelCardStyle
 
     var body: some View {
         HStack(spacing: 0) {
@@ -82,7 +106,7 @@ struct CompactSummaryInfoBar: View {
             }
         }
         .frame(height: HardwareSummaryMetricCell.barHeight)
-        .panelCardSurface(.silver(.disconnected), tint: .clear, cornerRadius: 10)
+        .hardwareMonitorCardSurface(.silver(.disconnected), cornerRadius: 10)
         .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
     }
 
@@ -97,7 +121,9 @@ struct CompactSummaryInfoBar: View {
             .buttonStyle(.plain)
             .overlay {
                 RoundedRectangle(cornerRadius: 7, style: .continuous)
-                    .fill(Color.white.opacity(hoveredMetric == item.metric ? 0.08 : 0))
+                    .fill(panelCardStyle == .solid
+                          ? Color.primary.opacity(hoveredMetric == item.metric ? 0.06 : 0)
+                          : Color.white.opacity(hoveredMetric == item.metric ? 0.08 : 0))
                     .allowsHitTesting(false)
             }
             .onHover { inside in

@@ -57,6 +57,22 @@ struct BatteryStatusColorsTests {
         #expect(SettingsStore(defaults: defaults).batteryStatusColors == .standard)
     }
 
+    @Test func connectedColourInheritsLegacyChargingOnUpgrade() throws {
+        let suite = "BatteryStatusColorsTests.\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        // #389: a build before the split stored one merged colour under charging.
+        defaults.set("preset:amber", forKey: SettingsStore.batteryStatusColorsChargingDefaultsKey)
+        let store = SettingsStore(defaults: defaults)
+        #expect(store.batteryStatusColors.charging == .preset(.amber))
+        #expect(store.batteryStatusColors.connected == .preset(.amber))
+        #expect(defaults.string(forKey: SettingsStore.batteryStatusColorsConnectedDefaultsKey) == "preset:amber")
+        // After the upgrade the two roles are independent.
+        store.batteryStatusColors.setSelection(.preset(.sky), for: .connected)
+        #expect(SettingsStore(defaults: defaults).batteryStatusColors.connected == .preset(.sky))
+        #expect(SettingsStore(defaults: defaults).batteryStatusColors.charging == .preset(.amber))
+    }
+
     @Test func sceneCopiesAndBothRenderKeysKeepColorsAndMonochromeIgnoresThem() throws {
         let colors = BatteryStatusColors(charging: .preset(.lavender), lowPower: .preset(.sky), critical: .preset(.rose))
         let scene = makeScene(colors: colors)
@@ -89,6 +105,33 @@ struct BatteryStatusColorsTests {
         let dockFirst = try #require(DockIconRenderer.image(scene: system, backgroundStyle: .dark, pixelLength: 128))
         let dockSecond = try #require(DockIconRenderer.image(scene: custom, backgroundStyle: .dark, pixelLength: 128))
         #expect(dockFirst.tiffRepresentation != dockSecond.tiffRepresentation)
+    }
+
+    @Test func dischargingColourKeepsSystemMonochromeAndOverridesOnChoice() throws {
+        let system = makeDischargingScene(colors: .standard)
+        #expect(system.chromaticRegions.isEmpty)
+        #expect(system.templateRegions.contains(.ringFill))
+
+        let custom = makeDischargingScene(colors: BatteryStatusColors(discharging: .preset(.rose)))
+        #expect(custom.chromaticRegions.contains(.ringFill))
+
+        let environment = StatusIconRenderer.renderEnvironment(size: 64, scale: 2, appearance: NSAppearance(named: .darkAqua))
+        let systemImage = try #require(StatusIconRenderer.render(scene: system, environment: environment))
+        let customImage = try #require(StatusIconRenderer.render(scene: custom, environment: environment))
+        let systemBuffer = try PixelBuffer(image: systemImage)
+        let customBuffer = try PixelBuffer(image: customImage)
+        #expect(systemBuffer.bytes != customBuffer.bytes)
+    }
+
+    private func makeDischargingScene(colors: BatteryStatusColors) -> IconSceneState {
+        let snapshot = StatusSnapshot(
+            battery: BatteryStatus(rawPercentage: 50, isPresent: true, isCharging: false, isLowPowerMode: false, isConnectedToPower: false),
+            wifi: .placeholder, volume: .placeholder
+        )
+        return IconPresentationMapper.scene(
+            inputs: .init(snapshot: snapshot, audioIcon: nil),
+            configuration: .init(battery: BatteryIconOptions(showsChargingEffect: false, usesStatusColors: true, batteryStatusColors: colors), connection: .standard, volume: .standard, bluetooth: .standard)
+        )
     }
 
     private func makeScene(colors: BatteryStatusColors, usesColors: Bool = true, effect: Bool = true) -> IconSceneState {

@@ -184,6 +184,12 @@ final class StatusPanelViewModel: ObservableObject {
     @Published private(set) var hardwareMonitorMetrics: [HardwareMonitorMetric]
     /// Shared per-metric colours shown on the card bars (same field as the ring).
     @Published private(set) var hardwareMonitorMetricColors: [HardwareMonitorMetric: IconRGBA]
+    /// SSD ring colour. SSD usage is not a sampled metric, so it is not part of
+    /// `hardwareMonitorMetricColors`; it still comes from settings so the panel
+    /// and the settings colour row stay in sync.
+    @Published private(set) var hardwareDiskRingColor: IconRGBA
+    @Published private(set) var panelLevelSliderColor: PanelLevelSliderColorSelection
+    @Published private(set) var panelLevelSliderMatchesBrightnessThickness: Bool
     @Published private(set) var statusPanelBoldTextEnabled: Bool
     @Published private(set) var statusPanelMediumTextEnabled: Bool
     /// Broadband caps (Mbps) for the network-speed tiles.
@@ -197,6 +203,19 @@ final class StatusPanelViewModel: ObservableObject {
     /// items collapse so the rest divide the width evenly.
     @Published private(set) var enabledHardwareRingSlots: Set<HardwareRingSlot>
     @Published private(set) var enabledHardwareSummaryMetrics: Set<HardwareSummaryMetric>
+    /// Whether the RAM/SSD rings read as consumed or remaining.
+    @Published private(set) var memoryRingDisplayMode: RingValueDisplayMode
+    @Published private(set) var ssdRingDisplayMode: RingValueDisplayMode
+    @Published private(set) var cpuRingCenterContent: HardwareRingCenterContent
+    @Published private(set) var gpuRingCenterContent: HardwareRingCenterContent
+    @Published private(set) var hardwareTemperatureMonitoringEnabled: Bool
+    /// Whether the four panel rings split their progress across the top gap
+    /// (left half 0–50%, right half 50–100%) instead of absorbing it.
+    @Published private(set) var hardwareRingSplitGapProgress: Bool
+    /// Whether the SSD ring percentage pools ticked external volumes, and which
+    /// external volume mount paths are ticked.
+    @Published private(set) var hardwareSSDIncludeExternalInPercent: Bool
+    @Published private(set) var hardwareSSDExternalVolumePaths: Set<String>
 
     private var isStarted = false
     private var bluetoothIsExpanded = false
@@ -220,8 +239,12 @@ final class StatusPanelViewModel: ObservableObject {
     /// publishes each 30 Hz slider report, so the row stays glued to the pointer.
     static let levelVolumePublishInterval: Duration = .milliseconds(100)
     private var pendingRefreshRegions: RefreshRegions = []
+    /// True while a battery tick is driving the charge-to-full demand, so the
+    /// nested presentation publish does not read a not-yet-committed snapshot.
+    private var isUpdatingChargeDemand = false
     private var lastPanelSettingsFingerprint: PanelSettingsFingerprint?
     private var panelSettingsCheckScheduled = false
+    private var hardwareDemandRecomputeScheduled = false
     private var lifecycleGeneration = 0
 
     /// Tests observe deliveries from the single popup-snapshot subscription
@@ -265,6 +288,10 @@ final class StatusPanelViewModel: ObservableObject {
         visiblePopupSections = settings.visiblePopupSections
         hardwareMonitorMetrics = settings.visibleHardwareMetrics
         hardwareMonitorMetricColors = settings.hardwareMonitorMetricColors
+        hardwareDiskRingColor = settings.hardwareDiskRingColor
+        panelLevelSliderColor = settings.panelLevelSliderColor
+        panelLevelSliderMatchesBrightnessThickness =
+            settings.panelLevelSliderMatchesBrightnessThickness
         statusPanelBoldTextEnabled = settings.statusPanelBoldTextEnabled
         statusPanelMediumTextEnabled = settings.statusPanelMediumTextEnabled
         showsHardwareRings = settings.showsHardwareRings
@@ -272,6 +299,14 @@ final class StatusPanelViewModel: ObservableObject {
         showsHardwareTopApps = settings.showsHardwareTopApps
         enabledHardwareRingSlots = settings.enabledHardwareRingSlots
         enabledHardwareSummaryMetrics = settings.enabledHardwareSummaryMetrics
+        memoryRingDisplayMode = settings.memoryRingDisplayMode
+        ssdRingDisplayMode = settings.ssdRingDisplayMode
+        cpuRingCenterContent = settings.cpuRingCenterContent
+        gpuRingCenterContent = settings.gpuRingCenterContent
+        hardwareTemperatureMonitoringEnabled = settings.hardwareTemperatureMonitoringEnabled
+        hardwareRingSplitGapProgress = settings.hardwareRingSplitGapProgress
+        hardwareSSDIncludeExternalInPercent = settings.hardwareSSDIncludeExternalInPercent
+        hardwareSSDExternalVolumePaths = settings.hardwareSSDExternalVolumePaths
         hardwareSpeedCapsMbps = [
             .downloadSpeed: settings.hardwareDownloadCapMbps,
             .uploadSpeed: settings.hardwareUploadCapMbps
@@ -358,12 +393,16 @@ final class StatusPanelViewModel: ObservableObject {
         lifecycleGeneration &+= 1
         lastPanelSettingsFingerprint = PanelSettingsFingerprint(settings: settings)
         panelSettingsCheckScheduled = false
+        hardwareDemandRecomputeScheduled = false
         let sections = settings.visiblePopupSections
         if visiblePopupSections != sections { visiblePopupSections = sections }
         let metrics = settings.visibleHardwareMetrics
         if hardwareMonitorMetrics != metrics { hardwareMonitorMetrics = metrics }
         if hardwareMonitorMetricColors != settings.hardwareMonitorMetricColors {
             hardwareMonitorMetricColors = settings.hardwareMonitorMetricColors
+        }
+        if hardwareDiskRingColor != settings.hardwareDiskRingColor {
+            hardwareDiskRingColor = settings.hardwareDiskRingColor
         }
         if statusPanelBoldTextEnabled != settings.statusPanelBoldTextEnabled {
             statusPanelBoldTextEnabled = settings.statusPanelBoldTextEnabled
@@ -458,14 +497,28 @@ final class StatusPanelViewModel: ObservableObject {
             }
             .store(in: &cancellables)
 
-        settings.$hardwareBackgroundHistoryEnabled
+        settings.$hardwareDiskRingColor
             .removeDuplicates()
-            .sink { [weak self] enabled in self?.updateHardwareMetricsDemand(backgroundHistoryEnabled: enabled) }
+            .sink { [weak self] color in
+                guard let self else { return }
+                if self.hardwareDiskRingColor != color { self.hardwareDiskRingColor = color }
+            }
             .store(in: &cancellables)
 
-        settings.$hardwarePanelRefreshSeconds
-            .removeDuplicates()
-            .sink { [weak self] seconds in self?.updateHardwareMetricsDemand(panelSeconds: seconds) }
+        let refreshTriggers: [AnyPublisher<Void, Never>] = [
+            settings.$hardwareCPUUsageRefreshSeconds.map { _ in () }.eraseToAnyPublisher(),
+            settings.$hardwareGPUUsageRefreshSeconds.map { _ in () }.eraseToAnyPublisher(),
+            settings.$hardwareMemoryRefreshSeconds.map { _ in () }.eraseToAnyPublisher(),
+            settings.$hardwareNetworkRefreshSeconds.map { _ in () }.eraseToAnyPublisher(),
+            settings.$hardwareTemperatureRefreshSeconds.map { _ in () }.eraseToAnyPublisher(),
+            settings.$hardwareDiskRefreshSeconds.map { _ in () }.eraseToAnyPublisher()
+        ]
+        Publishers.MergeMany(refreshTriggers)
+            .sink { [weak self] in self?.updateHardwareMetricsDemand() }
+            .store(in: &cancellables)
+
+        settings.$hardwareTopAppsRefreshSeconds
+            .sink { [weak self] seconds in self?.updateHardwareMetricsDemand(topAppsSeconds: seconds) }
             .store(in: &cancellables)
 
         settings.$showsHardwareRings
@@ -473,6 +526,7 @@ final class StatusPanelViewModel: ObservableObject {
             .sink { [weak self] value in
                 guard let self, self.showsHardwareRings != value else { return }
                 self.showsHardwareRings = value
+                self.scheduleHardwareDemandRecompute()
             }
             .store(in: &cancellables)
 
@@ -481,6 +535,7 @@ final class StatusPanelViewModel: ObservableObject {
             .sink { [weak self] value in
                 guard let self, self.showsHardwareSummaryRow != value else { return }
                 self.showsHardwareSummaryRow = value
+                self.scheduleHardwareDemandRecompute()
             }
             .store(in: &cancellables)
 
@@ -498,6 +553,7 @@ final class StatusPanelViewModel: ObservableObject {
             .sink { [weak self] slots in
                 guard let self, self.enabledHardwareRingSlots != slots else { return }
                 self.enabledHardwareRingSlots = slots
+                self.scheduleHardwareDemandRecompute()
             }
             .store(in: &cancellables)
 
@@ -506,6 +562,89 @@ final class StatusPanelViewModel: ObservableObject {
             .sink { [weak self] metrics in
                 guard let self, self.enabledHardwareSummaryMetrics != metrics else { return }
                 self.enabledHardwareSummaryMetrics = metrics
+                self.scheduleHardwareDemandRecompute()
+            }
+            .store(in: &cancellables)
+
+        settings.$memoryRingDisplayMode
+            .removeDuplicates()
+            .sink { [weak self] mode in
+                guard let self, self.memoryRingDisplayMode != mode else { return }
+                self.memoryRingDisplayMode = mode
+            }
+            .store(in: &cancellables)
+
+        settings.$ssdRingDisplayMode
+            .removeDuplicates()
+            .sink { [weak self] mode in
+                guard let self, self.ssdRingDisplayMode != mode else { return }
+                self.ssdRingDisplayMode = mode
+            }
+            .store(in: &cancellables)
+
+        settings.$cpuRingCenterContent
+            .removeDuplicates()
+            .sink { [weak self] content in
+                guard let self, self.cpuRingCenterContent != content else { return }
+                self.cpuRingCenterContent = content
+            }
+            .store(in: &cancellables)
+
+        settings.$gpuRingCenterContent
+            .removeDuplicates()
+            .sink { [weak self] content in
+                guard let self, self.gpuRingCenterContent != content else { return }
+                self.gpuRingCenterContent = content
+            }
+            .store(in: &cancellables)
+
+        settings.$hardwareTemperatureMonitoringEnabled
+            .removeDuplicates()
+            .sink { [weak self] enabled in
+                guard let self, self.hardwareTemperatureMonitoringEnabled != enabled else { return }
+                self.hardwareTemperatureMonitoringEnabled = enabled
+                self.scheduleHardwareDemandRecompute()
+            }
+            .store(in: &cancellables)
+
+        settings.$hardwareRingSplitGapProgress
+            .removeDuplicates()
+            .sink { [weak self] split in
+                guard let self, self.hardwareRingSplitGapProgress != split else { return }
+                self.hardwareRingSplitGapProgress = split
+            }
+            .store(in: &cancellables)
+
+        settings.$hardwareSSDIncludeExternalInPercent
+            .removeDuplicates()
+            .sink { [weak self] include in
+                guard let self, self.hardwareSSDIncludeExternalInPercent != include else { return }
+                self.hardwareSSDIncludeExternalInPercent = include
+            }
+            .store(in: &cancellables)
+
+        settings.$hardwareSSDExternalVolumePaths
+            .removeDuplicates()
+            .sink { [weak self] paths in
+                guard let self, self.hardwareSSDExternalVolumePaths != paths else { return }
+                self.hardwareSSDExternalVolumePaths = paths
+            }
+            .store(in: &cancellables)
+
+        settings.$panelLevelSliderColor
+            .removeDuplicates()
+            .sink { [weak self] color in
+                guard let self, self.panelLevelSliderColor != color else { return }
+                self.panelLevelSliderColor = color
+            }
+            .store(in: &cancellables)
+
+        settings.$panelLevelSliderMatchesBrightnessThickness
+            .removeDuplicates()
+            .sink { [weak self] matches in
+                guard let self,
+                      self.panelLevelSliderMatchesBrightnessThickness != matches else { return }
+                self.panelLevelSliderMatchesBrightnessThickness = matches
             }
             .store(in: &cancellables)
 
@@ -558,7 +697,11 @@ final class StatusPanelViewModel: ObservableObject {
     private func subscribeToEffectivePanelBackgroundStyle() {
         settings.$panelBackgroundStyle
             .removeDuplicates()
-            .sink { [weak self] _ in self?.refreshEffectivePanelBackgroundStyle() }
+            // @Published emits in willSet, so reading settings.panelBackgroundStyle
+            // inside the sink would still return the old value. Use the emitted
+            // style so the SwiftUI card surface updates in place instead of
+            // waiting for the next panel reopen.
+            .sink { [weak self] style in self?.applyEffectivePanelBackgroundStyle(for: style) }
             .store(in: &cancellables)
         NSWorkspace.shared.notificationCenter
             .publisher(for: NSWorkspace.accessibilityDisplayOptionsDidChangeNotification)
@@ -568,8 +711,12 @@ final class StatusPanelViewModel: ObservableObject {
     }
 
     private func refreshEffectivePanelBackgroundStyle() {
+        applyEffectivePanelBackgroundStyle(for: settings.panelBackgroundStyle)
+    }
+
+    private func applyEffectivePanelBackgroundStyle(for style: PanelBackgroundStyle) {
         let next = PanelBackgroundStyle.renderStyle(
-            for: settings.panelBackgroundStyle,
+            for: style,
             reduceTransparency: NSWorkspace.shared.accessibilityDisplayShouldReduceTransparency
         )
         if next != effectivePanelBackgroundStyle {
@@ -584,6 +731,7 @@ final class StatusPanelViewModel: ObservableObject {
         pendingRefreshRegions = []
         lastPanelSettingsFingerprint = nil
         panelSettingsCheckScheduled = false
+        hardwareDemandRecomputeScheduled = false
         volumeDeviceRowsLoaded = false
         cancelLevelVolumePublish()
         lastLiveVolumeStatus = nil
@@ -606,6 +754,7 @@ final class StatusPanelViewModel: ObservableObject {
             showSummaryPage()
             return
         }
+        guard !closeOpenDetailIfAlreadyShowing(.battery) else { return }
         guard transition(to: .battery) else { return }
         actions.batteryDetailsAppeared()
         refreshBatteryDetails()
@@ -616,6 +765,7 @@ final class StatusPanelViewModel: ObservableObject {
             showSummaryPage()
             return
         }
+        guard !closeOpenDetailIfAlreadyShowing(.wifi) else { return }
         let opensNewPage = route != .wifi
         if opensNewPage {
             wifiDisclosure = WiFiPanelDisclosureState(
@@ -633,6 +783,7 @@ final class StatusPanelViewModel: ObservableObject {
             showSummaryPage()
             return
         }
+        guard !closeOpenDetailIfAlreadyShowing(.ethernet) else { return }
         guard transition(to: .ethernet) else { return }
         actions.wiredDetailsOpened()
         refreshWiredDetailsAndNetwork()
@@ -643,6 +794,7 @@ final class StatusPanelViewModel: ObservableObject {
             showSummaryPage()
             return
         }
+        guard !closeOpenDetailIfAlreadyShowing(.inputSource) else { return }
         transition(to: .inputSource)
     }
 
@@ -653,6 +805,7 @@ final class StatusPanelViewModel: ObservableObject {
             showSummaryPage()
             return
         }
+        guard !closeOpenDetailIfAlreadyShowing(.hardwareDetail(kind)) else { return }
         transition(to: .hardwareDetail(kind))
     }
 
@@ -966,9 +1119,17 @@ final class StatusPanelViewModel: ObservableObject {
             .removeDuplicates()
             .sink { [weak self] presentation in
                 guard let self else { return }
-                chargeToFullNowPresentation = presentation
-                refreshSummaryChargeToFullNowPresentation()
-                refreshBatterySummary()
+                // A battery tick drives `updateChargeToFullNowDemand`, which
+                // applies the resolved value with the delivered battery. A
+                // publish from inside that call happens during `@Published`
+                // willSet, so `store.popupSnapshot` is still the previous
+                // value; skip here instead of mapping a stale battery.
+                if isUpdatingChargeDemand { return }
+                applyChargeToFullNowPresentation(
+                    presentation,
+                    battery: nil,
+                    percentage: store.popupSnapshot.battery.percentage
+                )
             }
             .store(in: &cancellables)
 
@@ -1011,6 +1172,30 @@ final class StatusPanelViewModel: ObservableObject {
         .store(in: &cancellables)
     }
 
+    /// Resolve the raw controller presentation against the displayed battery so
+    /// the summary card and the battery detail page both hide the charge-to-full
+    /// row at 100%. The controller keeps its session; only the rendered row is
+    /// affected.
+    private func applyChargeToFullNowPresentation(
+        _ presentation: ChargeToFullNowPresentation,
+        battery deliveredBattery: BatteryStatus?,
+        percentage: Int
+    ) {
+        let resolved = presentation.hidingPanelActionAtFullCharge(percentage: percentage)
+        let changed = resolved != chargeToFullNowPresentation
+        if changed {
+            chargeToFullNowPresentation = resolved
+            refreshSummaryChargeToFullNowPresentation()
+        }
+        // On a battery tick the delivered status is authoritative; reading
+        // `store.popupSnapshot` here would see the previous value.
+        if let deliveredBattery {
+            refreshBatterySummary(status: deliveredBattery)
+        } else if changed {
+            refreshBatterySummary()
+        }
+    }
+
     private func refreshSummaryChargeToFullNowPresentation(
         settingEnabled: Bool? = nil
     ) {
@@ -1036,8 +1221,8 @@ final class StatusPanelViewModel: ObservableObject {
     /// and the section is visible. Switching pages, hiding the module or
     /// closing the panel ends the demand immediately, so a closed panel never
     /// keeps a hardware timer alive.
-    private func updateHardwareMetricsDemand(popoverVisible: Bool? = nil, backgroundHistoryEnabled: Bool? = nil,
-                                             panelSeconds: Int? = nil) {
+    private func updateHardwareMetricsDemand(popoverVisible: Bool? = nil,
+                                             topAppsSeconds: Int? = nil) {
         // `@Published` publishes in willSet, so a subscriber must pass the new
         // value in rather than read `store.isPopoverVisible` (still the old one).
         let sectionOn = visiblePopupSections.contains(.hardwareMonitor)
@@ -1045,46 +1230,46 @@ final class StatusPanelViewModel: ObservableObject {
         let detailKind = activeDetailKind
         let summaryVisible = panelOpen && isSummaryVisible
         let detailVisible = panelOpen && detailKind != nil
-        // @Published fires in willSet, so a settings subscriber must pass the new
-        // value in rather than read the not-yet-committed stored property.
-        let backgroundHistory = backgroundHistoryEnabled ?? settings.hardwareBackgroundHistoryEnabled
-        let panelRefresh = panelSeconds ?? settings.hardwarePanelRefreshSeconds
-        // Background history follows the panel cadence, so opening a detail page
-        // shows the same resolution the panel would have recorded.
-        store.hardwareMetrics.backgroundIntervalSeconds = TimeInterval(panelRefresh)
-        store.hardwareMetrics.panelIntervalSeconds = TimeInterval(panelRefresh)
+        // Per-group panel cadence: a metric is sampled at the fastest of all
+        // active consumers, so icons stay fast and a panel-only metric slows to
+        // its group's setting.
+        store.hardwareMetrics.panelCadenceProvider = { [settings] group in
+            TimeInterval(settings.hardwareRefreshSeconds(for: group))
+        }
+        // Same cadences drive the panel's display throttle: the physical sample
+        // stays shared, but the panel only adopts a group's latest value once
+        // that group's cadence has elapsed.
+        store.hardwareMetrics.observable.panelDisplayCadence = { [settings] group in
+            TimeInterval(settings.hardwareRefreshSeconds(for: group))
+        }
         // Only the visible detail page pays for its structured payload and the
         // per-page expensive work (frequency for CPU, session totals for network).
         store.hardwareMetrics.setDetailDemand(detailVisible ? detailKind : nil)
+        // The top-app list uses its own cadence so it never outruns the panel and
+        // can be tuned independently of the card refresh.
+        store.topApps.minimumIntervalSeconds =
+            TimeInterval(topAppsSeconds ?? settings.hardwareTopAppsRefreshSeconds)
         store.topApps.setDemand(detailVisible && showsHardwareTopApps ? detailKind?.topAppMetric : nil)
-        if summaryVisible || detailVisible {
-            // The compact summary is fixed: four rings plus download/upload,
-            // average fan and disk read/write. It no longer follows the card
-            // metric order, so every group has data even when the user's card
-            // selection changed. An alongside detail unions its own metrics on
-            // top so the visible summary and the detail share one demand.
-            store.hardwareMetrics.end(.background)
-            var metrics: Set<HardwareMetricID> = []
-            if summaryVisible {
-                metrics.formUnion(HardwareMetricsService.hardwareSummaryMetricIDs)
-            }
-            if let detailKind, detailVisible {
-                metrics.formUnion(HardwareMetricsService.detailMetricIDs(for: detailKind))
-            }
+        // Background history belongs to the app-lifetime controller, so closing
+        // the panel (which stops this view model's subscriptions) cannot kill it.
+        let summary = HardwareMetricDemandResolver.PanelSummaryInputs(
+            showsHardwareRings: showsHardwareRings,
+            enabledRingSlots: enabledHardwareRingSlots,
+            showsHardwareSummaryRow: showsHardwareSummaryRow,
+            enabledSummaryMetrics: enabledHardwareSummaryMetrics
+        )
+        let metrics = HardwareMetricDemandResolver.panelMetrics(
+            summary: summaryVisible ? summary : nil,
+            detailKind: detailVisible ? detailKind : nil
+        )
+        if metrics.isEmpty {
+            store.hardwareMetrics.end(.panel)
+        } else {
             store.hardwareMetrics.begin(.panel, metrics: metrics)
             if detailVisible {
                 // Read immediately so the page's structured payload appears on
                 // open instead of waiting for the next scheduled interval.
                 store.hardwareMetrics.forceRefresh()
-            }
-        } else {
-            store.hardwareMetrics.end(.panel)
-            // Optional low-frequency background sampling keeps the summary warm
-            // while the panel is closed (off by default to preserve idle power).
-            if isStarted, sectionOn, backgroundHistory {
-                store.hardwareMetrics.begin(.background, metrics: HardwareMetricsService.hardwareSummaryMetricIDs)
-            } else {
-                store.hardwareMetrics.end(.background)
             }
         }
     }
@@ -1109,10 +1294,10 @@ final class StatusPanelViewModel: ObservableObject {
 
     /// Re-maps the visible battery row when the charge action changes, so the
     /// subtitle reflects the click before the system's charging flag catches up.
-    private func refreshBatterySummary() {
+    private func refreshBatterySummary(status deliveredStatus: BatteryStatus? = nil) {
         guard isVisible(.battery) else { return }
         let next = PanelPresentationMapper.battery(
-            store.popupSnapshot.battery,
+            deliveredStatus ?? store.popupSnapshot.battery,
             powerSample: store.powerSampling.systemPower,
             inputPower: store.powerSampling.inputPower,
             batteryPower: store.powerSampling.batteryPower,
@@ -1133,12 +1318,19 @@ final class StatusPanelViewModel: ObservableObject {
             chargeToFullNowPresentation = .hidden
             return
         }
+        isUpdatingChargeDemand = true
+        defer { isUpdatingChargeDemand = false }
         chargeToFullNow.update(
             ChargeToFullNowDemand(
                 popoverVisible: popoverVisible,
                 batterySectionVisible: batterySectionVisible,
                 battery: battery
             )
+        )
+        applyChargeToFullNowPresentation(
+            chargeToFullNow.presentation,
+            battery: battery,
+            percentage: battery.percentage
         )
     }
 
@@ -1434,6 +1626,18 @@ final class StatusPanelViewModel: ObservableObject {
         return true
     }
 
+    /// Issue #369: clicking the entry for the detail page that is already open
+    /// closes that detail page (returning the main panel to its summary) instead
+    /// of re-entering the same page. The side panel is closed while the main
+    /// popover stays open, matching the back button's page semantics. Hardware
+    /// details match only the same `kind`, so a different card still switches.
+    /// Returns true when the click was handled as a close.
+    private func closeOpenDetailIfAlreadyShowing(_ target: StatusPanelRoute) -> Bool {
+        guard route == target else { return false }
+        showSummaryPage()
+        return true
+    }
+
     private func closeCurrentPage() {
         guard route != .summary else { return }
         endCurrentPageActions()
@@ -1480,6 +1684,22 @@ final class StatusPanelViewModel: ObservableObject {
     /// before the value is stored, so the comparison has to happen after a
     /// yield; by then a burst of writes has settled and the newest values are
     /// read once.
+    /// Recomputes the hardware demand after settings have committed. `@Published`
+    /// publishes in willSet, so a synchronous sink would read the previous value;
+    /// yielding one turn lets the store commit, and the guard coalesces a burst of
+    /// toggles into one begin/end evaluation instead of flapping the sampler.
+    private func scheduleHardwareDemandRecompute() {
+        guard isStarted, !hardwareDemandRecomputeScheduled else { return }
+        hardwareDemandRecomputeScheduled = true
+        Task { @MainActor [weak self] in
+            await Task.yield()
+            guard let self else { return }
+            self.hardwareDemandRecomputeScheduled = false
+            guard self.isStarted else { return }
+            self.updateHardwareMetricsDemand()
+        }
+    }
+
     private func schedulePanelSettingsCheck() {
         guard isStarted, !panelSettingsCheckScheduled else { return }
         panelSettingsCheckScheduled = true
@@ -1685,6 +1905,7 @@ private extension VolumePanelState {
             outputIdentity: outputIdentity,
             interactionIdentity: interactionIdentity,
             muted: muted,
+            isAutoMuted: isAutoMuted,
             muteState: muteState,
             canAdjust: canAdjust,
             canMute: canMute,
@@ -1711,6 +1932,7 @@ private extension VolumePanelState {
             outputIdentity: outputIdentity,
             interactionIdentity: interactionIdentity,
             muted: muted,
+            isAutoMuted: isAutoMuted,
             muteState: muteState,
             canAdjust: false,
             canMute: false,

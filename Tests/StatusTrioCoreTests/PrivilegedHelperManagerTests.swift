@@ -1,6 +1,179 @@
 import Combine
+import Testing
 import XCTest
 @testable import StatusTrioCore
+
+@MainActor
+struct PrivilegedHelperIdleTests {
+    @Test func enabledHelperDoesNotKeepCheckingAfterStartup() async throws {
+        let service = FakePrivilegedHelperService(status: .enabled)
+        let manager = PrivilegedHelperManager(
+            service: service,
+            pollInterval: .milliseconds(5),
+            enabledHealthCheckInterval: .milliseconds(25)
+        )
+        try await waitForTestCondition { manager.isReady }
+        let reads = service.statusReadCount
+        let probes = service.verificationCallCount
+
+        try await Task.sleep(for: .milliseconds(150))
+
+        #expect(manager.isReady)
+        #expect(service.statusReadCount == reads)
+        #expect(service.verificationCallCount == probes)
+    }
+
+    @Test(arguments: [true, false])
+    func pendingStatusStopsBeingPolledAfterApprovalWindow(reachable: Bool) async throws {
+        let service = FakePrivilegedHelperService(status: .requiresApproval)
+        service.allowsPendingVerification = reachable
+        let manager = PrivilegedHelperManager(
+            service: service,
+            pollInterval: .milliseconds(5),
+            healthCheckInterval: .seconds(5)
+        )
+        if reachable {
+            try await waitForTestCondition { manager.isReady }
+        } else {
+            // Make sure the startup sequence and approval polling actually began
+            // before asserting they stop; the exact final count is left to the
+            // quiescence check below rather than a brittle magic number.
+            try await waitForTestCondition {
+                service.verificationCallCount >= 1 && service.statusReadCount >= 2
+            }
+        }
+        // Wait for the approval window to close and both counters to stop
+        // moving, instead of a fixed read count and a fixed delay: a loaded CI
+        // runner can stretch either. A manager that kept polling would never go
+        // quiet, so quiescence is the real end state this asserts.
+        try await waitForQuiet { service.statusReadCount + service.verificationCallCount }
+        let reads = service.statusReadCount
+        let probes = service.verificationCallCount
+
+        try await Task.sleep(for: .milliseconds(100))
+
+        #expect(manager.requiresApproval)
+        #expect(manager.isReady == reachable)
+        #expect(service.statusReadCount == reads)
+        #expect(service.verificationCallCount == probes)
+        #expect(service.registerCallCount == 0)
+        #expect(service.recoveryUnregisterCallCount == 0)
+    }
+
+    @Test func backgroundRecoveryStopsAfterItsProbeBudget() async throws {
+        let service = FakePrivilegedHelperService(status: .enabled)
+        let manager = PrivilegedHelperManager(
+            service: service,
+            healthCheckInterval: .milliseconds(20),
+            enabledHealthCheckInterval: .milliseconds(20)
+        )
+        try await waitForTestCondition { manager.isReady }
+        let probes = service.verificationCallCount
+
+        manager.setBackgroundRecoveryNeeded(true)
+        try await waitForTestCondition { service.verificationCallCount >= probes + 5 }
+        try await Task.sleep(for: .milliseconds(150))
+
+        #expect(service.verificationCallCount == probes + 5)
+        manager.setBackgroundRecoveryNeeded(false)
+    }
+
+    @Test func repeatedActivationCoalescesToOneStatusRead() async throws {
+        let service = FakePrivilegedHelperService(status: .enabled)
+        let manager = PrivilegedHelperManager(service: service)
+        try await waitForTestCondition { manager.isReady }
+        let reads = service.statusReadCount
+        let probes = service.verificationCallCount
+
+        // Ten rapid activations share a single status read.
+        for _ in 0..<10 { manager.refreshAfterActivation() }
+        await Task.yield()
+
+        #expect(service.statusReadCount == reads + 1)
+        #expect(service.verificationCallCount == probes)
+    }
+
+    @Test func activationAfterTheIntervalRefreshesAgain() async throws {
+        let service = FakePrivilegedHelperService(status: .enabled)
+        let manager = PrivilegedHelperManager(
+            service: service,
+            activationStatusRefreshInterval: .milliseconds(30)
+        )
+        try await waitForTestCondition { manager.isReady }
+        let reads = service.statusReadCount
+
+        manager.refreshAfterActivation()
+        #expect(service.statusReadCount == reads + 1)
+
+        try await Task.sleep(for: .milliseconds(80))
+        manager.refreshAfterActivation()
+        #expect(service.statusReadCount == reads + 2)
+    }
+
+    @Test func successfulOperationChecksXPCWithoutReadingNativeStatus() async throws {
+        let service = FakePrivilegedHelperService(status: .enabled)
+        let manager = PrivilegedHelperManager(service: service)
+        try await waitForTestCondition { manager.isReady }
+        let reads = service.statusReadCount
+        let probes = service.verificationCallCount
+
+        let ready = await manager.verifyForUse()
+
+        #expect(ready)
+        #expect(service.statusReadCount == reads)
+        #expect(service.verificationCallCount == probes + 1)
+    }
+
+    @Test func repeatedActivationSharesOneNativeStatusRead() async throws {
+        let service = FakePrivilegedHelperService(status: .enabled)
+        let manager = PrivilegedHelperManager(service: service)
+        try await waitForTestCondition { manager.isReady }
+        let reads = service.statusReadCount
+        let probes = service.verificationCallCount
+
+        manager.openLoginItemsSettings()
+        manager.refreshAfterActivation()
+        manager.refreshAfterActivation()
+        try await waitForTestCondition { service.verificationCallCount > probes }
+
+        #expect(service.verificationCallCount == probes + 1)
+        #expect(service.statusReadCount == reads + 1)
+    }
+
+    private func waitForTestCondition(_ condition: () -> Bool) async throws {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: .seconds(20))
+        while !condition(), clock.now < deadline {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        try #require(condition())
+    }
+
+    /// Waits until `sample()` stops changing for a short quiet window, so a
+    /// straggler tick still in flight on a loaded runner is not mistaken for a
+    /// poller that never stopped.
+    private func waitForQuiet(
+        _ sample: () -> Int,
+        quiet: Duration = .milliseconds(300),
+        timeout: Duration = .seconds(20)
+    ) async throws {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        var last = sample()
+        var stableSince = clock.now
+        while clock.now < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+            let value = sample()
+            if value != last {
+                last = value
+                stableSince = clock.now
+            } else if clock.now - stableSince >= quiet {
+                return
+            }
+        }
+        Issue.record("Timed out waiting for the poller to go quiet")
+    }
+}
 
 @MainActor
 final class PrivilegedHelperManagerTests: XCTestCase {
@@ -27,8 +200,7 @@ final class PrivilegedHelperManagerTests: XCTestCase {
         let service = FakePrivilegedHelperService(status: .enabled)
         let manager = PrivilegedHelperManager(
             service: service,
-            pollInterval: .milliseconds(10),
-            enabledStatusPollInterval: .seconds(30)
+            pollInterval: .milliseconds(10)
         )
         await waitUntil { manager.isReady }
         // Let the tick that was already scheduled at the approval cadence
@@ -79,6 +251,7 @@ final class PrivilegedHelperManagerTests: XCTestCase {
         XCTAssertTrue(manager.isReady)
         service.allowsPendingVerification = false
 
+        manager.openLoginItemsSettings()
         manager.refreshAfterActivation()
         await waitUntil { !manager.isReady }
 
@@ -154,6 +327,7 @@ final class PrivilegedHelperManagerTests: XCTestCase {
         // The helper goes away, and the user's gesture is the only signal the
         // app gets: the native status never moves.
         service.allowsPendingVerification = false
+        manager.openLoginItemsSettings()
         manager.refreshAfterActivation()
 
         // The failed gesture is retried within its window — far inside the
@@ -182,6 +356,7 @@ final class PrivilegedHelperManagerTests: XCTestCase {
         await waitUntil { manager.isReady }
         XCTAssertTrue(manager.isReady)
         service.allowsPendingVerification = false
+        manager.openLoginItemsSettings()
         manager.refreshAfterActivation()
         // Let the window spend itself, then confirm the reads stop arriving.
         try? await Task.sleep(for: .milliseconds(200))
@@ -215,6 +390,7 @@ final class PrivilegedHelperManagerTests: XCTestCase {
         )
         await waitUntil { manager.isReady }
         XCTAssertTrue(manager.isReady)
+        manager.setBackgroundRecoveryNeeded(true)
         service.allowsPendingVerification = false
         await waitUntil { !manager.isReady }
         XCTAssertFalse(manager.isReady)
@@ -490,9 +666,9 @@ final class PrivilegedHelperManagerTests: XCTestCase {
         XCTAssertEqual(service.recoveryUnregisterCallCount, 1)
     }
 
-    func testEnabledHelperIsRecheckedWithoutAUserAction() async {
-        // A helper that crashes after a successful verification used to stay
-        // "ready" until the user touched the switch: nothing ever read it again.
+    func testPendingCleanupKeepsCheckingAnEnabledHelper() async {
+        // An unfinished lid-sleep cleanup still needs health checks when the
+        // user is away from the app.
         let service = FakePrivilegedHelperService(status: .enabled)
         let manager = PrivilegedHelperManager(
             service: service,
@@ -501,6 +677,8 @@ final class PrivilegedHelperManagerTests: XCTestCase {
         )
         await waitUntil { manager.isReady }
         let readsAfterReady = service.verificationCallCount
+        let nativeReads = service.statusReadCount
+        manager.setBackgroundRecoveryNeeded(true)
 
         // Wait for the re-probes instead of a fixed sleep: a loaded CI runner can
         // starve the poll loop and make a fixed window flaky.
@@ -509,6 +687,14 @@ final class PrivilegedHelperManagerTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(service.verificationCallCount, readsAfterReady + 2)
         XCTAssertTrue(manager.isReady)
         XCTAssertFalse(manager.didFailLastOperation)
+        XCTAssertEqual(service.statusReadCount, nativeReads)
+        manager.setBackgroundRecoveryNeeded(false)
+        // Drain the tick that may already be in flight, then assert the poller
+        // really stopped instead of racing a fixed 100 ms window.
+        await waitForQuiet { service.verificationCallCount }
+        let probesAfterCleanup = service.verificationCallCount
+        try? await Task.sleep(for: .milliseconds(150))
+        XCTAssertEqual(service.verificationCallCount, probesAfterCleanup)
         // Re-probing must not churn the registration of a healthy helper.
         XCTAssertEqual(service.recoveryUnregisterCallCount, 0)
         XCTAssertEqual(service.registerCallCount, 0)
@@ -525,6 +711,7 @@ final class PrivilegedHelperManagerTests: XCTestCase {
             enabledHealthCheckInterval: .milliseconds(20)
         )
         await waitUntil { manager.isReady }
+        manager.setBackgroundRecoveryNeeded(true)
 
         for expected in 1...3 {
             service.verificationFailuresRemaining = 1
@@ -539,10 +726,33 @@ final class PrivilegedHelperManagerTests: XCTestCase {
     }
 
     private func waitUntil(_ predicate: () -> Bool) async {
-        let deadline = Date().addingTimeInterval(1)
+        let deadline = Date().addingTimeInterval(10)
         while !predicate(), Date() < deadline {
             try? await Task.sleep(for: .milliseconds(10))
         }
+    }
+
+    /// Waits until a counter stops changing for a short quiet window, so an
+    /// in-flight poll tick on a loaded runner is not seen as continued polling.
+    private func waitForQuiet(
+        _ sample: () -> Int,
+        quiet: TimeInterval = 0.3,
+        timeout: TimeInterval = 20
+    ) async {
+        let start = Date()
+        var last = sample()
+        var stableSince = Date()
+        while Date().timeIntervalSince(start) < timeout {
+            try? await Task.sleep(for: .milliseconds(10))
+            let value = sample()
+            if value != last {
+                last = value
+                stableSince = Date()
+            } else if Date().timeIntervalSince(stableSince) >= quiet {
+                return
+            }
+        }
+        XCTFail("Timed out waiting for the poller to go quiet")
     }
 
     func testVerifiedHelperIsNotKeptAliveByStatusPolling() async {
@@ -558,6 +768,7 @@ final class PrivilegedHelperManagerTests: XCTestCase {
         let service = FakePrivilegedHelperService(status: .requiresApproval)
         service.registerError = TestFailure.registration
         let manager = PrivilegedHelperManager(service: service, pollInterval: .milliseconds(5))
+        manager.openLoginItemsSettings()
         for _ in 0..<10 { manager.refreshAfterActivation() }
         await waitUntil { service.registerCallCount == 5 }
         try? await Task.sleep(for: .milliseconds(50))
@@ -952,7 +1163,7 @@ final class FakePrivilegedHelperService: PrivilegedHelperServicing {
             await withCheckedContinuation { verificationContinuation = $0 }
             verificationContinuation = nil
         }
-        if status == .requiresApproval, !allowsPendingVerification {
+        if storedStatus == .requiresApproval, !allowsPendingVerification {
             throw NSError(domain: "XPCProbe", code: 4099)
         }
         if verificationFailuresRemaining > 0 {

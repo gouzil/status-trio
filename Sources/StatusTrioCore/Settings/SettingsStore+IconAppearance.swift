@@ -46,26 +46,43 @@ extension SettingsStore {
                 $outerRingContent,
                 $airPodsRingUsesDualRing,
                 $showsAirPodsTopSymbolInRing,
-                $airPodsRingFallsBackToBattery
+                $airPodsRingFallback
             )
-            .combineLatest($hardwareRingConfiguration) { ring, hardwareRing in
-                (ring.0, ring.1, ring.2, ring.3, hardwareRing)
+            .combineLatest(
+                Publishers.CombineLatest($hardwareRingConfiguration, $hardwareTemperatureMonitoringEnabled)
+            ) { ring, hardware in
+                // Keep the stored selection intact so re-enabling temperature
+                // restores it. Only the effective rendering/demand projection
+                // falls back to usage while monitoring is off.
+                let effectiveRing = hardware.1
+                    ? hardware.0
+                    : hardware.0.replacingUnavailableTemperatures()
+                return (ring.0, ring.1, ring.2, ring.3, effectiveRing)
             }
             .combineLatest(
                 Publishers.CombineLatest3($hardwareMonitorMetricColors, $hardwareDownloadCapMbps, $hardwareUploadCapMbps)
             ) { ring, extras in
                 (ring.0, ring.1, ring.2, ring.3, ring.4, extras.0, extras.1, extras.2)
             }
+            .combineLatest(
+                Publishers.CombineLatest3($airPodsLeftArcColor, $airPodsRightArcColor, $airPodsSingleArcColor)
+            ) { ring, colors in
+                (ring.0, ring.1, ring.2, ring.3, ring.4, ring.5, ring.6, ring.7,
+                 colors.0, colors.1, colors.2)
+            }
         ) { triple, ring in
             var appearance = triple.0.appearance(ringStrokeScale: triple.1, centerScale: triple.2)
             appearance.outerRingContent = ring.0
             appearance.airPodsRingUsesDualRing = ring.1
             appearance.showsAirPodsTopSymbolInRing = ring.2
-            appearance.airPodsRingFallsBackToBattery = ring.3
+            appearance.airPodsRingFallback = ring.3
             appearance.hardwareRingConfiguration = ring.4
             appearance.hardwareMetricColors = ring.5
             appearance.hardwareDownloadCapMbps = ring.6
             appearance.hardwareUploadCapMbps = ring.7
+            appearance.airPodsLeftArcColor = ring.8
+            appearance.airPodsRightArcColor = ring.9
+            appearance.airPodsSingleArcColor = ring.10
             return appearance
         }
         .removeDuplicates()
@@ -156,19 +173,27 @@ extension SettingsStore {
     }
 
     private var bluetoothOptionsPublisher: AnyPublisher<BluetoothAudioIconOptions, Never> {
-        Publishers.CombineLatest3(
+        Publishers.CombineLatest4(
             $bluetoothIconColor,
             $usesBluetoothAudioVolumeColor,
-            $bluetoothNetworkIconSymbolName
+            $bluetoothNetworkIconSymbolName,
+            $bluetoothVolumeColor
         )
         .combineLatest($bluetoothAudioIconChoiceRawValue) { values, choiceRawValue in
-            BluetoothAudioIconOptions(
+            let volumeColorRole: IconColorRole? = {
+                switch values.3 {
+                case .automatic: return nil
+                case let .custom(color): return .custom(color)
+                }
+            }()
+            return BluetoothAudioIconOptions(
                 iconColor: values.0,
                 usesVolumeColor: values.1,
                 networkIconSymbolOverride: values.2,
                 iconChoice: BluetoothAudioIconChoice.persisted(choiceRawValue) { symbol in
                     NSImage(systemSymbolName: symbol, accessibilityDescription: nil) != nil
-                }
+                },
+                volumeColorRole: volumeColorRole
             )
         }
         .removeDuplicates()

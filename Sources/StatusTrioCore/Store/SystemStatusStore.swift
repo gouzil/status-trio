@@ -17,6 +17,7 @@ private enum BluetoothDemandSource: Hashable {
     case popover
     case settings
     case selectedDeviceIcon
+    case iconBluetoothSource
     case backgroundRefresh
     case audioListeningModes
     case legacyToggle
@@ -44,10 +45,16 @@ protocol HelperReadinessProviding {
     /// Re-reads the helper's native status/readiness now (called on user action
     /// so a click never acts on a stale helper state).
     func refreshStatus()
+    func setBackgroundRecoveryNeeded(_ needed: Bool)
+    var recoveryProbePublisher: AnyPublisher<Void, Never> { get }
+    func verifyForUse() async -> Bool
 }
 
 extension HelperReadinessProviding {
     func refreshStatus() {}
+    func setBackgroundRecoveryNeeded(_ needed: Bool) {}
+    var recoveryProbePublisher: AnyPublisher<Void, Never> { Empty().eraseToAnyPublisher() }
+    func verifyForUse() async -> Bool { isReady }
 }
 
 /// Production provider. Resolves the shared manager lazily so a store that
@@ -60,15 +67,20 @@ struct SharedHelperReadiness: HelperReadinessProviding {
         PrivilegedHelperManager.shared.readinessPublisher
     }
 
-    func refreshStatus() {
-        PrivilegedHelperManager.shared.refresh()
+    func refreshStatus() { PrivilegedHelperManager.shared.refreshForUse() }
+    func setBackgroundRecoveryNeeded(_ needed: Bool) {
+        PrivilegedHelperManager.shared.setBackgroundRecoveryNeeded(needed)
     }
+    var recoveryProbePublisher: AnyPublisher<Void, Never> {
+        PrivilegedHelperManager.shared.recoveryProbePublisher
+    }
+    func verifyForUse() async -> Bool { await PrivilegedHelperManager.shared.verifyForUse() }
 }
 
 extension PrivilegedHelperManager: HelperReadinessProviding {
     /// The same `isReady` rule the UI gates the switches with, re-published so
     /// the automation can re-evaluate when approval or responsiveness lands.
-    func refreshStatus() { refresh() }
+    func refreshStatus() { refreshForUse() }
 
     var readinessPublisher: AnyPublisher<Bool, Never> {
         Publishers.CombineLatest4(
@@ -193,6 +205,9 @@ final class SystemStatusStore: ObservableObject {
     let sleepControl: SleepControlController
     /// The low-battery → Low Power Mode automation (#246).
     private let lowPowerAutoEnable = LowPowerAutoEnableController()
+    private var autoLowPowerVerificationTask: Task<Void, Never>?
+    private var autoLowPowerVerificationRequested = false
+    private var autoLowPowerHelperVerified = false
     /// Helper readiness for the #246 automation. Production reads the shared
     /// manager; tests inject a fake.
     private let helperReadiness: any HelperReadinessProviding
@@ -326,6 +341,7 @@ final class SystemStatusStore: ObservableObject {
     private var bluetoothSettingsDemandTokens: Set<BluetoothSettingsDemandToken> = []
     private var legacyBluetoothSettingsDemandClaimCount = 0
     private var isLegacyBluetoothDemandEnabled = false
+    private var isIconBluetoothDemandActive = false
     private var isBluetoothAuthorizationRequestPending = false
     private var isReconcilingBluetoothDemand = false
     private var needsBluetoothDemandReconciliation = false
@@ -710,6 +726,7 @@ final class SystemStatusStore: ObservableObject {
         lowPowerAutoEnableThresholdCancellable = nil
         lowPowerAutoEnableReadinessCancellable?.cancel()
         lowPowerAutoEnableReadinessCancellable = nil
+        resetAutoLowPowerVerification()
         boundLowPowerSettings = nil
         appleDeviceSettingsCancellable?.cancel()
         appleDeviceSettingsCancellable = nil
@@ -723,6 +740,7 @@ final class SystemStatusStore: ObservableObject {
         bluetoothAuthorizationCancellable = nil
         bluetoothSettingsDemandTokens.removeAll()
         legacyBluetoothSettingsDemandClaimCount = 0
+        isIconBluetoothDemandActive = false
         boundBluetoothSettings = nil
         inputUpdateTask?.cancel()
         inputUpdateTask = nil
@@ -754,6 +772,7 @@ final class SystemStatusStore: ObservableObject {
         highPowerMode.onSuccessfulWrite = nil
 
         powerSampling.stopAll()
+        hardwareMetrics.stopAll()
         topApps.stop()
         batteryDetails.deactivate()
         mobileBattery.stop()
@@ -799,7 +818,16 @@ final class SystemStatusStore: ObservableObject {
             return
         }
         let previousScalar = liveVolume.scalar
-        liveVolume = liveVolume.replacingScalar(min(1, max(0, scalar)))
+        let clampedScalar = min(1, max(0, scalar))
+        var nextVolume = liveVolume.replacingScalar(clampedScalar)
+        if clampedScalar > 0, liveVolume.isAutoMuted {
+            // Raising the level restores sound; mirror the controller's
+            // automatic unmute here so the mute icon does not lag behind the
+            // read-back. A user's manual mute has isAutoMuted == false and is
+            // left untouched.
+            nextVolume = nextVolume.replacingMuted(false)
+        }
+        liveVolume = nextVolume
         publish(snapshot.replacingVolume(liveVolume), immediately: true)
         volumeController?.setVolume(liveVolume.scalar ?? 0)
 
@@ -935,6 +963,19 @@ final class SystemStatusStore: ObservableObject {
         reconcileBluetoothDemand()
     }
 
+    /// Marks the icon's Bluetooth source (an AirPods ring, or a Bluetooth
+    /// centre) as an owning consumer of the controller. The menu bar icon is
+    /// always visible, so its source needs the device rows and live levels in
+    /// the background. Without a demand source here the ordinary empty-demand
+    /// path calls `releaseTransientState()`, which resets availability and
+    /// drops the rows the icon reads — leaving the icon and the panel stuck on
+    /// their loading placeholder. Called by the icon demand wiring.
+    func setIconBluetoothDemand(_ active: Bool) {
+        guard !hasStopped, isIconBluetoothDemandActive != active else { return }
+        isIconBluetoothDemandActive = active
+        reconcileBluetoothDemand()
+    }
+
     /// The Bluetooth page owns a consumer only while it is actually visible.
     /// Merely opening Settings on another page must not start CoreBluetooth.
     func setBluetoothSettingsVisible(_ visible: Bool) {
@@ -1052,6 +1093,10 @@ final class SystemStatusStore: ObservableObject {
 
     private func currentBluetoothDemandSources() -> Set<BluetoothDemandSource> {
         var sources: Set<BluetoothDemandSource> = []
+
+        if isIconBluetoothDemandActive {
+            sources.insert(.iconBluetoothSource)
+        }
 
         let isPopoverBluetoothVisible: Bool
         if hasBluetoothSettingsBinding {
@@ -1682,10 +1727,6 @@ final class SystemStatusStore: ObservableObject {
             .removeDuplicates()
             .sink { [weak self] enabled in
                 guard let self else { return }
-                guard enabled else {
-                    self.lowPowerAutoEnable.reset()
-                    return
-                }
                 // Enabling the automation while the battery is already low must
                 // not wait for the next snapshot to act.
                 self.evaluateLowPowerAutoEnable(
@@ -1759,14 +1800,42 @@ final class SystemStatusStore: ObservableObject {
         let isEnabled = (automationOverride ?? settings.autoEnablesLowPowerMode)
             && (controlsOverride ?? settings.controlsLowPowerMode)
             && HighPowerModeController.supportsCurrentPlatform
-        let shouldEnable = lowPowerAutoEnable.evaluate(
-            battery: battery,
-            threshold: thresholdOverride ?? settings.autoLowPowerThreshold,
-            isEnabled: isEnabled,
-            isHelperReady: readinessOverride ?? helperReadiness.isReady
-        )
-        guard shouldEnable else { return }
-        lowPowerMode.setLowPowerMode(true)
+        let threshold = thresholdOverride ?? settings.autoLowPowerThreshold
+        if autoLowPowerVerificationRequested, autoLowPowerVerificationTask == nil,
+           let readinessOverride {
+            autoLowPowerHelperVerified = readinessOverride
+        }
+        guard lowPowerAutoEnable.updateCycle(battery: battery, threshold: threshold, isEnabled: isEnabled) else {
+            if !isEnabled || battery.isConnectedToPower || (battery.isPresent && battery.rawPercentage != nil) {
+                resetAutoLowPowerVerification()
+            }
+            return
+        }
+        guard !lowPowerAutoEnable.didAutoEnableThisCycle else { return }
+        if !autoLowPowerVerificationRequested {
+            autoLowPowerVerificationRequested = true
+            autoLowPowerVerificationTask = Task { [weak self, helperReadiness] in
+                guard !Task.isCancelled else { return }
+                let ready = await helperReadiness.verifyForUse()
+                guard !Task.isCancelled, let self else { return }
+                self.autoLowPowerVerificationTask = nil
+                self.evaluateLowPowerAutoEnable(battery: self.snapshot.battery, readinessOverride: ready)
+            }
+            return
+        }
+        // A battery update alone must not reuse cached readiness after a failed
+        // verification. A later positive readiness event can still finish this cycle.
+        guard autoLowPowerVerificationTask == nil, autoLowPowerHelperVerified else { return }
+        if lowPowerAutoEnable.evaluate(battery: battery, threshold: threshold, isEnabled: true) {
+            lowPowerMode.setLowPowerMode(true)
+        }
+    }
+
+    private func resetAutoLowPowerVerification() {
+        autoLowPowerVerificationTask?.cancel()
+        autoLowPowerVerificationTask = nil
+        autoLowPowerVerificationRequested = false
+        autoLowPowerHelperVerified = false
     }
 
     private func updateAppleRefreshDemand() {
@@ -2229,6 +2298,7 @@ private extension VolumeStatus {
             currentDevice: currentDevice,
             outputDevices: outputDevices,
             canSetVolume: canSetVolume, canMute: canMute,
+            isAutoMuted: isAutoMuted,
             muteState: muteState,
             externalVolumeTransitionGeneration:
                 externalVolumeTransitionGeneration,
@@ -2237,6 +2307,8 @@ private extension VolumeStatus {
     }
 
     func replacingMuted(_ isMuted: Bool) -> VolumeStatus {
+        // A mute change is a user-controlled state; it never carries the app's
+        // automatic-mute ownership.
         VolumeStatus(
             scalar: scalar,
             isMuted: isMuted,
@@ -2244,6 +2316,7 @@ private extension VolumeStatus {
             currentDevice: currentDevice,
             outputDevices: outputDevices,
             canSetVolume: canSetVolume, canMute: canMute,
+            isAutoMuted: false,
             muteState: isMuted ? .muted : .unmuted,
             externalVolumeTransitionGeneration:
                 externalVolumeTransitionGeneration,

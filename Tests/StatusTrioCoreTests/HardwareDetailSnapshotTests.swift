@@ -50,7 +50,27 @@ final class HardwareDetailSnapshotTests: XCTestCase {
             snapshot.diskDetail = DiskDetailReading(
                 capacity: DiskCapacityReading(totalBytes: 1_995_000_000_000, freeBytes: 533_000_000_000,
                                               usedBytes: 1_462_000_000_000, fileSystem: "APFS", sampledAt: date),
-                readBytesPerSecond: 45_000_000, writeBytesPerSecond: 12_000_000, sampledAt: date)
+                readBytesPerSecond: 45_000_000, writeBytesPerSecond: 12_000_000,
+                volumes: [
+                    DiskVolumeReading(name: "Macintosh HD", mountPath: "/",
+                                      totalBytes: 1_995_000_000_000, freeBytes: 533_000_000_000,
+                                      fileSystem: "APFS", isExternal: false, isReadOnly: false),
+                    DiskVolumeReading(name: "新加卷", mountPath: "/Volumes/新加卷",
+                                      totalBytes: 1_500_166_221_824, freeBytes: 1_427_726_479_360,
+                                      fileSystem: "Windows NT File System (NTFS)", isExternal: true, isReadOnly: true),
+                    DiskVolumeReading(name: "MacData", mountPath: "/Volumes/MacData",
+                                      totalBytes: 477_000_000_000, freeBytes: 7_800_000_000,
+                                      fileSystem: "APFS", isExternal: true, isReadOnly: false)
+                ],
+                volumeSpeeds: [
+                    "/": DiskThroughputReading(readBytesPerSecond: 45_000_000,
+                                               writeBytesPerSecond: 12_000_000, sampledAt: date),
+                    "/Volumes/新加卷": DiskThroughputReading(readBytesPerSecond: 3_200_000,
+                                                          writeBytesPerSecond: 640_000, sampledAt: date),
+                    "/Volumes/MacData": DiskThroughputReading(readBytesPerSecond: 120_000,
+                                                             writeBytesPerSecond: 8_000, sampledAt: date)
+                ],
+                sampledAt: date)
             snapshot.samples[.diskRead] = HardwareMetricSample(value: 45_000_000, unit: .bytesPerSecond, sampledAt: date, source: .ioStorage, availability: .measured)
             snapshot.samples[.diskWrite] = HardwareMetricSample(value: 12_000_000, unit: .bytesPerSecond, sampledAt: date, source: .ioStorage, availability: .measured)
         case .fan:
@@ -101,23 +121,35 @@ final class HardwareDetailSnapshotTests: XCTestCase {
         for kind in HardwareDetailKind.allCases {
             let snap = snapshot(for: kind, at: date)
             let points = history(for: kind, at: date)
-            for dark in [false, true] {
-                let observable = HardwareMonitorObservable(snapshot: snap)
-                let view = HardwareDetailView(kind: kind, hardware: observable, onBack: {}, previewHistory: points)
-                    .environmentObject(Localization())
-                    .environment(\.panelCardSurfaceStyle, PanelCardSurfaceStyle.material)
-                    .environment(\.colorScheme, dark ? .dark : .light)
-                    .frame(width: 330)
-                    .background(dark ? Color(white: 0.12) : Color(white: 0.96))
-                let renderer = ImageRenderer(content: view)
-                renderer.scale = 2
-                let cgImage = try XCTUnwrap(renderer.cgImage)
-                let rep = NSBitmapImageRep(cgImage: cgImage)
-                let data = try XCTUnwrap(rep.representation(using: .png, properties: [:]))
-                let path = "\(directory)/\(kind.rawValue)_\(dark ? "dark" : "light").png"
-                try data.write(to: URL(fileURLWithPath: path))
-                print("wrote \(path) (\(cgImage.width)x\(cgImage.height))")
+            for style: PanelCardSurfaceStyle in [.glass, .material, .solid] {
+                for dark in [false, true] {
+                    let observable = HardwareMonitorObservable(snapshot: snap)
+                    let view = HardwareDetailView(kind: kind, hardware: observable, onBack: {}, previewHistory: points)
+                        .environmentObject(Localization())
+                        .environment(\.panelCardSurfaceStyle, style)
+                        .environment(\.colorScheme, dark ? .dark : .light)
+                        .frame(width: 330)
+                        .background(dark ? Color(white: 0.12) : Color(white: 0.96))
+                    let renderer = ImageRenderer(content: view)
+                    renderer.scale = 2
+                    let cgImage = try XCTUnwrap(renderer.cgImage)
+                    let rep = NSBitmapImageRep(cgImage: cgImage)
+                    let data = try XCTUnwrap(rep.representation(using: .png, properties: [:]))
+                    let path = "\(directory)/\(kind.rawValue)_\(style.snapshotName)_\(dark ? "dark" : "light").png"
+                    try data.write(to: URL(fileURLWithPath: path))
+                    print("wrote \(path) (\(cgImage.width)x\(cgImage.height))")
+                }
             }
+        }
+    }
+}
+
+private extension PanelCardSurfaceStyle {
+    var snapshotName: String {
+        switch self {
+        case .glass: return "glass"
+        case .material: return "material"
+        case .solid: return "solid"
         }
     }
 }

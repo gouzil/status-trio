@@ -95,34 +95,95 @@ final class PhaseOneCorrectnessTests: XCTestCase {
 
     // MARK: - Phase 2 demand lifecycle
 
-    func testHardwareRingDemandsFollowPlacementAndFallback() {
+    func testHardwareRingDemandsFollowPlacementAndSelectedSource() {
         var config = IconConfigurationV1.classic
         config.composition.outerRing = SlotSelection(primary: .hardwareMonitor)
         config.behaviors.hardwareRing = HardwareRingConfiguration(
             layout: .dual, primaryMetric: .cpuUsage, secondaryMetric: .gpuUsage)
 
-        let dockOnly = IconSourceDemandPolicy.hardwareRingDemands(configuration: config, placement: .dock)
+        let dockOnly = IconSourceDemandPolicy.hardwareRingDemands(
+            configuration: config, placement: .dock, isHardwareRingSelected: true)
         XCTAssertNil(dockOnly.menuBar)
         XCTAssertEqual(dockOnly.dock, Set([HardwareMetricID.cpuUsage, .gpuUsage]))
 
-        let menuOnly = IconSourceDemandPolicy.hardwareRingDemands(configuration: config, placement: .menuBar)
+        let menuOnly = IconSourceDemandPolicy.hardwareRingDemands(
+            configuration: config, placement: .menuBar, isHardwareRingSelected: true)
         XCTAssertNotNil(menuOnly.menuBar)
         XCTAssertNil(menuOnly.dock)
 
-        let both = IconSourceDemandPolicy.hardwareRingDemands(configuration: config, placement: .both)
+        let both = IconSourceDemandPolicy.hardwareRingDemands(
+            configuration: config, placement: .both, isHardwareRingSelected: true)
         XCTAssertNotNil(both.menuBar)
         XCTAssertNotNil(both.dock)
 
-        // Non-hardware source: no demand.
+        // A configured-but-not-selected hardware ring (e.g. only a fallback
+        // while another source is on screen) must not start the sampler.
+        XCTAssertEqual(IconSourceDemandPolicy.hardwareRingDemands(
+            configuration: config, placement: .both, isHardwareRingSelected: false), .none)
+
+        // Non-hardware source: no demand even if a stale selection flag is set.
         var battery = IconConfigurationV1.classic
         battery.composition.outerRing = SlotSelection(primary: .systemBattery)
-        XCTAssertEqual(IconSourceDemandPolicy.hardwareRingDemands(configuration: battery, placement: .both), .none)
+        XCTAssertEqual(IconSourceDemandPolicy.hardwareRingDemands(
+            configuration: battery, placement: .both, isHardwareRingSelected: false), .none)
 
-        // Hardware as fallback keeps the demand warm for the switch.
+        // The fallback activates only when the selected source says so, and then
+        // demands exactly its configured metrics.
         var fallback = IconConfigurationV1.classic
         fallback.composition.outerRing = SlotSelection(primary: .systemBattery, fallback: .hardwareMonitor)
         fallback.behaviors.hardwareRing = config.behaviors.hardwareRing
-        XCTAssertNotNil(IconSourceDemandPolicy.hardwareRingDemands(configuration: fallback, placement: .menuBar).menuBar)
+        XCTAssertEqual(IconSourceDemandPolicy.hardwareRingDemands(
+            configuration: fallback, placement: .menuBar, isHardwareRingSelected: false), .none)
+        XCTAssertNotNil(IconSourceDemandPolicy.hardwareRingDemands(
+            configuration: fallback, placement: .menuBar, isHardwareRingSelected: true).menuBar)
+    }
+
+    func testVolumeOrWifiOnlyRingDemandsNoHardwareSampling() {
+        var config = IconConfigurationV1.classic
+        config.composition.outerRing = SlotSelection(primary: .hardwareMonitor)
+        config.behaviors.hardwareRing = HardwareRingConfiguration(
+            layout: .single, primaryMetric: .volume, secondaryMetric: nil)
+        XCTAssertEqual(IconSourceDemandPolicy.hardwareRingDemands(
+            configuration: config, placement: .both, isHardwareRingSelected: true), .none)
+
+        config.behaviors.hardwareRing = HardwareRingConfiguration(
+            layout: .single, primaryMetric: .wifiSignal, secondaryMetric: nil)
+        XCTAssertEqual(IconSourceDemandPolicy.hardwareRingDemands(
+            configuration: config, placement: .both, isHardwareRingSelected: true), .none)
+
+        // A mixed CPU + volume ring demands only CPU.
+        config.behaviors.hardwareRing = HardwareRingConfiguration(
+            layout: .dual, primaryMetric: .cpuUsage, secondaryMetric: .volume)
+        XCTAssertEqual(IconSourceDemandPolicy.hardwareRingDemands(
+            configuration: config, placement: .both, isHardwareRingSelected: true).dock,
+            Set([HardwareMetricID.cpuUsage]))
+    }
+
+    /// The icon scene is built from the live, appearance-derived configuration.
+    /// The persisted `settings.iconConfiguration` snapshot is only rewritten by
+    /// the editor API, so a ring metric chosen on the settings surface (a dual
+    /// CPU + memory ring here) is absent from it. Demand must follow the live
+    /// configuration; reading the snapshot would prune memory back to CPU-only on
+    /// the first icon tick, leaving the memory arc blank until the panel reopened.
+    func testHardwareRingDemandFollowsLiveConfigurationNotPersistedSnapshot() throws {
+        let store = try makeStore()
+        store.hardwareRingConfiguration = HardwareRingConfiguration(
+            layout: .dual, primaryMetric: .cpuUsage, secondaryMetric: .memoryUsage)
+
+        var live: IconPresentationSettings?
+        let cancellable = store.iconPresentationPublisher.sink { live = $0 }
+        defer { cancellable.cancel() }
+
+        let liveConfiguration = try XCTUnwrap(live?.iconConfiguration)
+        let liveDemands = IconSourceDemandPolicy.hardwareRingDemands(
+            configuration: liveConfiguration, placement: .menuBar, isHardwareRingSelected: true)
+        XCTAssertEqual(liveDemands.menuBar, Set([HardwareMetricID.cpuUsage, .memoryUsage]),
+                       "demand must follow the live presentation configuration")
+
+        let staleDemands = IconSourceDemandPolicy.hardwareRingDemands(
+            configuration: store.iconConfiguration, placement: .menuBar, isHardwareRingSelected: true)
+        XCTAssertEqual(staleDemands.menuBar, Set([HardwareMetricID.cpuUsage]),
+                       "the persisted snapshot still looks CPU-only; demand must not read it")
     }
 
 
@@ -154,5 +215,20 @@ final class PhaseOneCorrectnessTests: XCTestCase {
         let reopened = SettingsStore(defaults: defaults)
         XCTAssertFalse(reopened.statusPanelMediumTextEnabled)
         XCTAssertTrue(reopened.keepsPanelOpenWhenOpeningSettings)
+    }
+
+    /// The single "Bold panel text" switch must move both weight tiers together
+    /// so "on" restores the classic bold + medium look and "off" is all regular.
+    func testBoldPanelTextToggleDrivesBothBoldAndMediumTiers() throws {
+        let store = try makeStore()
+        XCTAssertFalse(store.statusPanelBoldTextEnabled, "defaults to the current regular look")
+
+        store.applyPanelBoldTextToggle(true)
+        XCTAssertTrue(store.statusPanelBoldTextEnabled)
+        XCTAssertTrue(store.statusPanelMediumTextEnabled)
+
+        store.applyPanelBoldTextToggle(false)
+        XCTAssertFalse(store.statusPanelBoldTextEnabled)
+        XCTAssertFalse(store.statusPanelMediumTextEnabled)
     }
 }

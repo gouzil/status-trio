@@ -16,7 +16,11 @@ struct StatusIconAppearance: Equatable, Sendable {
     var outerRingContent: OuterRingContent
     var airPodsRingUsesDualRing: Bool
     var showsAirPodsTopSymbolInRing: Bool
-    var airPodsRingFallsBackToBattery: Bool
+    var airPodsRingFallback: AirPodsRingFallback
+    /// AirPods ring arc colours: left ear, right ear, and the single-arc view.
+    var airPodsLeftArcColor: BluetoothIconColorSelection
+    var airPodsRightArcColor: BluetoothIconColorSelection
+    var airPodsSingleArcColor: BluetoothIconColorSelection
     /// Internal configuration of the `hardwareMonitor` ring source.
     var hardwareRingConfiguration: HardwareRingConfiguration
     /// Shared per-metric identity colours (also used by the panel bars).
@@ -34,7 +38,10 @@ struct StatusIconAppearance: Equatable, Sendable {
         outerRingContent: OuterRingContent = .systemBattery,
         airPodsRingUsesDualRing: Bool = true,
         showsAirPodsTopSymbolInRing: Bool = true,
-        airPodsRingFallsBackToBattery: Bool = true,
+        airPodsRingFallback: AirPodsRingFallback = .battery,
+        airPodsLeftArcColor: BluetoothIconColorSelection = .systemBlue,
+        airPodsRightArcColor: BluetoothIconColorSelection = .primary,
+        airPodsSingleArcColor: BluetoothIconColorSelection = .primary,
         hardwareRingConfiguration: HardwareRingConfiguration = .default,
         hardwareMetricColors: [HardwareMonitorMetric: IconRGBA] = [:],
         hardwareDownloadCapMbps: Double = 1000,
@@ -48,7 +55,10 @@ struct StatusIconAppearance: Equatable, Sendable {
         self.outerRingContent = outerRingContent
         self.airPodsRingUsesDualRing = airPodsRingUsesDualRing
         self.showsAirPodsTopSymbolInRing = showsAirPodsTopSymbolInRing
-        self.airPodsRingFallsBackToBattery = airPodsRingFallsBackToBattery
+        self.airPodsRingFallback = airPodsRingFallback
+        self.airPodsLeftArcColor = airPodsLeftArcColor
+        self.airPodsRightArcColor = airPodsRightArcColor
+        self.airPodsSingleArcColor = airPodsSingleArcColor
         self.hardwareRingConfiguration = hardwareRingConfiguration
         self.hardwareMetricColors = hardwareMetricColors
         self.hardwareDownloadCapMbps = hardwareDownloadCapMbps
@@ -68,7 +78,10 @@ struct StatusIconAppearance: Equatable, Sendable {
             outerRingContent: settings.outerRingContent,
             airPodsRingUsesDualRing: settings.airPodsRingUsesDualRing,
             showsAirPodsTopSymbolInRing: settings.showsAirPodsTopSymbolInRing,
-            airPodsRingFallsBackToBattery: settings.airPodsRingFallsBackToBattery,
+            airPodsRingFallback: settings.airPodsRingFallback,
+            airPodsLeftArcColor: settings.airPodsLeftArcColor,
+            airPodsRightArcColor: settings.airPodsRightArcColor,
+            airPodsSingleArcColor: settings.airPodsSingleArcColor,
             hardwareRingConfiguration: settings.hardwareRingConfiguration,
             hardwareMetricColors: settings.hardwareMonitorMetricColors,
             hardwareDownloadCapMbps: settings.hardwareDownloadCapMbps,

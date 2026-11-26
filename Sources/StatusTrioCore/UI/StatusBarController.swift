@@ -78,6 +78,9 @@ final class StatusBarController: NSObject {
     private var detailCoordinator = StatusPanelDetailCoordinator()
     private var detailCancellables = Set<AnyCancellable>()
     private var isDetailPanelClosing = false
+    /// The current presentation's origin. The Dock route bounds the attached
+    /// detail to the summary's height; the menu bar route lets it grow past it.
+    private var isDockPresented = false
     private let store: SystemStatusStore
     private let settings: SettingsStore
     private let panelActions: StatusPanelActions
@@ -112,7 +115,6 @@ final class StatusBarController: NSObject {
     private var powerDemandCancellable: AnyCancellable?
     private var panelBackgroundCancellable: AnyCancellable?
     private var reduceTransparencyCancellable: AnyCancellable?
-    private var helperQuiescenceCancellable: AnyCancellable?
     private var lidPolicyCancellables: Set<AnyCancellable> = []
     private var hoverPreferenceCancellable: AnyCancellable?
     /// Issue #355: whether hover-to-show is active. Off unless the user opts in.
@@ -137,6 +139,8 @@ final class StatusBarController: NSObject {
     /// Debounces enter/exit so duplicate tracking/monitor signals do not restart
     /// the dwell timer on every mouse move.
     private var isPointerInStatusItemRegion = false
+    /// Boundary tracking for the whole hover group (icon, panels and bridge).
+    private var hoverGroupTracker = PopoverHoverGroupTracker()
     private let openSettings: () -> Void
     /// Opens Status Trio's own Settings window on the Battery tab.
     private let openAppBatterySettings: () -> Void
@@ -432,10 +436,6 @@ final class StatusBarController: NSObject {
                 self?.detailPanel.refreshBackgroundForAccessibilityChange()
             }
 
-        // Keep the helper enabled but stretch its self-check cadence to 30 minutes
-        // when no visible panel section needs it. Hiding a section never disables
-        // the helper; a pending lid-sleep recovery keeps the normal cadence so a
-        // residual disablesleep=1 is still noticed.
         // Drive the lid-sleep battery policy from Settings.
         store.sleepControl.allowsLidSleepOnBattery = settings.allowLidSleepOnBattery
         store.sleepControl.autoDisablesLidSleepOnLowBattery = settings.autoDisableLidSleepOnLowBattery
@@ -453,20 +453,6 @@ final class StatusBarController: NSObject {
                 self.store.sleepControl.applyLidPowerPolicy()
             }
             .store(in: &lidPolicyCancellables)
-
-        helperQuiescenceCancellable = Publishers.CombineLatest3(
-            settings.$controlsLowPowerMode,
-            settings.$showsLidSleepButton,
-            settings.$enabledPopupSections
-        )
-        .receive(on: RunLoop.main)
-        .sink { [weak self] batteryOn, lidOn, sections in
-            guard let self else { return }
-            let anyVisible = (batteryOn && sections.contains(.battery))
-                || (lidOn && sections.contains(.quickActions))
-            let pending = self.store.sleepControl.hasPendingLidRecovery
-            PrivilegedHelperManager.shared.setQuiescent(!anyVisible && !pending)
-        }
 
         screenParametersCancellable = NotificationCenter.default.publisher(
             for: NSApplication.didChangeScreenParametersNotification,
@@ -506,6 +492,7 @@ final class StatusBarController: NSObject {
             resetStaticPresentation()
             renderLatestScene()
             installStatusItemHoverTracking()
+            if isHoverPresentationEnabled { installHoverMouseMonitors() }
         } else {
             clearAnimationPresentation()
             // The colored presentation's non-template footprint is transparent.
@@ -529,6 +516,9 @@ final class StatusBarController: NSObject {
             removeStatusItemHoverTracking()
             cancelHoverTransition()
             removePanelHoverTracking()
+            // A hidden icon has no hover to track; stop the global monitor too.
+            removeHoverMouseMonitors()
+            hoverGroupTracker.reset()
         }
         visibilityDidChange?()
     }
@@ -683,6 +673,7 @@ final class StatusBarController: NSObject {
             removeHoverMouseMonitors()
             removePanelHoverTracking()
             cancelHoverTransition()
+            hoverGroupTracker.reset()
         }
     }
 
@@ -735,11 +726,27 @@ final class StatusBarController: NSObject {
     }
 
     private func refreshStatusItemHoverState() {
+        guard isHoverPresentationEnabled else { return }
         let point = NSEvent.mouseLocation
-        let inside = statusItemHoverRegions().contains {
+        let regions = statusItemHoverRegions()
+        let presentation = PopoverHoverPresentation(statusItemFrames: regions,
+                                                   panelFrames: panelWindowFrames)
+        // Group state comes first so entering the icon from outside cancels any
+        // stale hide before the icon path schedules the show.
+        switch hoverGroupTracker.update(inside: presentation.isWithinHoverArea(point)) {
+        case .cancelPending:
+            cancelHoverTransition()
+        case .scheduleHide:
+            if popover.isShown, popoverPresentedByHover {
+                scheduleHoverTransition(.hide)
+            }
+        case .none:
+            break
+        }
+        let insideItem = regions.contains {
             PopoverHoverPresentation.containsInclusive($0, point)
         }
-        setPointerInsideStatusItemRegion(inside)
+        setPointerInsideStatusItemRegion(insideItem)
     }
 
     private func setPointerInsideStatusItemRegion(_ inside: Bool) {
@@ -824,13 +831,16 @@ final class StatusBarController: NSObject {
     private func panelHoverDidEnter() {
         guard isHoverPresentationEnabled else { return }
         cancelHoverTransition()
+        _ = hoverGroupTracker.update(inside: true)
     }
 
     private func panelHoverDidExit() {
         guard isHoverPresentationEnabled,
               popover.isShown,
               popoverPresentedByHover else { return }
-        scheduleHoverTransition(.hide)
+        // Re-resolve against the full group: leaving the panel into the 8 pt
+        // bridge is not leaving the hover area.
+        refreshStatusItemHoverState()
     }
 
     private func scheduleHoverTransition(_ transition: PopoverHoverIntent.Transition) {
@@ -913,7 +923,12 @@ final class StatusBarController: NSObject {
             statusItemFrames: statusItemHoverRegions(),
             panelFrames: panelWindowFrames
         )
-        guard !presentation.isWithinHoverArea(NSEvent.mouseLocation) else { return }
+        // Still inside the bridge: remember that, so moving beyond it schedules
+        // a fresh hide instead of leaving the panel stuck on screen.
+        guard !presentation.isWithinHoverArea(NSEvent.mouseLocation) else {
+            _ = hoverGroupTracker.update(inside: true)
+            return
+        }
         closePopover()
     }
 
@@ -945,7 +960,10 @@ final class StatusBarController: NSObject {
 
         settings.$showsPanelDetailsAlongside
             .dropFirst()
-            .sink { [weak self] _ in self?.syncDetailPresentation() }
+            // Combine publishes this in willSet: the stored property is still
+            // the old value inside the sink. Hand the delivered value through
+            // instead of re-reading it.
+            .sink { [weak self] enabled in self?.syncDetailPresentation(enabled: enabled) }
             .store(in: &detailCancellables)
         panelViewModel.routeDidChange = { [weak self] route in
             guard let self else { return }
@@ -969,19 +987,30 @@ final class StatusBarController: NSObject {
         }
     }
 
+    /// The setting event carries the new value; the stored property may still
+    /// hold the previous one because @Published publishes in willSet.
+    static func detailAlongsidePreference(delivered: Bool?, stored: Bool) -> Bool {
+        delivered ?? stored
+    }
+
     /// Places, moves or hides the attached detail window for the current route
     /// and geometry. The panel's summary stays visible in alongside mode.
-    private func syncDetailPresentation() {
+    private func syncDetailPresentation(enabled delivered: Bool? = nil) {
         guard popover.isShown else {
             detailPanel.hideDetail()
             return
         }
+        let alongside = Self.detailAlongsidePreference(
+            delivered: delivered,
+            stored: settings.showsPanelDetailsAlongside
+        )
         let decision = detailCoordinator.update(
             route: panelViewModel.route,
-            enabled: settings.showsPanelDetailsAlongside,
+            enabled: alongside,
             summaryFrame: popover.frame,
             screens: NSScreen.screens.map { StatusPanelScreen($0) },
-            dockInset: popover.currentDockInset
+            dockInset: popover.currentDockInset,
+            limitsToSummaryHeight: isDockPresented
         )
         switch decision {
         case .hidden, .inline:
@@ -1132,7 +1161,8 @@ final class StatusBarController: NSObject {
             // reopen callback. Re-activating can restore the existing Settings
             // window ahead of the transient popover.
             activatesApplication: false,
-            dockInset: anchor.dockInset
+            dockInset: anchor.dockInset,
+            presentedFromDock: true
         )
     }
 
@@ -1233,9 +1263,11 @@ final class StatusBarController: NSObject {
         makesKeyWindow: Bool = true,
         dockInset: NSEdgeInsets = DockReveal.noInset,
         revealStyle: AnchoredStatusPanel.RevealStyle = .fade,
-        presentedByHover: Bool = false
+        presentedByHover: Bool = false,
+        presentedFromDock: Bool = false
     ) {
         popoverPresentedByHover = presentedByHover
+        isDockPresented = presentedFromDock
         cancelPopoverContentRelease()
         // A fresh presentation is not the tail of a mouse-down dismissal.
         reopenSuppression.reset()

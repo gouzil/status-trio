@@ -221,7 +221,17 @@ struct QuickActionsCardView: View {
                     .secondary
                 )
             }
-            return (localization.string(external.localizationKey), .secondary)
+            var text = localization.string(external.localizationKey)
+            // Failure states carry a stable code so a user report maps to a
+            // cause; external ownership is guidance and needs no code (#383).
+            if external != .managedExternally, let code = control.lidSleepFailureCode {
+                text += String(
+                    format: localization.string(.quickActionsLidSleepFailureCode),
+                    locale: localization.resolvedLanguage.locale,
+                    arguments: [code]
+                )
+            }
+            return (text, .secondary)
         }
         if shouldShowLid, !control.isPreventingLidSleep,
            let reason = control.lidUnavailableReason, reason != .requiresPower {
@@ -257,10 +267,10 @@ private struct UnifiedCountdownControl: View {
     @State private var isHoveringTime = false
     @State private var isHoveringCapsule = false
 
-    private static let height: CGFloat = 54
+    private static let height: CGFloat = 38
     private static let cornerRadius: CGFloat = 13
     private static let timeWidth: CGFloat = 68
-    private static let iconDiameter: CGFloat = 32
+    private static let iconDiameter: CGFloat = 23
 
     var body: some View {
         HStack(spacing: 0) {
@@ -379,7 +389,7 @@ private struct UnifiedCountdownControl: View {
 
                 VStack(alignment: .leading, spacing: 1) {
                     Text(title)
-                        .font(.system(size: 13, weight: .semibold))
+                        .font(.system(size: 13))
                         .lineLimit(1)
                         .minimumScaleFactor(0.8)
                         .foregroundStyle(.primary)
@@ -487,11 +497,11 @@ private enum KeepAwakeRole {
     }
 
     /// Slightly larger glyph for the bulb so it balances the wider moon in the
-    /// same 32pt circle.
+    /// same icon circle.
     var glyphSize: CGFloat {
         switch self {
-        case .displayAwake: 16
-        case .lidAwake: 15
+        case .displayAwake: 12
+        case .lidAwake: 11
         }
     }
 }
